@@ -8,9 +8,6 @@ appropriate covariance, opacity, and spherical-harmonic colors (degree 3).
 Updated: Adaptive outlier threshold based on point cloud scale.
 """
 
-import os
-from typing import Optional
-
 import cv2
 import numpy as np
 
@@ -118,7 +115,12 @@ def initialize_gaussians(
     proj_matrices = []
     for j in valid_indices:
         pose = poses[j]
-        P = intrinsics.K @ np.hstack([pose.R, pose.t[:, None]])  # (3, 4)
+        # ----- 修复开始 -----
+        # 强制将 R 和 t 转换为正确的二维形状，避免拼接时维度不一致
+        R = np.asarray(pose.R).reshape(3, 3)
+        t = np.asarray(pose.t).reshape(3, 1)
+        P = intrinsics.K @ np.hstack([R, t])  # (3, 4)
+        # ----- 修复结束 -----
         proj_matrices.append(P)
     n_valid_poses = len(proj_matrices)
 

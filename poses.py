@@ -33,7 +33,7 @@ PRUNE_INTERVAL = 50
 MIN_OBSERVATIONS = 3
 MAX_REPROJ_ERROR = 3.0
 SMALL_TRANSLATION = 1e-4
-MATCH_DIST = 65
+MATCH_DIST = 65                  # 降低此值（如 50）可增加匹配数量，但可能增加误匹配
 DESC_UPDATE_THRESH = 35
 MIN_FEATURES = 80
 MIN_TRI_ANGLE_DEG = 1.5
@@ -369,10 +369,11 @@ def estimate_poses(
 # ---------- Feature Extraction ----------
 def _extract_features(paths: List[str], feature_type: str = "orb"):
     images, kps, descs = [], [], []
+    # 增加特征数量以产生更多点云（默认5000已足够，可调至8000）
     if feature_type == "sift":
-        detector = cv2.SIFT_create(nfeatures=5000, contrastThreshold=0.04, edgeThreshold=10)
+        detector = cv2.SIFT_create(nfeatures=8000, contrastThreshold=0.04, edgeThreshold=10)
     else:
-        detector = cv2.ORB_create(nfeatures=5000, scaleFactor=1.2, nlevels=8)
+        detector = cv2.ORB_create(nfeatures=8000, scaleFactor=1.2, nlevels=8)
 
     for p in paths:
         img = cv2.imread(p, cv2.IMREAD_COLOR)
@@ -479,7 +480,7 @@ def _triangulate_new_points(curr_idx, matches, inlier_mask,
             continue
 
         pts4d = cv2.triangulatePoints(P_prev, P_curr, pt_prev, pt_curr)
-        pt3d = pts4d[:3] / (float(pts4d[3]) + 1e-12)
+        pt3d = pts4d[:3] / (float(pts4d[3][0]) + 1e-12)
         pt3d = pt3d.flatten()
 
         if not _is_valid_point(pt3d, pose_prev, pose_curr, cam_prev, cam_curr,
@@ -550,6 +551,13 @@ def _bundle_adjustment(
     Bundle adjustment for a set of keyframes.
     Returns updated focal, fy.
     """
+    # ---------- FIX: Filter out invalid keyframes (pose is None) ----------
+    valid_kfs = [f for f in keyframe_ids if f < len(frame_poses) and frame_poses[f] is not None]
+    if len(valid_kfs) < 2:
+        return focal, fy
+    keyframe_ids = valid_kfs
+    # ---------- End of fix ----------
+
     if len(keyframe_ids) < 2:
         return focal, fy
 

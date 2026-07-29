@@ -12,16 +12,13 @@ All hyperparameters are centralized at the top for easy tuning.
 Checkpoints are strict: loading expects exactly the same structure as saved.
 """
 
-import os
-import math
-import warnings
-from dataclasses import dataclass, field
-from typing import Optional, List, Dict, Any, Callable, Tuple, Union
-
+import threading
 import numpy as np
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
+from dataclasses import dataclass, field
+from typing import Optional, List, Dict, Callable, Union
 
 # ---------- Optional CUDA rasterizer ----------
 try:
@@ -46,7 +43,7 @@ PRUNE_EVERY = 1000
 GRAD_THRESH_BASE = 0.0002
 SCALE_THRESH = 0.01
 MIN_OPACITY = 0.005
-MAX_GAUSSIANS = 300_000
+MAX_GAUSSIANS = 1_000_000          # increased for dense reconstruction
 SH_WARMUP_STEPS = 1000
 SSIM_WARMUP_STEPS = 500
 SSIM_WEIGHT_MAX = 0.2
@@ -121,10 +118,10 @@ def build_covariance(scales: torch.Tensor, rotations: torch.Tensor) -> torch.Ten
     return cov
 
 
-# ---------- SH evaluation (used only for custom rasterizer fallback, SH0 only) ----------
+# ---------- SH evaluation (only for fallback, SH0 only) ----------
 def eval_sh_0(sh_coeffs: torch.Tensor) -> torch.Tensor:
     """Return the 0th order SH coefficient (diffuse color), shape (N, 3)."""
-    return sh_coeffs[:, 0, :] + 0.5   # assuming coefficients are stored as 0-centered
+    return sh_coeffs[:, 0, :] + 0.5
 
 
 # ---------- Gaussian3D ----------
@@ -171,7 +168,46 @@ class Gaussian3D:
         return self
 
 
+# ---------- Dense initialization ----------
+def densify_initial_gaussians(gaussians: Gaussian3D, expansion_factor: int = 8, noise_scale: float = 0.02):
+    """
+    Increase the number of Gaussians by duplicating each point with small random perturbations
+    and slightly reduced scale. This helps to start with a richer representation.
+    """
+    n = gaussians.num_gaussians
+    if n == 0:
+        return
+    device = gaussians.positions.device
+
+    pos = gaussians.positions.detach().cpu().numpy()
+    scales = gaussians.log_scales.detach().cpu().numpy()
+    opa = gaussians.opacities_raw.detach().cpu().numpy()
+    rot = gaussians.rotations.detach().cpu().numpy()
+    sh = gaussians.sh_coeffs.detach().cpu().numpy()
+
+    new_pos, new_scales, new_opa, new_rot, new_sh = [], [], [], [], []
+    for i in range(n):
+        for _ in range(expansion_factor):
+            noise = np.random.normal(0, noise_scale, 3).astype(np.float32)
+            new_pos.append(pos[i] + noise)
+            new_scales.append(scales[i] + np.log(0.8))          # reduce scale
+            new_opa.append(opa[i] + np.random.normal(0, 0.1))
+            new_rot.append(rot[i] + np.random.normal(0, 0.01, 4))
+            new_sh.append(sh[i] + np.random.normal(0, 0.01, (sh.shape[1], 3)))
+
+    gaussians.positions = torch.from_numpy(np.array(new_pos)).float().to(device)
+    gaussians.log_scales = torch.from_numpy(np.array(new_scales)).float().to(device)
+    gaussians.opacities_raw = torch.from_numpy(np.array(new_opa)).float().to(device)
+    gaussians.rotations = torch.from_numpy(np.array(new_rot)).float().to(device)
+    gaussians.sh_coeffs = torch.from_numpy(np.array(new_sh)).float().to(device)
+
+    for param in [gaussians.positions, gaussians.log_scales, gaussians.opacities_raw,
+                  gaussians.rotations, gaussians.sh_coeffs]:
+        param.requires_grad_(True)
+
+
 # ---------- Differentiable Rasterizer (fallback, SH0 only) ----------
+# This fallback is kept for completeness but will not be used if CUDA rasterizer is available.
 class DifferentiableRasterizer(nn.Module):
     """Pure PyTorch rasterizer (SH0 only). Used when CUDA rasterizer is unavailable."""
     def __init__(self, image_width: int, image_height: int, max_radius: int = 32):
@@ -399,6 +435,18 @@ class Trainer:
         densify_every: int = DENSIFY_EVERY,
         prune_every: int = PRUNE_EVERY,
     ):
+        # ---------- Enforce CUDA rasterizer ----------
+        if not HAS_CUDA_RASTERIZER:
+            raise RuntimeError(
+                "diff-gaussian-rasterization is not available. "
+                "Please install it (e.g., pip install diff-gaussian-rasterization). "
+                "On Windows, you may need to build from source."
+            )
+        if device != "cuda":
+            raise ValueError("This trainer requires device='cuda' for differentiable rasterization.")
+        if not use_cuda_rasterizer:
+            print("Warning: use_cuda_rasterizer=False is ignored; forcing CUDA rasterizer.")
+
         self.gaussians = gaussians
         self.K = torch.from_numpy(K.astype(np.float32)).to(device)
         self.device = device
@@ -410,11 +458,12 @@ class Trainer:
         self.train_focal = train_focal
         self.enable_k1 = enable_k1
 
-        self.use_cuda_rasterizer = (use_cuda_rasterizer and HAS_CUDA_RASTERIZER and device == "cuda")
-        if not self.use_cuda_rasterizer and sh_degree > 0:
-            print(f"  [WARN] CUDA rasterizer not available, SH>0 will be ignored. Install diff-gaussian-rasterization.")
-            sh_degree = 0
-        self.sh_degree = min(sh_degree, 3)
+        # Force CUDA rasterizer
+        self.use_cuda_rasterizer = True
+        if sh_degree > 0:
+            self.sh_degree = min(sh_degree, 3)
+        else:
+            self.sh_degree = 0
         self.sh_warmup_steps = sh_warmup_steps
         self.ssim_warmup_steps = ssim_warmup_steps
         self.ssim_weight_max = ssim_weight_max
@@ -462,8 +511,13 @@ class Trainer:
             min_opacity=min_opacity,
         )
 
-        self.rasterizer = rasterizer
+        self.rasterizer = rasterizer  # not used, kept for compatibility
         self._update_tanfov()
+
+        # ---------- Dense initialization ----------
+        if self.gaussians.num_gaussians < 2000:
+            densify_initial_gaussians(self.gaussians, expansion_factor=8, noise_scale=0.02)
+            print(f"  [INIT] Densified to {self.gaussians.num_gaussians} Gaussians")
 
     def _setup_optimizers(self):
         """Initialize optimizers with current learning rates."""
@@ -543,69 +597,55 @@ class Trainer:
 
         eff_deg = self.effective_sh_degree()
 
-        # Render
-        if self.use_cuda_rasterizer:
-            means3D = self.gaussians.positions
-            scales = torch.exp(self.gaussians.log_scales).repeat(1, 3)
-            rotations = self.gaussians.rotations
-            opacities = self.gaussians.opacities
+        # ---------- CUDA rasterizer only ----------
+        means3D = self.gaussians.positions
+        scales = torch.exp(self.gaussians.log_scales).repeat(1, 3)
+        rotations = self.gaussians.rotations
+        opacities = self.gaussians.opacities
 
-            shs = self.gaussians.sh_coeffs if eff_deg > 0 else None
-            colors_precomp = None if eff_deg > 0 else self.gaussians.sh_coeffs[:, 0, :]
+        shs = self.gaussians.sh_coeffs if eff_deg > 0 else None
+        colors_precomp = None if eff_deg > 0 else self.gaussians.sh_coeffs[:, 0, :]
 
-            R = self.view_matrix[:3, :3]
-            t = self.view_matrix[:3, 3]
-            cam_pts = means3D @ R.T + t
-            cam_x, cam_y, cam_z = cam_pts[:, 0], cam_pts[:, 1], cam_pts[:, 2]
-            z_clip = torch.clamp(cam_z, min=0.01)
-            fx = self.fx if not self.train_focal else self.fx
-            fy = self.fy if not self.train_focal else self.fy
-            u = fx * cam_x / z_clip + self.cx
-            v = fy * cam_y / z_clip + self.cy
-            means2D = torch.stack([u, v], dim=-1)
+        R = self.view_matrix[:3, :3]
+        t = self.view_matrix[:3, 3]
+        cam_pts = means3D @ R.T + t
+        cam_x, cam_y, cam_z = cam_pts[:, 0], cam_pts[:, 1], cam_pts[:, 2]
+        z_clip = torch.clamp(cam_z, min=0.01)
+        fx = self.fx if not self.train_focal else self.fx
+        fy = self.fy if not self.train_focal else self.fy
+        u = fx * cam_x / z_clip + self.cx
+        v = fy * cam_y / z_clip + self.cy
+        means2D = torch.stack([u, v], dim=-1)
 
-            viewmat = self.view_matrix[:3, :]
-            projmat = self._build_projection_matrix()
-            cam_center = self._get_camera_center(self.view_matrix)
-            self._update_tanfov()
+        viewmat = self.view_matrix[:3, :]
+        projmat = self._build_projection_matrix()
+        cam_center = self._get_camera_center(self.view_matrix)
+        self._update_tanfov()
 
-            settings = RasterizationSettings(
-                image_height=self.image_height,
-                image_width=self.image_width,
-                tanfovx=self.tanfovx,
-                tanfovy=self.tanfovy,
-                bg=self.background,
-                scale_modifier=1.0,
-                viewmatrix=viewmat,
-                projmatrix=projmat,
-                sh_degree=eff_deg,
-                campos=cam_center,
-                prefiltered=False,
-                debug=False,
-            )
-            rasterizer = CUDARasterizer(raster_settings=settings)
-            rendered, _ = rasterizer(
-                means3D=means3D,
-                means2D=means2D,
-                scales=scales,
-                rotations=rotations,
-                opacities=opacities,
-                colors_precomp=colors_precomp,
-                shs=shs,
-            )
-        else:
-            if self.rasterizer is None:
-                raise RuntimeError("No rasterizer available")
-            # Use SH0 only
-            rendered, _ = self.rasterizer(
-                self.gaussians.positions,
-                self.gaussians.cov3d,
-                self.gaussians.opacities,
-                self.gaussians.sh_coeffs,
-                self.view_matrix,
-                self.K,
-                self.background,
-            )
+        settings = RasterizationSettings(
+            image_height=self.image_height,
+            image_width=self.image_width,
+            tanfovx=self.tanfovx,
+            tanfovy=self.tanfovy,
+            bg=self.background,
+            scale_modifier=1.0,
+            viewmatrix=viewmat,
+            projmatrix=projmat,
+            sh_degree=eff_deg,
+            campos=cam_center,
+            prefiltered=False,
+            debug=False,
+        )
+        rasterizer = CUDARasterizer(raster_settings=settings)
+        rendered, _ = rasterizer(
+            means3D=means3D,
+            means2D=means2D,
+            scales=scales,
+            rotations=rotations,
+            opacities=opacities,
+            colors_precomp=colors_precomp,
+            shs=shs,
+        )
 
         # Target
         if isinstance(target_image, torch.Tensor):
@@ -809,9 +849,6 @@ class Trainer:
         ad.densify_every = state.get("densify_every", DENSIFY_EVERY)
         ad.prune_every = state.get("prune_every", PRUNE_EVERY)
 
-        # Rebuild optimizers if shapes mismatch (density control may have changed)
-        # But we've already loaded states, so we trust they match.
-        # If they don't, we'll let the next density control step rebuild them.
         self._update_tanfov()
 
 
