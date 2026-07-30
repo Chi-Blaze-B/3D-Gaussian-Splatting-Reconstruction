@@ -53,7 +53,7 @@
    
    Linux/macOS：需自行安装 COLMAP，并确保 colmap 命令在 PATH 中可用。
 
-🚀 使用方式
+## 🚀 使用方式
 
 1. 命令行接口（CLI）
 
@@ -86,6 +86,7 @@ python cli.py --video input.mp4 --output output.ply
 | `--pose-estimator` | 姿态估计后端：opencv / colmap | `opencv` |
 | `--focal-guess` | 初始焦距猜测（像素） | `None` |
 | `--resume-dir` | 从该工作目录恢复训练 | `None` |
+| `--eval-every` | 每 N 轮打印一次日志 | `500` |
 
 示例：
 ```bash
@@ -113,7 +114,7 @@ python gui.py
 - 日志输出窗口详细记录每步进度
 - 支持中断训练并自动保存检查点
 
-🧩 核心模块说明
+## 🧩 核心模块说明
 
 | 模块 | 功能 |
 |------|------|
@@ -125,37 +126,48 @@ python gui.py
 | `exporter.py` | 导出标准 PLY 格式，兼容官方查看器 |
 | `gui.py` | PySide6 暗色主题图形界面 |
 | `cli.py` | 命令行入口，集成完整流程 |
-📈 训练细节
-损失函数：(1 - w_ssim) * L1 + w_ssim * SSIM，SSIM 权重线性升温。
 
-密度控制：每 densify_every 步根据梯度累积和尺度分裂/复制高斯，每 prune_every 步修剪低不透明度高斯，并自动限制总数量。
+## 📈 训练细节
 
-学习率衰减：指数衰减，每 lr_decay_steps 步乘以 lr_decay_gamma。
+**损失函数**：`(1 - w_ssim) * L1 + w_ssim * SSIM`，SSIM 权重线性升温。
 
-SH 升温：前 sh_warmup_steps 步逐渐提升 SH 阶数，从 0 逐步增至设定值。
+**密度控制**：每 `densify_every` 步根据梯度累积和尺度分裂/复制高斯，每 `prune_every` 步修剪低不透明度高斯，并自动限制总数量。
 
-焦距自校准：若启用 --train-focal，在训练中优化焦距参数（fx, fy），适应实际内参。
+**初始高斯稠密化**：若初始化后高斯数量少于 2000 个，自动对每个高斯做 8 倍扩增（加噪声），确保训练有足够的起始高斯数。
 
-径向畸变：实验性支持优化一阶径向畸变系数 k1（仅 --enable-k1）。
+**学习率衰减**：指数衰减，每 `lr_decay_steps` 步乘以 `lr_decay_gamma`。
 
-💾 断点续训
-所有中间结果和训练状态保存在 --workdir 指定目录下：
+**SH 升温**：前 `sh_warmup_steps` 步逐渐提升 SH 阶数，从 0 逐步增至设定值。
 
-frame_paths.txt：帧路径列表
+**梯度裁剪**：全局梯度范数限制为 10.0，防止训练发散。
 
-intrinsics.npy、poses.npy、sparse_points.npy：姿态和稀疏点云
+**Loss 发散保护**：若单步 loss 超过阈值（默认 1.0），自动保存检查点并中断训练，避免无限发散。
 
-gaussian_params.npz：初始化后的高斯参数
+**焦距自校准**：若启用 `--train-focal`，在训练中优化焦距参数（fx, fy），适应实际内参。
 
-training_state.pt：完整训练状态（包括优化器、密度控制器、焦距、k1、SH 阶数、最佳损失等）
+**径向畸变**：实验性支持优化一阶径向畸变系数 k1（仅 `--enable-k1`）。
 
-恢复训练：
+## 💾 断点续训
+
+所有中间结果和训练状态保存在 `--workdir` 指定目录下：
+
+| 文件 | 内容 |
+|------|------|
+| `frame_paths.txt` | 帧路径列表 |
+| `intrinsics.npy`、`poses.npy`、`sparse_points.npy` | 姿态和稀疏点云 |
+| `gaussian_params.npz` | 初始化后的高斯参数 |
+| `training_state.pt` | 完整训练状态（参数、优化器、密度控制器、焦距、k1、SH 阶数等） |
+| `best_training_state.pt` | 历史最优（最低 loss）训练状态，始终保留不覆盖 |
+
+**最佳检查点保护**：`best_training_state.pt` 始终保留训练过程中的最优模型，与常规检查点分开保存，不会因后续训练震荡而被覆盖。
+
+**恢复训练**：
 ```bash
 python cli.py --video input.mp4 --resume-dir ./workdir --output restored.ply
 ```
 或通过 GUI 直接选择相同的工作目录，程序自动检测并恢复。恢复时，训练会从上次中断的帧位置继续，而非从头开始该轮次。
 
-⚙️ 高级参数调优建议
+## ⚙️ 高级参数调优建议
 --sampling-mode two-stage：适用于快速运动或视角变化剧烈的视频，能更好保留细节。
 
 --sh-degree 3：获得最强的视角相关效果，但训练时间略增。
@@ -168,7 +180,8 @@ python cli.py --video input.mp4 --resume-dir ./workdir --output restored.ply
 
 --enable-k1：仅当镜头畸变明显时开启，否则可能引入噪声。
 
-📝 注意事项
+## 📝 注意事项
+
 帧采样数量：通常 100~200 帧效果较好，过少会导致欠约束，过多增加训练时间。
 
 姿态估计：若 ORB 方法失败，可尝试 --pose-estimator colmap（需安装 COLMAP）。COLMAP 更鲁棒但速度较慢。
@@ -179,10 +192,10 @@ CPU 亲和性：启动时会自动绑定所有逻辑核心，提升多核利用�
 
 光栅化器：本项目使用纯 PyTorch 实现的光栅化器，无需编译任何 CUDA 扩展，开箱即用。
 
-📄 许可证
+## 📄 许可证
 本项目采用 MIT 许可证，欢迎自由使用和修改。
 
-🙏 致谢
+## 🙏 致谢
 3D Gaussian Splatting 原始论文和开源代码。
 
 OpenCV、PyTorch、SciPy、PySide6 等优秀开源库。
