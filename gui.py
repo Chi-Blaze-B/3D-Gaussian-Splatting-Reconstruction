@@ -20,6 +20,19 @@ import matplotlib
 matplotlib.use("Agg")
 import matplotlib.pyplot as plt
 
+import psutil
+import os
+
+def set_affinity_to_all_cores():
+    """将当前进程绑定到所有逻辑核心"""
+    try:
+        p = psutil.Process(os.getpid())
+        all_cpus = list(range(psutil.cpu_count()))
+        p.cpu_affinity(all_cpus)
+        print(f"[INFO] CPU 亲和性设置为 {len(all_cpus)} 个核心")
+    except Exception as e:
+        print(f"[WARN] 无法设置 CPU 亲和性: {e}")
+
 os.environ["PYTORCH_CUDA_ALLOC_CONF"] = "expandable_segments:True"
 
 from PySide6.QtWidgets import (
@@ -868,7 +881,6 @@ class PipelineWorker(QThread):
             image_width=w,
             image_height=h,
             device=c["device"],
-            use_cuda_rasterizer=True,
             sh_degree=c["sh_degree"],
             random_background=c["random_background"],
             train_focal=c["train_focal"],
@@ -896,14 +908,17 @@ class PipelineWorker(QThread):
             except Exception as e:
                 self._log(f"  [WARN] 加载检查点失败: {e}，从头开始")
 
-        for epoch in range(start_epoch, c["num_epochs"] + 1):
-            if not self._running:
-                self._log("  用户已取消训练")
-                trainer.save_training_state(pt_ckpt)
-                self.finished_signal.emit(False, "已取消")
-                return
+        # ========== 训练主循环（修复版） ==========
+        try:
+            for epoch in range(start_epoch, c["num_epochs"] + 1):
+                # 检查停止标志（外层）
+                if not self._running or self._stop_event.is_set():
+                    self._log("  用户已取消训练")
+                    trainer.save_training_state(pt_ckpt)
+                    self.finished_signal.emit(False, "已取消")
+                    return
 
-            try:
+                # 定义进度回调
                 def _prog(fi, tot, loss):
                     self._log(f"[{epoch}/{c['num_epochs']}] 帧 {fi}/{tot} | 损失: {loss:.6f}")
                     pct = 50 + int((epoch - start_epoch) / max(1, c["num_epochs"] - start_epoch) * 40)
@@ -911,50 +926,80 @@ class PipelineWorker(QThread):
                     self.progress_signal.emit(min(pct, 94), f"帧 {fi}/{tot} | 损失: {loss:.6f}")
                     self._emit_frame_loss(epoch, fi, loss)
 
-                avg_loss = trainer.train_epoch(
-                    frames_iter=frame_paths,
-                    camera_poses=train_poses,
-                    stop_event=self._stop_event,
-                    progress_callback=_prog,
-                    loss_threshold=1.0,
-                    checkpoint_path=pt_ckpt,
-                )
-            except LossDivergenceError as e:
-                self._log(f"\n  [LOSS DIVERGENCE] {e}")
-                trainer.save_training_state(pt_ckpt)
-                self.finished_signal.emit(False, "损失发散")
-                return
-            except torch.cuda.OutOfMemoryError:
-                self._log(f"\n  [OOM] CUDA 显存不足")
-                self._log("  尝试降低高斯上限并修剪...")
-                # Reduce max_gaussians and prune
-                new_max = max(100000, trainer.adaptive_density.max_gaussians // 2)
-                trainer.adaptive_density.max_gaussians = new_max
-                n_pruned = trainer.adaptive_density.prune(min_opacity=0.05)
-                self._log(f"  已修剪 {n_pruned} 个高斯，新上限 {new_max}")
-                trainer.save_training_state(pt_ckpt)
-                # Continue training with reduced budget
-                avg_loss = trainer.train_epoch(
-                    frames_iter=frame_paths,
-                    camera_poses=train_poses,
-                    stop_event=self._stop_event,
-                    progress_callback=_prog,
-                    loss_threshold=1.0,
-                    checkpoint_path=pt_ckpt,
-                )
+                try:
+                    avg_loss = trainer.train_epoch(
+                        frames_iter=frame_paths,
+                        camera_poses=train_poses,
+                        stop_event=self._stop_event,
+                        progress_callback=_prog,
+                        loss_threshold=1.0,
+                        checkpoint_path=pt_ckpt,
+                    )
+                except LossDivergenceError as e:
+                    self._log(f"\n  [LOSS DIVERGENCE] {e}")
+                    trainer.save_training_state(pt_ckpt)
+                    self.finished_signal.emit(False, "损失发散")
+                    return
+                except KeyboardInterrupt:
+                    # ===== 修复: 捕获停止信号 =====
+                    self._log("\n  [STOP] 训练已中断，正在保存检查点...")
+                    trainer.save_training_state(pt_ckpt)
+                    self.finished_signal.emit(False, "已取消")
+                    return
+                except torch.cuda.OutOfMemoryError:
+                    # ===== 修复: OOM 处理 =====
+                    self._log(f"\n  [OOM] CUDA 显存不足")
+                    self._log("  尝试降低高斯上限并修剪...")
+                    new_max = max(100000, trainer.adaptive_density.max_gaussians // 2)
+                    trainer.adaptive_density.max_gaussians = new_max
+                    # 调整修剪阈值
+                    trainer.adaptive_density.min_opacity = 0.05
+                    n_pruned = trainer.adaptive_density.prune()
+                    self._log(f"  已修剪 {n_pruned} 个高斯，新上限 {new_max}")
+                    trainer.save_training_state(pt_ckpt)
 
-            self._emit_epoch_loss(epoch, avg_loss)
-            self._current_epoch_frame_losses = []
+                    # 重新执行当前 epoch（从头开始）
+                    self._log("  重新开始当前轮次训练...")
+                    try:
+                        avg_loss = trainer.train_epoch(
+                            frames_iter=frame_paths,
+                            camera_poses=train_poses,
+                            stop_event=self._stop_event,
+                            progress_callback=_prog,
+                            loss_threshold=1.0,
+                            checkpoint_path=pt_ckpt,
+                        )
+                    except Exception as e2:
+                        self._log(f"  OOM 恢复后仍失败: {e2}")
+                        trainer.save_training_state(pt_ckpt)
+                        self.finished_signal.emit(False, f"OOM 恢复失败: {e2}")
+                        return
 
-            elapsed = time.time() - training_start
-            current_gs = trainer.gaussians.num_gaussians
-            self._log(f"  轮次 {epoch:>5d}/{c['num_epochs']} | 损失: {avg_loss:.6f} | 耗时: {elapsed:.0f}s | 高斯数: {current_gs}")
+                # 记录本轮损失
+                self._emit_epoch_loss(epoch, avg_loss)
+                self._current_epoch_frame_losses = []
 
-            if avg_loss < best_loss:
-                best_loss = avg_loss
+                elapsed = time.time() - training_start
+                current_gs = trainer.gaussians.num_gaussians
+                self._log(f"  轮次 {epoch:>5d}/{c['num_epochs']} | 损失: {avg_loss:.6f} | 耗时: {elapsed:.0f}s | 高斯数: {current_gs}")
 
-            pct = 45 + int((epoch - start_epoch + 1) / max(1, c["num_epochs"] - start_epoch + 1) * 50)
-            self._set_progress(min(pct, 95), f"训练轮次 {epoch}/{c['num_epochs']}")
+                if avg_loss < best_loss:
+                    best_loss = avg_loss
+
+                pct = 45 + int((epoch - start_epoch + 1) / max(1, c["num_epochs"] - start_epoch + 1) * 50)
+                self._set_progress(min(pct, 95), f"训练轮次 {epoch}/{c['num_epochs']}")
+
+        except KeyboardInterrupt:
+            # 外层防护（理论上不会触发，但保留）
+            self._log("\n  [STOP] 用户中断（外层），保存检查点...")
+            trainer.save_training_state(pt_ckpt)
+            self.finished_signal.emit(False, "已取消")
+            return
+        except Exception as e:
+            self._log(f"\n  [ERROR] 训练过程中发生异常: {e}")
+            trainer.save_training_state(pt_ckpt)
+            self.finished_signal.emit(False, str(e))
+            return
 
         self._log(f"\n  训练完成。最佳损失: {best_loss:.6f}")
         self._set_progress(95, "训练完成")
@@ -1549,6 +1594,7 @@ class MainWindow(QMainWindow):
 # ============================================================================
 
 def main():
+    set_affinity_to_all_cores()
     app = QApplication(sys.argv)
     app.setStyle("Fusion")
     app.setApplicationName("3D Gaussian Splatting")

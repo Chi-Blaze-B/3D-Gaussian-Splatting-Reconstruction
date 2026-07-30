@@ -23,26 +23,28 @@ from scipy.optimize import least_squares
 
 # ---------- Constants ----------
 MIN_INLIERS = 25
-KEYFRAME_ANGLE_DEG = 10.0
-KEYFRAME_TRANS_RATIO = 0.08
-COVIS_RATIO_THRESH = 0.3
-BA_MAX_ITER = 80
-GLOBAL_BA_ITER = 150
+KEYFRAME_ANGLE_DEG = 5.0
+KEYFRAME_TRANS_RATIO = 0.05
+COVIS_RATIO_THRESH = 0.25
+BA_MAX_ITER = 15                # was 30, reduced for speed and stability
+GLOBAL_BA_ITER = 25             # was 50
 MIN_BA_WINDOW = 5
-PRUNE_INTERVAL = 50
-MIN_OBSERVATIONS = 3
-MAX_REPROJ_ERROR = 3.0
+PRUNE_INTERVAL = 200            # fixed
+MIN_OBSERVATIONS = 2 
+MAX_REPROJ_ERROR = 4.0
 SMALL_TRANSLATION = 1e-4
-MATCH_DIST = 65                  # 降低此值（如 50）可增加匹配数量，但可能增加误匹配
+MATCH_DIST = 90
 DESC_UPDATE_THRESH = 35
 MIN_FEATURES = 80
-MIN_TRI_ANGLE_DEG = 1.5
+MIN_TRI_ANGLE_DEG = 0.5
 INIT_MIN_TRANSLATION = 0.01
 KEYFRAME_CULLING_WINDOW = 10
-LOCAL_MAP_RADIUS = 3
-MAX_POINTS_IN_BA = 500          # limit for global BA
+LOCAL_MAP_RADIUS = 2
+MAX_POINTS_IN_BA = 150          # was 500, reduce to avoid overfitting
 EPS_MIN = 1e-8
 EPS_MAX = 0.1
+BA_MAX_OBS = 2000               # new: cap observations per BA call
+BA_F_SCALE_MULTIPLIER = 3.0     # new: make loss more robust
 
 logger = logging.getLogger(__name__)
 logging.basicConfig(level=logging.INFO, format="[Pose] %(message)s")
@@ -55,7 +57,7 @@ class CameraIntrinsics:
     fy: float
     cx: float
     cy: float
-    k1: float = 0.0   # not used, kept for compatibility
+    k1: float = 0.0
 
     @property
     def K(self) -> np.ndarray:
@@ -66,8 +68,8 @@ class CameraIntrinsics:
 
 @dataclass(frozen=True)
 class CameraPose:
-    R: np.ndarray   # (3,3)
-    t: np.ndarray   # (3,1)
+    R: np.ndarray
+    t: np.ndarray
 
     @property
     def RT(self) -> np.ndarray:
@@ -83,18 +85,10 @@ def estimate_poses(
     output_dir: str,
     *,
     min_inliers: int = MIN_INLIERS,
-    feature_type: str = "orb",      # "orb" or "sift"
+    feature_type: str = "orb",
     focal_guess: Optional[float] = None,
     aspect_ratio: float = 1.0,
 ) -> Tuple[CameraIntrinsics, List[CameraPose], np.ndarray]:
-    """
-    Estimate camera poses from a sequence of frames.
-
-    Returns:
-        intrinsics: CameraIntrinsics
-        poses: list of CameraPose, same length as frame_paths (None for unregistered frames filled with last valid)
-        sparse_points: (N,3) array of reconstructed 3D points
-    """
     if not frame_paths:
         raise ValueError("frame_paths cannot be empty")
 
@@ -107,39 +101,34 @@ def estimate_poses(
     fy0 = focal0 * aspect_ratio
     image_size = max(w, h)
 
-    # Adaptive thresholds
-    reproj_thresh = max(0.5, min(2.0, image_size * 0.001))
+    reproj_thresh = max(0.5, min(3.0, image_size * 0.0015))
     ransac_thresh = reproj_thresh * 0.8
     triang_thresh = reproj_thresh
     logger.info(f"Thresholds: reproj={reproj_thresh:.2f}, ransac={ransac_thresh:.2f}")
 
-    # Data structures
-    map_points: List[Dict] = []          # each dict: xyz, desc, obs list, obs_count, desc_age
+    map_points: List[Dict] = []
     frame_poses: List[Optional[CameraPose]] = [None] * len(images)
-    feat_map = [[-1] * len(kp) for kp in kp_list]   # frame -> keypoint -> map point index
+    feat_map = [[-1] * len(kp) for kp in kp_list]
     frame_to_points: Dict[int, Set[int]] = defaultdict(set)
 
-    # First frame: identity
     frame_poses[0] = CameraPose(np.eye(3), np.zeros((3, 1)))
     keyframes = [0]
     last_pose = frame_poses[0]
 
     bf = cv2.BFMatcher(cv2.NORM_HAMMING, crossCheck=False)
 
-    # ----- Process frames -----
     initialized = False
-    # We'll attempt to initialize with the first non‑pure‑rotation pair.
-    init_candidates = []   # store (prev_idx, curr_idx, matches, pts_prev, pts_curr, mask)
+    init_candidates = []
+    ba_counter = 0
 
     for i in range(1, len(images)):
-        logger.debug(f"Frame {i}/{len(images)-1}")
+        logger.info(f"Processing frame {i}/{len(images)-1}")
 
         if len(kp_list[i]) < MIN_FEATURES // 2:
             logger.warning(f"Frame {i} has too few features, copying previous pose")
             frame_poses[i] = last_pose
             continue
 
-        # Match with previous frame
         matches = _match_features(desc_list[i-1], desc_list[i], bf)
         if len(matches) < min_inliers:
             frame_poses[i] = last_pose
@@ -148,7 +137,6 @@ def estimate_poses(
         pts_prev = np.array([kp_list[i-1][m.queryIdx].pt for m in matches], dtype=np.float32)
         pts_curr = np.array([kp_list[i][m.trainIdx].pt for m in matches], dtype=np.float32)
 
-        # Essential matrix
         E, mask = cv2.findEssentialMat(pts_prev, pts_curr, focal=focal0, pp=(cx, cy),
                                        method=cv2.RANSAC, prob=0.999, threshold=ransac_thresh)
         if E is None or mask.sum() < min_inliers:
@@ -166,12 +154,10 @@ def estimate_poses(
         is_pure_rotation = trans_norm < SMALL_TRANSLATION
 
         R_curr = R_rel @ last_pose.R
-        t_curr = R_rel @ last_pose.t + t_rel   # scale will be normalized upon init
+        t_curr = R_rel @ last_pose.t + t_rel
 
-        # ----- Initialization -----
         if not initialized:
             if not is_pure_rotation and trans_norm > INIT_MIN_TRANSLATION:
-                # Found a good pair: initialize
                 norm_t = np.linalg.norm(t_curr)
                 if norm_t > 0:
                     t_curr = t_curr / norm_t
@@ -179,7 +165,6 @@ def estimate_poses(
                     frame_poses[i] = new_pose
                     last_pose = new_pose
                     initialized = True
-                    # Triangulate points from this pair
                     _triangulate_new_points(i, matches, mask_pose.ravel().astype(bool),
                                             kp_list, pts_prev, pts_curr,
                                             frame_poses[i-1], new_pose,
@@ -190,18 +175,14 @@ def estimate_poses(
                     logger.info(f"Initialized with frames 0 and {i}")
                     continue
                 else:
-                    # Pure rotation or too small translation – store potential candidate
                     init_candidates.append((i, matches, mask_pose, pts_prev, pts_curr))
                     frame_poses[i] = last_pose
                     continue
             else:
-                # Still looking for good pair; if we have enough candidates, try pairing among them
                 if len(init_candidates) >= 2:
-                    # Try to initialize using the last two candidates
                     for j in range(len(init_candidates)-1, -1, -1):
                         idx_cand, _, _, _, _ = init_candidates[j]
                         if idx_cand > 0 and idx_cand < i:
-                            # Try essential matrix between candidate frame and current
                             matches_cand = _match_features(desc_list[idx_cand], desc_list[i], bf)
                             if len(matches_cand) >= min_inliers:
                                 pts_cand = np.array([kp_list[idx_cand][m.queryIdx].pt for m in matches_cand], dtype=np.float32)
@@ -232,16 +213,12 @@ def estimate_poses(
                                             break
                     if initialized:
                         continue
-                # If still not initialized, copy pose and continue
                 frame_poses[i] = last_pose
                 continue
 
-        # ----- Normal processing (initialized) -----
-        # Estimate new pose from relative motion
         new_pose = CameraPose(R_curr, t_curr)
         inlier_mask = mask_pose.ravel().astype(bool)
 
-        # Triangulate new points
         _triangulate_new_points(i, matches, inlier_mask,
                                 kp_list, pts_prev, pts_curr,
                                 frame_poses[i-1], new_pose,
@@ -274,7 +251,6 @@ def estimate_poses(
                 if inliers_pnp is not None and len(inliers_pnp) >= 8:
                     R_pnp, _ = cv2.Rodrigues(rvec_pnp)
                     t_pnp = tvec_pnp.reshape(3, 1)
-                    # Check scale
                     depth_median = np.median([np.linalg.norm(p) for p in pts3d_local])
                     if np.linalg.norm(t_pnp) < 10.0 * depth_median:
                         new_pose = CameraPose(R_pnp, t_pnp)
@@ -288,7 +264,6 @@ def estimate_poses(
                        covis_ratio < COVIS_RATIO_THRESH)
 
         if is_keyframe and not is_pure_rotation and len(map_points) > 20:
-            # Keyframe culling
             if len(keyframes) > KEYFRAME_CULLING_WINDOW:
                 recent = keyframes[-KEYFRAME_CULLING_WINDOW:-1]
                 for kf in recent:
@@ -299,8 +274,8 @@ def estimate_poses(
                             break
             keyframes.append(i)
 
-            # Run local BA
-            if len(keyframes) >= MIN_BA_WINDOW:
+            ba_counter += 1
+            if len(keyframes) >= MIN_BA_WINDOW and ba_counter % 2 == 0:
                 window = keyframes[-MIN_BA_WINDOW:]
                 focal0, fy0 = _bundle_adjustment(
                     window, map_points, feat_map, frame_poses,
@@ -311,30 +286,19 @@ def estimate_poses(
                     max_iter=BA_MAX_ITER,
                     is_global=False
                 )
-                # Update scene depth scale
-                depths = [np.linalg.norm(p['xyz']) for p in map_points if np.isfinite(np.linalg.norm(p['xyz']))]
-                if depths:
-                    scale = np.median(depths)
-                    # Scale all poses and points to keep numeric stability
-                    # (we don't explicitly rescale here; BA handles it)
 
-        # Update last pose
         last_pose = new_pose
         frame_poses[i] = new_pose
 
-        # Periodic pruning
         if i % PRUNE_INTERVAL == 0 and len(map_points) > 100:
             _prune_map_points(map_points, feat_map, frame_to_points, reproj_thresh,
                               frame_poses, focal0, fy0, cx, cy)
 
-    # ----- Handle uninitialized case -----
     if not initialized:
         raise RuntimeError(
-            "Could not initialize SfM: no pair of frames with sufficient translation found. "
-            "Ensure the video contains translational motion (not pure rotation)."
+            "Could not initialize SfM: no pair of frames with sufficient translation found."
         )
 
-    # ----- Final global BA -----
     if len(keyframes) >= 3 and len(map_points) > 50:
         logger.info("Running global BA on all keyframes...")
         focal0, fy0 = _bundle_adjustment(
@@ -347,13 +311,11 @@ def estimate_poses(
             is_global=True
         )
 
-    # Final pruning and filtering
     _prune_map_points(map_points, feat_map, frame_to_points, reproj_thresh,
                       frame_poses, focal0, fy0, cx, cy)
     all_xyz, mask = _filter_point_cloud(map_points, frame_poses, focal0, fy0, cx, cy, reproj_thresh)
     all_xyz = all_xyz[mask] if np.any(mask) else all_xyz
 
-    # Fill missing poses
     last_valid = frame_poses[0]
     for i, p in enumerate(frame_poses):
         if p is None:
@@ -369,11 +331,14 @@ def estimate_poses(
 # ---------- Feature Extraction ----------
 def _extract_features(paths: List[str], feature_type: str = "orb"):
     images, kps, descs = [], [], []
-    # 增加特征数量以产生更多点云（默认5000已足够，可调至8000）
     if feature_type == "sift":
-        detector = cv2.SIFT_create(nfeatures=8000, contrastThreshold=0.04, edgeThreshold=10)
+        try:
+            detector = cv2.SIFT_create(nfeatures=12000, contrastThreshold=0.03, edgeThreshold=10, sigma=1.6)
+        except cv2.error as e:
+            logger.warning(f"SIFT not available ({e}), falling back to ORB.")
+            detector = cv2.ORB_create(nfeatures=12000, scaleFactor=1.2, nlevels=8, edgeThreshold=31, patchSize=31)
     else:
-        detector = cv2.ORB_create(nfeatures=8000, scaleFactor=1.2, nlevels=8)
+        detector = cv2.ORB_create(nfeatures=12000, scaleFactor=1.2, nlevels=8, edgeThreshold=31, patchSize=31)
 
     for p in paths:
         img = cv2.imread(p, cv2.IMREAD_COLOR)
@@ -387,6 +352,7 @@ def _extract_features(paths: List[str], feature_type: str = "orb"):
     return images, kps, descs
 
 
+# ---------- Match Features ----------
 def _match_features(desc1, desc2, bf, ratio=0.75):
     if desc1 is None or desc2 is None or len(desc1) == 0 or len(desc2) == 0:
         return []
@@ -394,6 +360,7 @@ def _match_features(desc1, desc2, bf, ratio=0.75):
         matches = cv2.BFMatcher(cv2.NORM_HAMMING, crossCheck=True).match(desc1, desc2)
         return [m for m in matches if m.distance < MATCH_DIST]
     raw = bf.knnMatch(desc1, desc2, k=2)
+    raw = [pair for pair in raw if len(pair) == 2]
     good = []
     for m, n in raw:
         if m.distance < ratio * n.distance and m.distance < MATCH_DIST:
@@ -401,7 +368,7 @@ def _match_features(desc1, desc2, bf, ratio=0.75):
     return good
 
 
-# ---------- Geometry Helpers ----------
+# ---------- Helpers ----------
 def _compute_rotation_angle(R):
     rv, _ = cv2.Rodrigues(R)
     return np.linalg.norm(rv) * 180.0 / np.pi
@@ -448,7 +415,6 @@ def _update_map_point_descriptor(pt_dict, new_desc):
         pt_dict['desc_age'] = age + 1
 
 
-# ---------- Triangulation ----------
 def _triangulate_new_points(curr_idx, matches, inlier_mask,
                             kp_list, pts_prev, pts_curr,
                             pose_prev, pose_curr,
@@ -468,7 +434,6 @@ def _triangulate_new_points(curr_idx, matches, inlier_mask,
         prev_feat = m.queryIdx
         curr_feat = m.trainIdx
 
-        # Skip if already linked
         if feat_map[curr_idx][curr_feat] >= 0:
             continue
 
@@ -516,7 +481,6 @@ def _is_valid_point(pt3d, pose_prev, pose_curr, cam_prev, cam_curr,
     if depth_prev <= 0 or depth_curr <= 0:
         return False
 
-    # Parallax
     v1 = pt3d - cam_prev.flatten()
     v2 = pt3d - cam_curr.flatten()
     n1, n2 = np.linalg.norm(v1), np.linalg.norm(v2)
@@ -526,7 +490,6 @@ def _is_valid_point(pt3d, pose_prev, pose_curr, cam_prev, cam_curr,
     if cos_angle > np.cos(np.radians(MIN_TRI_ANGLE_DEG)):
         return False
 
-    # Reprojection
     proj_prev = P_prev @ np.append(pt3d, 1.0)
     proj_curr = P_curr @ np.append(pt3d, 1.0)
     proj_prev = proj_prev[:2] / (proj_prev[2] + 1e-12)
@@ -537,7 +500,7 @@ def _is_valid_point(pt3d, pose_prev, pose_curr, cam_prev, cam_curr,
     return True
 
 
-# ---------- Bundle Adjustment ----------
+# ---------- Robust Bundle Adjustment ----------
 def _bundle_adjustment(
     keyframe_ids, map_points, feat_map, frame_poses,
     kp_list, focal, fy, cx, cy,
@@ -547,21 +510,11 @@ def _bundle_adjustment(
     max_iter=BA_MAX_ITER,
     is_global=False,
 ):
-    """
-    Bundle adjustment for a set of keyframes.
-    Returns updated focal, fy.
-    """
-    # ---------- FIX: Filter out invalid keyframes (pose is None) ----------
     valid_kfs = [f for f in keyframe_ids if f < len(frame_poses) and frame_poses[f] is not None]
     if len(valid_kfs) < 2:
         return focal, fy
     keyframe_ids = valid_kfs
-    # ---------- End of fix ----------
 
-    if len(keyframe_ids) < 2:
-        return focal, fy
-
-    # Collect observations
     obs = []
     for f_idx in keyframe_ids:
         for kp_idx, pt_idx in enumerate(feat_map[f_idx]):
@@ -572,22 +525,26 @@ def _bundle_adjustment(
     if len(obs) < 10:
         return focal, fy
 
-    # For global BA, limit points to avoid explosion
-    if is_global and len(obs) > 5000:
-        # Subsample observations (keep all frames, random points)
+    # ===== 限制观测数量 =====
+    if len(obs) > BA_MAX_OBS:
         np.random.seed(42)
-        obs = np.array(obs, dtype=object)
-        indices = np.random.choice(len(obs), 5000, replace=False)
-        obs = obs[indices].tolist()
+        idx = np.random.choice(len(obs), BA_MAX_OBS, replace=False)
+        obs = [obs[i] for i in idx]
+        logger.info(f"BA sampled {BA_MAX_OBS} observations out of {len(obs)}")
 
-    # Determine fixed frame (most observations)
+    logger.info(f"BA started: {len(keyframe_ids)} keyframes, {len(obs)} obs")
+
+    if is_global and len(obs) > 3000:
+        np.random.seed(42)
+        idx = np.random.choice(len(obs), 3000, replace=False)
+        obs = [obs[i] for i in idx]
+
     obs_count = {f: 0 for f in keyframe_ids}
     for f, _, _, _ in obs:
         obs_count[f] += 1
     fixed_kf = max(obs_count, key=obs_count.get)
     other_kfs = [f for f in keyframe_ids if f != fixed_kf]
 
-    # Build parameter vector: [focal, fy] + poses (6 per keyframe) + points (3 per point)
     eps = _compute_adaptive_eps(map_points)
     param = [float(focal), float(fy)]
     for idx in other_kfs:
@@ -599,7 +556,6 @@ def _bundle_adjustment(
     if optimize_points:
         point_ids = sorted({pt for _, pt, _, _ in obs})
         if len(point_ids) > MAX_POINTS_IN_BA:
-            # Keep points with most observations
             cnt = {pid: 0 for pid in point_ids}
             for _, pid, _, _ in obs:
                 cnt[pid] += 1
@@ -607,7 +563,6 @@ def _bundle_adjustment(
         for pid in point_ids:
             param.extend(map_points[pid]['xyz'])
 
-    # Bounds
     bound_scale = 100.0 * image_size
     bounds_lower = [1.0, 1.0] + [-bound_scale] * len(other_kfs) * 6
     bounds_upper = [10.0 * image_size, 10.0 * image_size] + [bound_scale] * len(other_kfs) * 6
@@ -619,7 +574,6 @@ def _bundle_adjustment(
         f = params[0]
         fy_local = params[1]
         n_poses = len(other_kfs)
-        # Reconstruct poses
         poses = {fixed_kf: frame_poses[fixed_kf]}
         for i, idx in enumerate(other_kfs):
             start = 2 + i * 6
@@ -628,14 +582,11 @@ def _bundle_adjustment(
             R, _ = cv2.Rodrigues(rv)
             poses[idx] = CameraPose(R, t.reshape(3, 1))
 
-        pts = {}
+        pts = {pid: map_points[pid]['xyz'] for _, pid, _, _ in obs}
         if optimize_points and point_ids:
             pts_start = 2 + n_poses * 6
             for j, pid in enumerate(point_ids):
                 pts[pid] = params[pts_start + j*3 : pts_start + j*3 + 3]
-        else:
-            for pid in set(pt for _, pt, _, _ in obs):
-                pts[pid] = map_points[pid]['xyz']
 
         res = []
         for f_idx, pt_idx, u_obs, v_obs in obs:
@@ -643,26 +594,36 @@ def _bundle_adjustment(
             pose = poses[f_idx]
             pt_cam = pose.R @ pt3d.reshape(3, 1) + pose.t
             depth = float(pt_cam[2, 0])
-            # Barrier for depth
+
+            if depth <= 1e-8:
+                res.append(1000.0)
+                res.append(1000.0)
+                continue
+
             if depth < eps:
-                barrier = -np.log(max(depth/eps, 1e-10))
+                barrier = -np.log(max(depth / eps, 1e-10))
                 res.append(barrier)
                 res.append(barrier)
                 continue
+
             x = float(pt_cam[0, 0]) / depth
             y = float(pt_cam[1, 0]) / depth
             u_pred = f * x + cx
             v_pred = fy_local * y + cy
             res.append(u_pred - u_obs)
             res.append(v_pred - v_obs)
+
         return np.array(res, dtype=np.float64)
 
     try:
+        # ===== 使用更宽容的 f_scale =====
+        f_scale = reproj_thresh * BA_F_SCALE_MULTIPLIER
         result = least_squares(
             residuals, np.array(param, dtype=np.float64),
             bounds=(bounds_lower, bounds_upper),
-            method='trf', loss='soft_l1', f_scale=reproj_thresh,
-            max_nfev=max_iter, verbose=0
+            method='trf', loss='soft_l1', f_scale=f_scale,
+            max_nfev=max_iter, verbose=0,
+            ftol=1e-4, xtol=1e-4, gtol=1e-4   # relaxed tolerance
         )
         if result.success:
             focal_new = max(float(result.x[0]), 1.0)
@@ -678,10 +639,10 @@ def _bundle_adjustment(
                 pts_start = 2 + n_poses * 6
                 for j, pid in enumerate(point_ids):
                     map_points[pid]['xyz'] = result.x[pts_start + j*3 : pts_start + j*3 + 3]
-            logger.info(f"BA: focal {focal:.2f}->{focal_new:.2f}, fy {fy:.2f}->{fy_new:.2f}")
+            logger.info(f"BA finished: focal {focal:.2f}->{focal_new:.2f}, fy {fy:.2f}->{fy_new:.2f}")
             return focal_new, fy_new
         else:
-            logger.warning("BA failed")
+            logger.warning("BA failed (least_squares did not converge)")
             return focal, fy
     except Exception as e:
         logger.warning(f"BA exception: {e}")
@@ -689,7 +650,10 @@ def _bundle_adjustment(
 
 
 def _compute_adaptive_eps(map_points, default_eps=0.01):
-    depths = [np.linalg.norm(p['xyz']) for p in map_points if np.isfinite(np.linalg.norm(p['xyz'])) and p['xyz'].size == 3]
+    depths = []
+    for p in map_points:
+        if p['xyz'].size == 3 and np.isfinite(p['xyz']).all():
+            depths.append(np.linalg.norm(p['xyz']))
     if depths:
         median = np.median(depths)
         eps = median * 0.001
@@ -697,7 +661,6 @@ def _compute_adaptive_eps(map_points, default_eps=0.01):
     return default_eps
 
 
-# ---------- Pruning ----------
 def _prune_map_points(map_points, feat_map, frame_to_points, reproj_thresh,
                       frame_poses, focal, fy, cx, cy):
     if not map_points:
@@ -736,7 +699,6 @@ def _prune_map_points(map_points, feat_map, frame_to_points, reproj_thresh,
         return
 
     remove_set = set(to_remove)
-    # Update feat_map
     idx_map = {}
     new_idx = 0
     for old_idx in range(len(map_points)):
@@ -751,13 +713,10 @@ def _prune_map_points(map_points, feat_map, frame_to_points, reproj_thresh,
             if old >= 0:
                 feat_map[f_idx][kp_idx] = idx_map.get(old, -1)
 
-    # Rebuild frame_to_points
     for f in list(frame_to_points.keys()):
         frame_to_points[f] = set()
-    # Remove points
     for old_idx in reversed(to_remove):
         del map_points[old_idx]
-    # Update indices and frame_to_points
     for new_idx, pt in enumerate(map_points):
         pt['idx'] = new_idx
         for f_idx, _, _, _ in pt['obs']:
@@ -766,7 +725,6 @@ def _prune_map_points(map_points, feat_map, frame_to_points, reproj_thresh,
     logger.debug(f"Pruned {len(to_remove)} points, remaining {len(map_points)}")
 
 
-# ---------- Filtering ----------
 def _filter_point_cloud(map_points, frame_poses, focal, fy, cx, cy, reproj_thresh):
     if not map_points:
         return np.array([]), np.array([])

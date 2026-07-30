@@ -303,12 +303,16 @@ def _extract_uniform(
     return paths
 
 
+# ========== 核心修复：光流计算 ==========
 def _compute_flow_magnitudes(
     cap: cv2.VideoCapture,
     indices: np.ndarray,
     method: str = "farneback",
 ) -> List[float]:
-    """Compute optical flow magnitude for each pair of consecutive indices."""
+    """
+    Compute optical flow magnitude for each pair of consecutive indices.
+    Returns a list of average displacement magnitudes (scalars).
+    """
     if len(indices) < 2:
         return []
 
@@ -323,9 +327,7 @@ def _compute_flow_magnitudes(
         gray = cv2.cvtColor(bgr, cv2.COLOR_BGR2GRAY)
         if prev_gray is not None:
             if method == "lk":
-                # Lucas-Kanade: compute sparse flow on a grid
-                flow = _compute_lk_flow(prev_gray, gray)
-                mag = np.mean(np.sqrt(flow[..., 0]**2 + flow[..., 1]**2))
+                mag = _compute_lk_flow_magnitude(prev_gray, gray)
             else:  # farneback
                 flow = cv2.calcOpticalFlowFarneback(
                     prev_gray, gray, None,
@@ -334,13 +336,14 @@ def _compute_flow_magnitudes(
                 mag = np.mean(np.sqrt(flow[..., 0]**2 + flow[..., 1]**2))
             mags.append(mag)
         prev_gray = gray
-
     return mags
 
 
-def _compute_lk_flow(prev: np.ndarray, curr: np.ndarray) -> np.ndarray:
-    """Lucas-Kanade dense optical flow approximation using grid points."""
-    # Sample points on a grid
+def _compute_lk_flow_magnitude(prev: np.ndarray, curr: np.ndarray) -> float:
+    """
+    Lucas-Kanade sparse optical flow: compute average displacement magnitude
+    over a grid of feature points.
+    """
     h, w = prev.shape
     step = 16  # grid step
     y_coords = np.arange(0, h, step, dtype=np.float32)
@@ -353,20 +356,19 @@ def _compute_lk_flow(prev: np.ndarray, curr: np.ndarray) -> np.ndarray:
         winSize=LK_WINDOW_SIZE, maxLevel=LK_MAX_LEVEL,
         criteria=LK_CRITERIA
     )
-    # Compute displacement magnitude for valid points
     if status is None:
-        return np.zeros((h, w, 2), dtype=np.float32)
+        return 0.0
     valid = status.ravel() == 1
     if not np.any(valid):
-        return np.zeros((h, w, 2), dtype=np.float32)
+        return 0.0
     disp = (next_pts[valid] - pts[valid]).reshape(-1, 2)
-    # Create dense flow by filling grid
-    flow = np.zeros((h, w, 2), dtype=np.float32)
-    for (x, y), (dx, dy) in zip(pts[valid].reshape(-1, 2), disp):
-        flow[int(y), int(x)] = [dx, dy]
-    return flow
+    # Compute RMS of displacement magnitude
+    mags = np.sqrt(np.sum(disp ** 2, axis=1))
+    # Use mean of magnitudes (ignore zeros)
+    return float(np.mean(mags))
 
 
+# ---------- 其余辅助函数（未变） ----------
 def _compute_texture_scores(
     cap: cv2.VideoCapture,
     total_frames: int,

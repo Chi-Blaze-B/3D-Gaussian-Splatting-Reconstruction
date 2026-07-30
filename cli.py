@@ -17,6 +17,7 @@ import argparse
 import os
 import sys
 import time
+import signal
 from pathlib import Path
 
 import numpy as np
@@ -27,6 +28,19 @@ from poses import estimate_poses, CameraPose, CameraIntrinsics
 from point_cloud import initialize_gaussians
 from gaussian import Gaussian3D, DifferentiableRasterizer, Trainer, LazyFrames, LossDivergenceError
 from exporter import export_training_checkpoint
+
+import psutil
+import os
+
+def set_affinity_to_all_cores():
+    """将当前进程绑定到所有逻辑核心"""
+    try:
+        p = psutil.Process(os.getpid())
+        all_cpus = list(range(psutil.cpu_count()))
+        p.cpu_affinity(all_cpus)
+        print(f"[INFO] CPU 亲和性设置为 {len(all_cpus)} 个核心")
+    except Exception as e:
+        print(f"[WARN] 无法设置 CPU 亲和性: {e}")
 
 
 def build_parser() -> argparse.ArgumentParser:
@@ -95,15 +109,25 @@ def build_parser() -> argparse.ArgumentParser:
 def run_pipeline(args: argparse.Namespace) -> None:
     overall_start = time.time()
 
+    # ===== 修复: resume-dir 覆盖 workdir =====
+    workdir = Path(args.workdir)
+    if args.resume_dir is not None:
+        # 如果用户显式指定了 resume-dir，则 workdir 强制指向该目录
+        resume_path = Path(args.resume_dir)
+        if not resume_path.exists():
+            print(f"[ERROR] Resume directory not found: {args.resume_dir}")
+            sys.exit(1)
+        workdir = resume_path
+        print(f"[INFO] Resuming from workdir: {workdir}")
+    else:
+        workdir.mkdir(parents=True, exist_ok=True)
+
     # Determine device
     if args.device == "auto":
         device = "cuda" if torch.cuda.is_available() else "cpu"
     else:
         device = args.device
     print(f"Using device: {device}")
-
-    workdir = Path(args.workdir)
-    workdir.mkdir(parents=True, exist_ok=True)
 
     frame_dir = workdir / "frames"
     poses_dir = workdir / "poses"
@@ -117,11 +141,12 @@ def run_pipeline(args: argparse.Namespace) -> None:
     print("\n[1/5] Extracting frames...")
     t0 = time.time()
 
-    if args.resume_dir and (Path(args.resume_dir) / "frame_paths.txt").exists():
-        frame_paths = [p.strip() for p in (Path(args.resume_dir) / "frame_paths.txt").read_text().splitlines()]
-        print(f"  Loaded {len(frame_paths)} frames from {args.resume_dir}")
+    # 优先从 resume-dir 加载，若不存在则提取
+    frame_paths_file = workdir / "frame_paths.txt"
+    if frame_paths_file.exists():
+        frame_paths = [p.strip() for p in frame_paths_file.read_text().splitlines()]
+        print(f"  Loaded {len(frame_paths)} frames from {workdir}")
     else:
-        # Map sampling mode to boolean flags
         smart_sampling = args.sampling_mode != "uniform"
         two_stage = args.sampling_mode == "two-stage"
 
@@ -135,9 +160,9 @@ def run_pipeline(args: argparse.Namespace) -> None:
             smart_sampling=smart_sampling,
             two_stage=two_stage,
             poses_output_dir=str(poses_dir / "coarse_poses") if two_stage else None,
-            optical_flow_method="farneback",   # could be made configurable
+            optical_flow_method="farneback",
         )
-        (workdir / "frame_paths.txt").write_text("\n".join(frame_paths))
+        frame_paths_file.write_text("\n".join(frame_paths))
         print(f"  Extracted {len(frame_paths)} frames ({time.time()-t0:.1f}s)")
 
     if len(frame_paths) < 2:
@@ -152,12 +177,16 @@ def run_pipeline(args: argparse.Namespace) -> None:
     print("\n[2/5] Estimating camera poses...")
     t0 = time.time()
 
-    if args.resume_dir and (Path(args.resume_dir) / "intrinsics.npy").exists():
-        K = np.load(Path(args.resume_dir) / "intrinsics.npy")
-        poses_data = np.load(Path(args.resume_dir) / "poses.npy")
-        sparse_points = np.load(Path(args.resume_dir) / "sparse_points.npy")
+    intrinsics_file = workdir / "intrinsics.npy"
+    poses_file = workdir / "poses.npy"
+    sparse_file = workdir / "sparse_points.npy"
+
+    if intrinsics_file.exists() and poses_file.exists() and sparse_file.exists():
+        K = np.load(intrinsics_file)
+        poses_data = np.load(poses_file)
+        sparse_points = np.load(sparse_file)
         poses = [CameraPose(R=p[:3, :3].copy(), t=p[:3, 3].copy()) for p in poses_data]
-        print(f"  Loaded poses from {args.resume_dir}")
+        print(f"  Loaded poses from {workdir}")
     else:
         if args.pose_estimator == "colmap":
             try:
@@ -181,13 +210,12 @@ def run_pipeline(args: argparse.Namespace) -> None:
             K = intrinsics.K
 
         # Save for potential resume
-        np.save(workdir / "intrinsics.npy", K)
+        np.save(intrinsics_file, K)
         valid_poses = [p for p in poses if p is not None]
         if valid_poses:
-            np.save(poses_dir / "poses.npy", np.stack([p.RT for p in valid_poses]))
+            np.save(poses_file, np.stack([p.RT for p in valid_poses]))
         if sparse_points is not None and sparse_points.size > 0:
-            np.save(poses_dir / "sparse_points.npy", sparse_points)
-            np.save(workdir / "sparse_points.npy", sparse_points)
+            np.save(sparse_file, sparse_points)
 
     # Ensure poses list length matches frames
     while len(poses) < len(frame_paths):
@@ -203,10 +231,11 @@ def run_pipeline(args: argparse.Namespace) -> None:
     print("\n[3/5] Initializing 3D Gaussians...")
     t0 = time.time()
 
-    if args.resume_dir and (workdir / "gaussian_params.npz").exists():
-        params = dict(np.load(Path(args.resume_dir) / "gaussian_params.npz"))
+    gauss_init_file = workdir / "gaussian_params.npz"
+    if gauss_init_file.exists():
+        params = dict(np.load(gauss_init_file))
         gauss_init = {k: params[k] for k in ["positions", "scales", "opacities", "sh_coeffs", "rotations"]}
-        print(f"  Loaded initialized Gaussians from {args.resume_dir}")
+        print(f"  Loaded initialized Gaussians from {workdir}")
     else:
         class _Intrinsics:
             pass
@@ -218,7 +247,7 @@ def run_pipeline(args: argparse.Namespace) -> None:
             frame_paths=frame_paths,
             intrinsics=_intr,
         )
-        np.savez(workdir / "gaussian_params.npz", **gauss_init)
+        np.savez(gauss_init_file, **gauss_init)
 
     print(f"  Initialized {gauss_init['positions'].shape[0]} Gaussians ({time.time()-t0:.1f}s)")
 
@@ -256,47 +285,62 @@ def run_pipeline(args: argparse.Namespace) -> None:
         ssim_warmup_steps=args.ssim_warmup_steps,
         ssim_weight_max=args.ssim_weight_max,
         enable_k1=args.enable_k1,
-        # Other advanced params (density thresholds) could be exposed here
     )
 
     train_poses = [p.RT.astype(np.float32) if p is not None else None for p in poses]
     start_epoch = 1
     pt_ckpt = workdir / "training_state.pt"
-
-    # Resume if requested and checkpoint exists
-    if args.resume_dir and (Path(args.resume_dir) / "training_state.pt").exists():
-        try:
-            trainer.load_training_state(str(Path(args.resume_dir) / "training_state.pt"), device=device)
-            start_epoch = max(1, trainer.current_step // max(len(frame_paths), 1))
-            print(f"  Resumed from epoch {start_epoch}")
-        except Exception as e:
-            print(f"  [WARN] Failed to load training state: {e}. Starting from scratch.")
-
     best_loss = float("inf")
     training_start = time.time()
 
-    for epoch in range(start_epoch, args.num_epochs + 1):
+    # Resume if checkpoint exists
+    if pt_ckpt.exists():
         try:
-            avg_loss = trainer.train_epoch(
-                frames_iter=frame_paths,  # LazyFrames would also work
-                camera_poses=train_poses,
-                stop_event=None,
-                progress_callback=None,
-                loss_threshold=1.0,
-                checkpoint_path=str(pt_ckpt),
-            )
-        except LossDivergenceError as e:
-            print(f"\n  [LOSS DIVERGENCE] {e}")
-            break
+            trainer.load_training_state(str(pt_ckpt), device=device)
+            saved = trainer.current_step
+            start_epoch = max(1, saved // max(len(frame_paths), 1))
+            print(f"  Resumed from epoch {start_epoch} (step {saved})")
+        except Exception as e:
+            print(f"  [WARN] Failed to load training state: {e}. Starting from scratch.")
 
-        if epoch % max(1, args.eval_every) == 0 or epoch == start_epoch:
-            elapsed = time.time() - training_start
-            print(f"  Epoch {epoch:>5d}/{args.num_epochs} | Loss: {avg_loss:.6f} | "
-                  f"Time: {elapsed:.1f}s | Gaussians: {trainer.gaussians.num_gaussians}")
+    # ===== 修复: 捕获 KeyboardInterrupt 并保存检查点 =====
+    try:
+        for epoch in range(start_epoch, args.num_epochs + 1):
+            try:
+                avg_loss = trainer.train_epoch(
+                    frames_iter=frame_paths,
+                    camera_poses=train_poses,
+                    stop_event=None,   # CLI 无停止事件
+                    progress_callback=None,
+                    loss_threshold=1.0,
+                    checkpoint_path=str(pt_ckpt),
+                )
+            except LossDivergenceError as e:
+                print(f"\n  [LOSS DIVERGENCE] {e}")
+                trainer.save_training_state(str(pt_ckpt))
+                break
+            except KeyboardInterrupt:
+                # ===== 新增: Ctrl+C 时保存检查点 =====
+                print("\n  [STOP] Interrupted by user, saving checkpoint...")
+                trainer.save_training_state(str(pt_ckpt))
+                print("  Checkpoint saved. To resume, use --resume-dir", workdir)
+                sys.exit(0)
 
-        if avg_loss < best_loss:
-            best_loss = avg_loss
-            trainer.save_training_state(str(workdir / "best_training_state.pt"))
+            if epoch % max(1, args.eval_every) == 0 or epoch == start_epoch:
+                elapsed = time.time() - training_start
+                print(f"  Epoch {epoch:>5d}/{args.num_epochs} | Loss: {avg_loss:.6f} | "
+                      f"Time: {elapsed:.1f}s | Gaussians: {trainer.gaussians.num_gaussians}")
+
+            if avg_loss < best_loss:
+                best_loss = avg_loss
+                trainer.save_training_state(str(workdir / "best_training_state.pt"))
+
+    except KeyboardInterrupt:
+        # 外层防护（理论上不会触发）
+        print("\n  [STOP] Interrupted, saving checkpoint...")
+        trainer.save_training_state(str(pt_ckpt))
+        print("  Checkpoint saved. To resume, use --resume-dir", workdir)
+        sys.exit(0)
 
     total_train = time.time() - training_start
     print(f"\n  Training complete. Best loss: {best_loss:.6f} ({total_train:.1f}s)")
@@ -313,6 +357,7 @@ def run_pipeline(args: argparse.Namespace) -> None:
 
 
 def cli(argv: list[str] = None) -> None:
+    set_affinity_to_all_cores()
     parser = build_parser()
     args = parser.parse_args(argv)
 

@@ -5,7 +5,10 @@
 #  ⚠️ 请勿直接执行 `pip install -r requirements.txt`！
 #     原因：PyTorch 需要指定 CUDA 版本，OpenCV 需要用 headless 版本。
 #
-#  请按以下步骤依次安装：
+#  📌 注意：本项目使用 纯 PyTorch 实现的光栅化器，无需编译 CUDA 扩展。
+#     因此不依赖 diff-gaussian-rasterization，也不依赖 VS 或 CUDA 编译工具链。
+#
+#  请按以下步骤依次安装（推荐使用 conda 环境）：
 #
 #  1. 创建 conda 环境（必须 Python 3.11）
 #     conda create -n gs python=3.11
@@ -13,26 +16,23 @@
 #
 #  2. 安装 PyTorch（CUDA 12.1 版本，CPU 用户请去掉 cu121 后缀）
 #     pip install torch torchvision torchaudio --index-url https://download.pytorch.org/whl/cu121
+#     # 或 CPU 版：pip install torch torchvision torchaudio --index-url https://download.pytorch.org/whl/cpu
 #
 #  3. 安装 OpenCV（必须用 headless 版本，避免 Qt 冲突）
 #     pip install opencv-python-headless
 #
 #  4. 安装其余核心依赖
-#     pip install numpy scipy PySide6 matplotlib
+#     pip install numpy scipy PySide6 matplotlib psutil>=5.9.0
 #
-#  5. （可选）安装 CUDA 光栅化器（需 VS2022 生成工具 + CUDA Toolkit）
-#     pip install git+https://github.com/graphdeco-inria/diff-gaussian-rasterization
+#  5. （可选）COLMAP 后端支持
+#     Windows 用户：项目已附带 colmap-x64-windows-nocuda/，无需额外安装。
+#     Linux/macOS 用户：需自行安装 COLMAP（确保 `colmap` 命令可用）。
 #
-#  6. （可选）COLMAP 后端支持——需要额外下载 COLMAP 二进制文件
-#     项目已附带 colmap-x64-windows-nocuda/，无需 pip 安装任何包
-#
-#  7. （实验性）LPIPS 感知损失——代码中有支持但默认未启用
+#  6. （实验性）LPIPS 感知损失（代码中预留接口，但默认未启用）
 #     # pip install torchmetrics
 # =============================================================================
 
-# -----------------------------------------------------------------------------
 # 核心依赖（由上述步骤 2-4 安装）
-# -----------------------------------------------------------------------------
 # torch>=2.0.0
 # torchvision>=0.15.0
 # opencv-python-headless>=4.8.0
@@ -40,13 +40,7 @@
 # scipy>=1.10.0
 # PySide6>=6.5.0
 # matplotlib>=3.7.0
+# psutil>=5.9.0
 
-# -----------------------------------------------------------------------------
-# 可选依赖（由上述步骤 5 安装）
-# -----------------------------------------------------------------------------
-# diff-gaussian-rasterization  # CUDA 光栅化器（需编译）
-
-# -----------------------------------------------------------------------------
 # 实验性依赖（默认未启用，无需安装）
-# -----------------------------------------------------------------------------
-# torchmetrics>=0.11.0          # LPIPS 感知损失（代码中预留，未暴露开关）
+# torchmetrics>=0.11.0
