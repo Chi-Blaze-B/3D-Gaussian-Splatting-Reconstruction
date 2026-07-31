@@ -41,7 +41,7 @@ from PySide6.QtWidgets import (
     QScrollArea, QMessageBox, QStackedWidget, QFormLayout, QListWidget,
     QFrame, QGraphicsDropShadowEffect, QCheckBox,
 )
-from PySide6.QtCore import Qt, QThread, Signal, QPoint, QPropertyAnimation
+from PySide6.QtCore import Qt, QThread, Signal, QPoint, QPropertyAnimation, QTimer
 from PySide6.QtGui import QPixmap, QImage, QFont, QColor, QPainter
 
 # ---------- Import simplified modules ----------
@@ -780,7 +780,9 @@ class PipelineWorker(QThread):
             )
             (workdir / "frame_paths.txt").write_text("\n".join(frame_paths))
             self._log(f"  已提取 {len(frame_paths)} 帧")
-            self.frame_paths_signal.emit(frame_paths)
+
+        # 两种路径（新提取 / 从已有 workdir 加载）都通知 GUI 刷新帧预览
+        self.frame_paths_signal.emit(frame_paths)
 
         self._set_progress(10, f"{len(frame_paths)} 帧就绪")
         frames = LazyFrames(frame_paths)
@@ -1025,6 +1027,12 @@ class MainWindow(QMainWindow):
         self.worker = None
         self.setWindowTitle("3D 高斯溅射重建")
         self.resize(1300, 820)
+        self._preview_paths = []          # 全部帧路径
+        self._preview_page = 0            # 当前页码（从 0 开始）
+        self._preview_per_page = 24       # 每页缩略图数量（自适应列数 × 自适应行数）
+        self._preview_cols = 3            # 当前列数（随窗口宽度自适应）
+        self._preview_rows = 8            # 当前行数（随窗口高度自适应，默认 3×8=24）
+        self._resize_timer = None         # 延迟重排定时器
         self._build_ui()
         self._apply_theme()
 
@@ -1202,6 +1210,27 @@ class MainWindow(QMainWindow):
         self.thumb_layout.setSpacing(8)
         self.thumb_scroll.setWidget(self.thumb_inner)
         ppl.addWidget(self.thumb_scroll)
+
+        # Pagination controls
+        pager = QHBoxLayout()
+        pager.setSpacing(12)
+        pager.setAlignment(Qt.AlignCenter)
+
+        self.prev_page_btn = StyledButton("◀ 上一页", C["bg_card"], C["border"], RADIUS_INPUT, 11)
+        self.prev_page_btn.setFixedWidth(96)
+        self.prev_page_btn.clicked.connect(self._preview_prev_page)
+
+        self.page_label = StyledLabel("帧 0-0 / 0", font_size=11, color=C["text_muted"])
+        self.page_label.setAlignment(Qt.AlignCenter)
+
+        self.next_page_btn = StyledButton("下一页 ▶", C["bg_card"], C["border"], RADIUS_INPUT, 11)
+        self.next_page_btn.setFixedWidth(96)
+        self.next_page_btn.clicked.connect(self._preview_next_page)
+
+        pager.addWidget(self.prev_page_btn)
+        pager.addWidget(self.page_label)
+        pager.addWidget(self.next_page_btn)
+        ppl.addLayout(pager)
         self.stacked.addWidget(preview_page)
 
         # Log tab
@@ -1339,8 +1368,8 @@ class MainWindow(QMainWindow):
         # Device & estimator
         self.device_combo = StyledComboBox()
         if torch.cuda.is_available():
-            self.device_combo.addItems(["自动", "CPU", "CUDA"])
-            self._device_map = {"自动": "auto", "CPU": "cpu", "CUDA": "cuda"}
+            self.device_combo.addItems(["自动", "CPU", "CUDA张量加速"])
+            self._device_map = {"自动": "auto", "CPU": "cpu", "CUDA张量加速": "cuda"}
         else:
             self.device_combo.addItems(["自动", "CPU"])
             self._device_map = {"自动": "auto", "CPU": "cpu"}
@@ -1541,14 +1570,69 @@ class MainWindow(QMainWindow):
         self.loss_curve_page.update_from_data(data)
 
     def _show_preview_frames(self, frame_paths):
-        # Clear old thumbnails
+        self._preview_paths = list(frame_paths)
+        self._preview_page = 0
+        self._render_preview_page()
+
+    def _preview_available_width(self) -> int:
+        return max(0, self.thumb_scroll.viewport().width())
+
+    def _preview_available_height(self) -> int:
+        return max(0, self.thumb_scroll.viewport().height())
+
+    def _compute_preview_cols(self) -> int:
+        """根据滚动区可用宽度计算缩略图列数（自适应）。"""
+        avail = self._preview_available_width()
+        card_w = 192  # 缩略图宽 180 + 卡片边距 4 + 行间距 8
+        cols = max(1, (avail + 8) // card_w)
+        return min(cols, 10)
+
+    def _compute_preview_rows(self) -> int:
+        """根据滚动区可用高度计算缩略图行数（自适应，使每页恰好填满可视区，消除滚动条）。"""
+        avail = self._preview_available_height()
+        card_h = 166  # 缩略图高 130 + 帧号文字 ~18 + 卡片边距 4 + 行间距 8
+        rows = max(1, (avail + 8) // card_h)
+        return min(rows, 10)
+
+    def _clear_thumbnails(self):
+        """递归移除所有缩略图卡片（含嵌套行布局），立即隐藏避免重影。"""
         while self.thumb_layout.count():
             item = self.thumb_layout.takeAt(0)
-            if item.widget():
-                item.widget().deleteLater()
+            layout = item.layout() if item else None
+            if layout is not None:
+                while layout.count():
+                    li = layout.takeAt(0)
+                    w = li.widget() if li else None
+                    if w is not None:
+                        w.hide()
+                        w.deleteLater()
 
-        for i, fp in enumerate(frame_paths[:24]):
-            if i % 3 == 0:
+    def _preview_total_pages(self) -> int:
+        n = len(self._preview_paths)
+        return max(1, (n + self._preview_per_page - 1) // self._preview_per_page)
+
+    def _render_preview_page(self):
+        # 先按当前可用宽高更新每页容量（自适应列数 × 自适应行数）
+        self._preview_cols = self._compute_preview_cols()
+        self._preview_rows = self._compute_preview_rows()
+        self._preview_per_page = self._preview_cols * self._preview_rows
+
+        # 保留滚动位置（清空重建后恢复）
+        scroll_pos = self.thumb_scroll.verticalScrollBar().value()
+
+        # 清空旧缩略图：递归移除行布局中的卡片并立即隐藏，避免重影
+        self._clear_thumbnails()
+
+        n = len(self._preview_paths)
+        total_pages = self._preview_total_pages()
+        self._preview_page = max(0, min(self._preview_page, total_pages - 1))
+        start = self._preview_page * self._preview_per_page
+        end = min(start + self._preview_per_page, n)
+        page_paths = self._preview_paths[start:end]
+
+        for i, fp in enumerate(page_paths):
+            global_idx = start + i
+            if i % self._preview_cols == 0:
                 row = QHBoxLayout()
                 row.setSpacing(8)
                 row.setAlignment(Qt.AlignCenter)
@@ -1573,7 +1657,7 @@ class MainWindow(QMainWindow):
                 cl.setSpacing(2)
                 cl.addWidget(lbl)
 
-                fl = StyledLabel(f"帧 {i}", font_size=9, color=C["text_muted"])
+                fl = StyledLabel(f"帧 {global_idx}", font_size=9, color=C["text_muted"])
                 fl.setAlignment(Qt.AlignCenter)
                 cl.addWidget(fl)
 
@@ -1581,6 +1665,46 @@ class MainWindow(QMainWindow):
                 row.addWidget(card)
             except Exception:
                 pass
+
+        # Update pagination controls
+        self.prev_page_btn.setEnabled(self._preview_page > 0)
+        self.next_page_btn.setEnabled(self._preview_page < total_pages - 1)
+        if n > 0:
+            self.page_label.setText(f"帧 {start}–{end - 1} / {n}  （第 {self._preview_page + 1}/{total_pages} 页，每页 {self._preview_per_page}）")
+        else:
+            self.page_label.setText("无帧可预览")
+        self.thumb_scroll.verticalScrollBar().setValue(min(scroll_pos, self.thumb_scroll.verticalScrollBar().maximum()))
+
+    def _preview_prev_page(self):
+        if self._preview_page > 0:
+            self._preview_page -= 1
+            self._render_preview_page()
+
+    def _preview_next_page(self):
+        total_pages = self._preview_total_pages()
+        if self._preview_page < total_pages - 1:
+            self._preview_page += 1
+            self._render_preview_page()
+
+    def _schedule_preview_relayout(self):
+        """窗口尺寸变化时延迟重排，避免高频 resize 反复重建缩略图。"""
+        if not self._preview_paths:
+            return
+        if self._resize_timer is None:
+            self._resize_timer = QTimer(self)
+            self._resize_timer.setSingleShot(True)
+            self._resize_timer.timeout.connect(self._on_preview_resize_timeout)
+        self._resize_timer.start(150)
+
+    def _on_preview_resize_timeout(self):
+        new_cols = self._compute_preview_cols()
+        new_rows = self._compute_preview_rows()
+        if new_cols != self._preview_cols or new_rows != self._preview_rows:
+            self._render_preview_page()
+
+    def resizeEvent(self, event):
+        super().resizeEvent(event)
+        self._schedule_preview_relayout()
 
     def closeEvent(self, event):
         if self.worker and self.worker.isRunning():
