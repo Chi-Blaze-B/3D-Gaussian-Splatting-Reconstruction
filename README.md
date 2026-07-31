@@ -10,7 +10,7 @@
   <img src="https://img.shields.io/github/issues/Chi-Blaze-B/3D-Gaussian-Splatting-Reconstruction?style=flat-square" alt="Issues">
 </p>
 
-纯 Python + PyTorch 实现的视频转 3D 高斯溅射（3DGS）完整工作流。输入一段视频，输出一个 `.ply` 文件，可用官方 3DGS 查看器（https://github.com/graphdeco-inria/gaussian-splatting）浏览重建的三维场景。
+纯 Python + PyTorch 实现的视频转 3D 高斯溅射（3DGS）完整工作流。输入一段视频，输出一个 `.ply` 文件，可用官方 3DGS 查看器（https://github.com/graphdeco-inria/gaussian-splatting ）浏览重建的三维场景。
 
 - **纯 PyTorch 光栅化器**：完全基于 PyTorch 实现，无需编译 CUDA 扩展，支持 SH 0–3 阶球谐函数，开箱即用。
 - **鲁棒姿态估计**：内置 ORB/SIFT 增量式 SfM（无 COLMAP 依赖），也可选用 COLMAP 作为后端。
@@ -59,7 +59,7 @@
    ```
    （可选）COLMAP 后端
    
-需自行安装 COLMAP，并确保 colmap 命令在 PATH 中可用。
+    需自行安装 COLMAP（https://github.com/colmap/colmap ），并确保 colmap 在此项目根目录下，即与所有`.py`文件一同放在同一个文件夹。
 
 ## 🚀 使用方式
 
