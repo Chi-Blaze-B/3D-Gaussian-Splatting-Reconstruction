@@ -243,8 +243,10 @@ class DifferentiableRasterizer(nn.Module):
         N = positions.shape[0]
         H, W = self.image_height, self.image_width
         if N == 0:
-            zero = torch.zeros((H, W, 3), dtype=positions.dtype, device=positions.device)
-            return zero, zero[..., 0]
+            # Must maintain gradient graph connection for loss.backward()
+            connected_zero = (positions.sum() if positions.numel() > 0 else opacities.sum()) * 0.0
+            zero = connected_zero.view(1).expand(H * W * 3).view(H, W, 3).contiguous()
+            return zero, connected_zero.view(1).expand(H * W).view(H, W).contiguous()
 
         # Camera space transformation
         R_cam = view_matrix[:3, :3]
@@ -276,8 +278,10 @@ class DifferentiableRasterizer(nn.Module):
 
         valid = (z > 0.01) & (radius > 0) & (radius < 1000)
         if not valid.any():
-            zero = torch.zeros((H, W, 3), dtype=positions.dtype, device=positions.device)
-            return zero, zero[..., 0]
+            # Maintain gradient graph connection
+            connected_zero = (positions.sum() if positions.numel() > 0 else opacities.sum()) * 0.0
+            zero = connected_zero.view(1).expand(H * W * 3).view(H, W, 3).contiguous()
+            return zero, connected_zero.view(1).expand(H * W).view(H, W).contiguous()
 
         u_v, v_v, r_v = u[valid], v[valid], radius[valid]
         cov2d_v = cov2d[valid]
@@ -299,8 +303,10 @@ class DifferentiableRasterizer(nn.Module):
         dirs = F.normalize(cam_positions[valid][order], dim=-1)
         colors = eval_sh(sh_degree, sh_coeffs[valid][order], dirs)
 
-        out_color = torch.zeros((H, W, 3), dtype=colors.dtype, device=colors.device)
-        out_alpha = torch.zeros((H, W), dtype=colors.dtype, device=colors.device)
+        # Ensure gradient connection even when all Gaussians land off-screen
+        _graph_link = (positions.sum() if positions.numel() > 0 else opacities.sum()) * 0.0
+        out_color = _graph_link.view(1,1,1).expand(H, W, 3).contiguous()
+        out_alpha = _graph_link.view(1,1).expand(H, W).contiguous()
 
         MAX_BATCH = 64
         for start in range(0, N_valid, MAX_BATCH):

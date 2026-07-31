@@ -1,4 +1,14 @@
 # 3D Gaussian Splatting Reconstruction
+<p align="center">
+  <img src="https://img.shields.io/badge/Python-3.11-blue?style=flat-square&logo=python&logoColor=white" alt="Python">
+  <img src="https://img.shields.io/badge/PyTorch-2.0+-orange?style=flat-square&logo=pytorch&logoColor=white" alt="PyTorch">
+  <img src="https://img.shields.io/badge/License-Apache_2.0-green?style=flat-square&logo=apache&logoColor=white" alt="License">
+  <img src="https://img.shields.io/badge/Platform-Windows%20%7C%20Linux%20%7C%20macOS-lightgrey?style=flat-square" alt="Platform">
+  <img src="https://img.shields.io/badge/GUI-PySide6-8A2BE2?style=flat-square&logo=qt&logoColor=white" alt="GUI">
+  <img src="https://img.shields.io/badge/SfM-OpenCV%20%7C%20COLMAP-brightgreen?style=flat-square" alt="SfM">
+  <img src="https://img.shields.io/github/stars/Chi-Blaze-B/3D-Gaussian-Splatting-Reconstruction?style=flat-square&color=yellow" alt="Stars">
+  <img src="https://img.shields.io/github/issues/Chi-Blaze-B/3D-Gaussian-Splatting-Reconstruction?style=flat-square" alt="Issues">
+</p>
 
 纯 Python + PyTorch 实现的视频转 3D 高斯溅射（3DGS）完整工作流。输入一段视频，输出一个 `.ply` 文件，可用官方 3DGS 查看器（https://github.com/graphdeco-inria/gaussian-splatting）浏览重建的三维场景。
 
@@ -49,9 +59,7 @@
    ```
    （可选）COLMAP 后端
    
-   Windows：项目已附带 colmap-x64-windows-nocuda/，无需额外安装。
-   
-   Linux/macOS：需自行安装 COLMAP，并确保 colmap 命令在 PATH 中可用。
+需自行安装 COLMAP，并确保 colmap 命令在 PATH 中可用。
 
 ## 🚀 使用方式
 
@@ -111,6 +119,7 @@ python gui.py
 - 调整采样策略、训练轮次、高斯预算等
 - 实时预览帧缩略图
 - 训练过程中显示损失曲线（帧级和轮次级）
+- 帧预览分页浏览：每页容量随窗口宽高自适应（列数 × 行数，默认约 24 帧），可翻页查看全部提取帧
 - 日志输出窗口详细记录每步进度
 - 支持中断训练并自动保存检查点
 
@@ -122,9 +131,9 @@ python gui.py
 | `poses.py` | 纯 OpenCV 增量式 SfM（ORB/SIFT），含 BA 和点云过滤 |
 | `colmap_poses.py` | COLMAP 封装，作为备选姿态估计后端 |
 | `point_cloud.py` | 从稀疏点云初始化高斯参数（SH 0–3），自适应离群点剔除 |
-| `gaussian.py` | 3DGS 核心：纯 PyTorch 光栅化器、Trainer、密度控制、学习率调度 |
+| `gaussian.py` | 3DGS 核心：纯 PyTorch 光栅化器（含梯度图连接保护）、Trainer、密度控制、学习率调度 |
 | `exporter.py` | 导出标准 PLY 格式，兼容官方查看器 |
-| `gui.py` | PySide6 暗色主题图形界面 |
+| `gui.py` | PySide6 暗色主题图形界面，帧预览分页浏览（列数×行数随窗口宽高自适应，可查看全部帧） |
 | `cli.py` | 命令行入口，集成完整流程 |
 
 ## 📈 训练细节
@@ -140,6 +149,8 @@ python gui.py
 **SH 升温**：前 `sh_warmup_steps` 步逐渐提升 SH 阶数，从 0 逐步增至设定值。
 
 **梯度裁剪**：全局梯度范数限制为 10.0，防止训练发散。
+
+**梯度图连接保护**：光栅化器在边缘情况（高斯数为 0、全部高斯在相机后方或投影到画面外）下返回与计算图保持连接的零张量，避免 `loss.backward()` 因缺少 `grad_fn` 而崩溃。
 
 **Loss 发散保护**：若单步 loss 超过阈值（默认 1.0），自动保存检查点并中断训练，避免无限发散。
 
@@ -193,7 +204,7 @@ CPU 亲和性：启动时会自动绑定所有逻辑核心，提升多核利用�
 光栅化器：本项目使用纯 PyTorch 实现的光栅化器，无需编译任何 CUDA 扩展，开箱即用。
 
 ## 📄 许可证
-本项目采用 MIT 许可证，欢迎自由使用和修改。
+本项目采用 Apache-2.0 许可证，欢迎自由使用和修改。
 
 ## 🙏 致谢
 3D Gaussian Splatting 原始论文和开源代码。
