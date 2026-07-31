@@ -859,18 +859,18 @@ class AdaptiveDensityController:
         new_pos = []; new_log_scales = []; new_opa = []; new_rot = []; new_sh = []
 
         if len(keep_idx) > 0:
-            new_pos.append(g.positions[keep_idx].cpu().numpy())
-            new_log_scales.append(g.log_scales[keep_idx].cpu().numpy())
-            new_opa.append(g.opacities_raw[keep_idx].cpu().numpy())
-            new_rot.append(g.rotations[keep_idx].cpu().numpy())
-            new_sh.append(g.sh_coeffs[keep_idx].cpu().numpy())
+            new_pos.append(g.positions[keep_idx].detach().cpu().numpy())
+            new_log_scales.append(g.log_scales[keep_idx].detach().cpu().numpy())
+            new_opa.append(g.opacities_raw[keep_idx].detach().cpu().numpy())
+            new_rot.append(g.rotations[keep_idx].detach().cpu().numpy())
+            new_sh.append(g.sh_coeffs[keep_idx].detach().cpu().numpy())
 
         if len(split_idx) > 0:
-            base_pos = g.positions[split_idx].cpu().numpy()
-            base_log_scales = g.log_scales[split_idx].cpu().numpy()
-            base_opa = g.opacities_raw[split_idx].cpu().numpy()
-            base_rot = g.rotations[split_idx].cpu().numpy()
-            base_sh = g.sh_coeffs[split_idx].cpu().numpy()
+            base_pos = g.positions[split_idx].detach().cpu().numpy()
+            base_log_scales = g.log_scales[split_idx].detach().cpu().numpy()
+            base_opa = g.opacities_raw[split_idx].detach().cpu().numpy()
+            base_rot = g.rotations[split_idx].detach().cpu().numpy()
+            base_sh = g.sh_coeffs[split_idx].detach().cpu().numpy()
             for scale_factor in [0.8, 0.6]:
                 jitter = np.random.randn(len(split_idx), 3).astype(np.float32) * 0.001
                 new_pos.append(base_pos + jitter * (1 if scale_factor == 0.8 else -0.5))
@@ -881,11 +881,11 @@ class AdaptiveDensityController:
             stats["split"] = len(split_idx) * 2
 
         if len(dup_idx) > 0:
-            dup_pos = g.positions[dup_idx].cpu().numpy()
-            dup_log_scales = g.log_scales[dup_idx].cpu().numpy()
-            dup_opa = g.opacities_raw[dup_idx].cpu().numpy()
-            dup_rot = g.rotations[dup_idx].cpu().numpy()
-            dup_sh = g.sh_coeffs[dup_idx].cpu().numpy()
+            dup_pos = g.positions[dup_idx].detach().cpu().numpy()
+            dup_log_scales = g.log_scales[dup_idx].detach().cpu().numpy()
+            dup_opa = g.opacities_raw[dup_idx].detach().cpu().numpy()
+            dup_rot = g.rotations[dup_idx].detach().cpu().numpy()
+            dup_sh = g.sh_coeffs[dup_idx].detach().cpu().numpy()
             new_pos.append(dup_pos + np.random.randn(len(dup_idx), 3).astype(np.float32) * 0.001)
             new_log_scales.append(dup_log_scales)
             new_opa.append(dup_opa + np.random.normal(0, 0.1, len(dup_idx)).astype(np.float32))
@@ -951,11 +951,11 @@ class AdaptiveDensityController:
         keep_mask = ~prune_mask
         keep_idx = torch.where(keep_mask)[0]
         device = g.positions.device
-        g.positions = g.positions[keep_idx].clone()
-        g.log_scales = g.log_scales[keep_idx].clone()
-        g.opacities_raw = g.opacities_raw[keep_idx].clone()
-        g.rotations = g.rotations[keep_idx].clone()
-        g.sh_coeffs = g.sh_coeffs[keep_idx].clone()
+        g.positions = g.positions[keep_idx].detach().clone()
+        g.log_scales = g.log_scales[keep_idx].detach().clone()
+        g.opacities_raw = g.opacities_raw[keep_idx].detach().clone()
+        g.rotations = g.rotations[keep_idx].detach().clone()
+        g.sh_coeffs = g.sh_coeffs[keep_idx].detach().clone()
         for param in [g.positions, g.log_scales, g.opacities_raw, g.rotations, g.sh_coeffs]:
             param.requires_grad_(True)
 
