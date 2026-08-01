@@ -239,7 +239,196 @@ class DifferentiableRasterizer(nn.Module):
     def forward(self, positions, cov3d, opacities, sh_coeffs, view_matrix, K, background, sh_degree=3):
         return self._render_batch(positions, cov3d, opacities, sh_coeffs, view_matrix, K, background, sh_degree)
 
+    # ---------- 向量化光栅化（方向 A：排序式逐像素 splat） ----------
     def _render_batch(self, positions, cov3d, opacities, sh_coeffs, view_matrix, K, background, sh_degree):
+        """主实现：排序式逐像素 splat，详见 _render_batch_vectorized 的说明。"""
+        return self._render_batch_vectorized(positions, cov3d, opacities, sh_coeffs,
+                                             view_matrix, K, background, sh_degree)
+
+    # ---------- 向量化光栅化（方向 A：排序式逐像素 splat） ----------
+    def _render_batch_vectorized(self, positions, cov3d, opacities, sh_coeffs, view_matrix, K, background, sh_degree):
+        """
+        与 legacy/_render_batch_batched 数值语义等价，但把最后那段逐高斯
+        Python 内层循环（每颗高斯 ~7 个 kernel launch）替换为纯向量化算子：
+        展平覆盖像素对 → stable sort → 分段透射率（log1p + cumsum + exp）→
+        scatter_add 归约。
+
+        正确性依据：
+        - 高斯已按深度全局排序（near→far），像素组内 stable sort 保持深度序；
+        - over-blend 等价于逐像素：T_before(p)=Π(1-α_j, j<i)，color(p)=Σα_i·T·c_i，
+          alpha(p)=1-Π(1-α_i)；用 log 空间 cumsum 实现分段累计透射率；
+        - 不同像素的合成互相独立，可并行 scatter_add。
+        """
+        N = positions.shape[0]
+        H, W = self.image_height, self.image_width
+        if N == 0:
+            connected_zero = (positions.sum() if positions.numel() > 0 else opacities.sum()) * 0.0
+            zero = connected_zero.view(1).expand(H * W * 3).view(H, W, 3).contiguous()
+            return zero, connected_zero.view(1).expand(H * W).view(H, W).contiguous()
+
+        # Camera space transformation
+        R_cam = view_matrix[:3, :3]
+        t_cam = view_matrix[:3, 3]
+        cam_positions = positions @ R_cam.T + t_cam
+        cam_cov = R_cam @ cov3d @ R_cam.T
+
+        # Projection
+        fx = K[0, 0]; fy = K[1, 1]; cx = K[0, 2]; cy = K[1, 2]
+        z = cam_positions[:, 2].clamp(min=0.01)
+        x_c = cam_positions[:, 0]; y_c = cam_positions[:, 1]
+        u = fx * (x_c / z) + cx
+        v = fy * (y_c / z) + cy
+
+        # Compute 2D covariance
+        B = torch.zeros(N, 2, 3, dtype=cov3d.dtype, device=cov3d.device)
+        B[:, 0, 0] = fx / z; B[:, 0, 2] = -fx * x_c / (z * z)
+        B[:, 1, 1] = fy / z; B[:, 1, 2] = -fy * y_c / (z * z)
+        cov2d = (B @ cam_cov) @ B.transpose(1, 2)
+
+        # Compute radius (3 sigma)
+        a = cov2d[:, 0, 0]; c = cov2d[:, 1, 1]; b = cov2d[:, 0, 1]
+        det = a * c - b * b
+        trace = a + c
+        disc = torch.clamp(trace ** 2 - 4 * det, min=1e-8)
+        half = 0.5 * (trace + torch.sqrt(disc))
+        sigma = torch.sqrt(half + 1e-6)
+        radius = (sigma * 3.0).ceil().int().clamp(max=self.max_radius)
+
+        valid = (z > 0.01) & (radius > 0) & (radius < 1000)
+        if not valid.any():
+            connected_zero = (positions.sum() if positions.numel() > 0 else opacities.sum()) * 0.0
+            zero = connected_zero.view(1).expand(H * W * 3).view(H, W, 3).contiguous()
+            return zero, connected_zero.view(1).expand(H * W).view(H, W).contiguous()
+
+        u_v, v_v, r_v = u[valid], v[valid], radius[valid]
+        cov2d_v = cov2d[valid]
+        op_v = opacities[valid]
+        N_valid = int(valid.sum())
+
+        # Depth ordering (front-to-back)
+        depth_sorted = cam_positions[valid][:, 2]
+        order = torch.argsort(depth_sorted)  # near to far
+
+        u_s = u_v[order]; v_s = v_v[order]; r_s = r_v[order]
+        cov2d_s = cov2d_v[order]; opa_s = op_v[order]
+
+        # Compute colors via SH
+        dirs = F.normalize(cam_positions[valid][order], dim=-1)
+        colors = eval_sh(sh_degree, sh_coeffs[valid][order], dirs)
+
+        # Ensure gradient connection even when all Gaussians land off-screen
+        _graph_link = (positions.sum() if positions.numel() > 0 else opacities.sum()) * 0.0
+        out_color = _graph_link.view(1,1,1).expand(H, W, 3).contiguous()
+        out_alpha = _graph_link.view(1,1).expand(H, W).contiguous()
+
+        # ---- 逐像素向量化合成（替代逐高斯 Python 循环） ----
+        mu_u = u_s; mu_v = v_s; rad = r_s
+        A = cov2d_s[:, 0, 0]; B_ = cov2d_s[:, 0, 1]; C = cov2d_s[:, 1, 1]
+        opa = opa_s; col = colors
+
+        y_min = (mu_v - rad).clamp(min=0).int(); y_max = (mu_v + rad + 1).clamp(max=H).int()
+        x_min = (mu_u - rad).clamp(min=0).int(); x_max = (mu_u + rad + 1).clamp(max=W).int()
+
+        valid_b = (y_min < y_max) & (x_min < x_max)
+        if not valid_b.any():
+            return out_color + background.view(1,1,3) * (1.0 - out_alpha.unsqueeze(-1)), out_alpha
+
+        y_min_b = y_min[valid_b]; y_max_b = y_max[valid_b]; x_min_b = x_min[valid_b]; x_max_b = x_max[valid_b]
+        mu_u_b = mu_u[valid_b]; mu_v_b = mu_v[valid_b]
+        A_b = A[valid_b]; B_b = B_[valid_b]; C_b = C[valid_b]
+        opa_b = opa[valid_b]; col_b = col[valid_b]
+        batch_n = int(valid_b.sum())
+
+        det_inv = 1.0 / (A_b * C_b - B_b * B_b + 1e-6)
+        inv_A = det_inv * C_b; inv_B = -det_inv * B_b; inv_C = det_inv * A_b
+
+        h_sizes = (y_max_b - y_min_b).int(); w_sizes = (x_max_b - x_min_b).int()
+        max_h = int(h_sizes.max()); max_w = int(w_sizes.max())
+
+        gy = torch.arange(max_h, device=colors.device, dtype=torch.float32).view(1, -1, 1)
+        gx = torch.arange(max_w, device=colors.device, dtype=torch.float32).view(1, 1, -1)
+        gy_g = gy + y_min_b.view(-1, 1, 1); gx_g = gx + x_min_b.view(-1, 1, 1)
+        dy = gy_g - mu_v_b.view(-1, 1, 1); dx = gx_g - mu_u_b.view(-1, 1, 1)
+
+        y_valid = (gy_g >= y_min_b.view(-1, 1, 1)) & (gy_g < y_max_b.view(-1, 1, 1))
+        x_valid = (gx_g >= x_min_b.view(-1, 1, 1)) & (gx_g < x_max_b.view(-1, 1, 1))
+        valid_mask = y_valid & x_valid
+
+        exponent = -(inv_A.view(-1,1,1) * dx**2 + 2*inv_B.view(-1,1,1)*dx*dy + inv_C.view(-1,1,1)*dy**2)*0.5
+        exponent = exponent.clamp(max=0)
+        alpha = exponent.exp() * opa_b.view(-1,1,1)
+        alpha = alpha.masked_fill(~valid_mask, 0.0)
+
+        # 展平覆盖像素对：只保留 valid_mask 为真的格点
+        # flat indices: (gauss_idx, y_in_tile, x_in_tile) -> pixel (gauss_idx, y, x)
+        mask = valid_mask  # [B, max_h, max_w]
+        flat_alpha = alpha[mask]
+        n_pairs = flat_alpha.shape[0]
+        if n_pairs == 0:
+            return out_color + background.view(1,1,3) * (1.0 - out_alpha.unsqueeze(-1)), out_alpha
+
+        # 重建每个覆盖格的全局像素坐标（y, x）
+        gauss_idx_3d = torch.arange(batch_n, device=colors.device).view(-1, 1, 1).expand_as(mask)
+        # 广播 y/x 网格到与 mask 相同的 [B, max_h, max_w] 形状
+        y_3d = gy_g.expand_as(mask)
+        x_3d = gx_g.expand_as(mask)
+        gauss_ids = gauss_idx_3d[mask].long()
+        y_coord = y_3d[mask].long()
+        x_coord = x_3d[mask].long()
+        pix = y_coord * W + x_coord  # 展平像素索引 [n_pairs]
+
+        flat_color = col_b[gauss_ids]  # [n_pairs, 3]
+
+        # 按像素 stable sort（保持深度序：gauss_ids 已按深度排序）
+        pix_sorted, sort_idx = torch.sort(pix, stable=True)
+        a_sorted = flat_alpha[sort_idx]
+        c_sorted = flat_color[sort_idx]
+
+        # 分段透射率：T_before(p) = exp(Σ_{j<i} log(1-α_j))，按像素分组
+        log_ta = torch.log1p(-a_sorted)
+        log_cum = torch.cumsum(log_ta, dim=0)
+
+        # 段内 exclusive 前缀：log_T_before[i] = log_cum[i-1]（前一个元素的累计），段首为 0
+        # torch.cumsum 给出含自身的累计，段内前移一位即得 exclusive 前缀
+        log_cum_shift = torch.cat([torch.zeros(1, dtype=log_cum.dtype, device=log_cum.device), log_cum[:-1]])
+        # 像素组边界：新组起始处重置为 0
+        new_group = pix_sorted[1:] != pix_sorted[:-1]
+        group_starts = torch.cat([torch.tensor([True], device=pix_sorted.device), new_group])
+        # 组内 exclusive 前缀：
+        #   log_T_before[j] = log_cum_shift[j] - offset[j]
+        #   其中 offset[j] = 该元素所属组"组首元素前一个位置"的累计
+        #                  = log_cum_shift[组首位置]（组首自身 offset 使 log_T=0，自洽）
+        # 组首位置用 cummax 前向传播（不能用 cumsum-1，那给出的是组 id 而非组首索引）
+        arange = torch.arange(group_starts.shape[0], device=pix_sorted.device)
+        group_start_pos = torch.where(group_starts, arange, torch.zeros_like(arange))
+        group_start_pos = torch.cummax(group_start_pos, dim=0).values
+        seg_offset = log_cum_shift[group_start_pos]
+        log_T_before = log_cum_shift - seg_offset
+
+        T_before = torch.exp(log_T_before.clamp(min=-50.0))
+        weight = a_sorted * T_before  # α_i * T_before(p)
+
+        # 归约：color + alpha
+        HpW = H * W
+        acc_color = torch.zeros(HpW, 3, dtype=colors.dtype, device=colors.device)
+        acc_color = acc_color.index_add_(0, pix_sorted, weight.unsqueeze(-1) * c_sorted)
+        acc_log = torch.zeros(HpW, dtype=colors.dtype, device=colors.device)
+        acc_log = acc_log.index_add_(0, pix_sorted, log_ta)
+
+        out_color = out_color.view(HpW, 3) + acc_color
+        out_alpha = out_alpha.view(HpW) + (1.0 - torch.exp(acc_log.clamp(min=-50.0)))
+        out_color = out_color.view(H, W, 3)
+        out_alpha = out_alpha.view(H, W)
+
+        out_color = out_color + background.view(1,1,3) * (1.0 - out_alpha.unsqueeze(-1))
+        return out_color, out_alpha
+
+    # ---------- 方向 B 实现（保留：批量同步 + 逐高斯串行合成） ----------
+    def _render_batch_batched(self, positions, cov3d, opacities, sh_coeffs, view_matrix, K, background, sh_degree):
+        """
+        与 legacy 数值语义一致；把内层循环每颗高斯的 4 次 GPU→CPU 同步
+        改为每 batch 一次 .tolist() 批量拉取。像素级 over-blend 仍逐高斯串行。
+        """
         N = positions.shape[0]
         H, W = self.image_height, self.image_width
         if N == 0:

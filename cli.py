@@ -276,7 +276,6 @@ def run_pipeline(args: argparse.Namespace) -> None:
         image_width=w,
         image_height=h,
         device=device,
-        use_cuda_rasterizer=True,   # will auto-detect availability
         sh_degree=args.sh_degree,
         random_background=args.random_background,
         train_focal=args.train_focal,

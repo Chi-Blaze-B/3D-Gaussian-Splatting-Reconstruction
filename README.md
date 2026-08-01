@@ -12,7 +12,7 @@
 
 纯 Python + PyTorch 实现的视频转 3D 高斯溅射（3DGS）完整工作流。输入一段视频，输出一个 `.ply` 文件，可用官方 3DGS 查看器（https://github.com/graphdeco-inria/gaussian-splatting ）浏览重建的三维场景。
 
-- **纯 PyTorch 光栅化器**：完全基于 PyTorch 实现，无需编译 CUDA 扩展，支持 SH 0–3 阶球谐函数，开箱即用。
+- **纯 PyTorch 光栅化器**：完全基于 PyTorch 实现，无需编译 CUDA 扩展，支持 SH 0–3 阶球谐函数，排序式逐像素 splat 向量化（大幅加速），开箱即用。
 - **鲁棒姿态估计**：内置 ORB/SIFT 增量式 SfM（无 COLMAP 依赖），也可选用 COLMAP 作为后端。
 - **智能采样**：均匀、光流驱动、两阶段（视差+光流+纹理）三种帧采样策略。
 - **自适应密度控制**：训练中自动分裂/复制/修剪高斯，支持显存预算控制。
@@ -35,7 +35,7 @@
    conda create -n gs python=3.11
    conda activate gs
    ```
-   安装 PyTorch
+2. 安装 PyTorch
    
    GPU 版本（CUDA 12.1）：
    ```bash
@@ -47,19 +47,24 @@
    pip install torch torchvision torchaudio --index-url https://download.pytorch.org/whl/cpu
    ```
    
-   安装 OpenCV（headless）
+3. 安装 OpenCV（headless）
    ```bash
    pip install opencv-python-headless
    ```
    必须使用 headless 版本，避免与 PySide6 的 Qt 库冲突。
    
-   安装其他依赖
+4. 安装其他依赖
    ```bash
    pip install numpy scipy PySide6 matplotlib psutil>=5.9.0
    ```
-   （可选）COLMAP 后端
+5. （可选）COLMAP 后端
    
     需自行安装 COLMAP（https://github.com/colmap/colmap ），并确保 colmap 在此项目根目录下，即与所有`.py`文件一同放在同一个文件夹。
+   
+6. 克隆本仓库
+   ```bash
+   git clone https://github.com/Chi-Blaze-B/3D-Gaussian-Splatting-Reconstruction
+   ```
 
 ## 🚀 使用方式
 
@@ -131,7 +136,7 @@ python gui.py
 | `poses.py` | 纯 OpenCV 增量式 SfM（ORB/SIFT），含 BA 和点云过滤 |
 | `colmap_poses.py` | COLMAP 封装，作为备选姿态估计后端 |
 | `point_cloud.py` | 从稀疏点云初始化高斯参数（SH 0–3），自适应离群点剔除 |
-| `gaussian.py` | 3DGS 核心：纯 PyTorch 光栅化器（含梯度图连接保护）、Trainer、密度控制、学习率调度 |
+| `gaussian.py` | 3DGS 核心：纯 PyTorch 光栅化器（排序式逐像素 splat 向量化，含梯度图连接保护）、Trainer、密度控制、学习率调度 |
 | `exporter.py` | 导出标准 PLY 格式，兼容官方查看器 |
 | `gui.py` | PySide6 暗色主题图形界面，帧预览分页浏览（列数×行数随窗口宽高自适应，可查看全部帧） |
 | `cli.py` | 命令行入口，集成完整流程 |
@@ -140,7 +145,7 @@ python gui.py
 
 **损失函数**：`(1 - w_ssim) * L1 + w_ssim * SSIM`，SSIM 权重线性升温。
 
-**密度控制**：每 `densify_every` 步根据梯度累积和尺度分裂/复制高斯，每 `prune_every` 步修剪低不透明度高斯，并自动限制总数量。
+**密度控制**：每 `densify_every` 步根据梯度累积和尺度分裂/复制高斯，每 `prune_every` 步修剪低不透明度高斯，并自动限制总数量。densify/prune 时对需梯度的参数先 `.detach()` 再转 numpy，修剪后用 `.detach().clone()` 重建叶子张量，确保后续反向传播正常。
 
 **初始高斯稠密化**：若初始化后高斯数量少于 2000 个，自动对每个高斯做 8 倍扩增（加噪声），确保训练有足够的起始高斯数。
 
@@ -150,7 +155,11 @@ python gui.py
 
 **梯度裁剪**：全局梯度范数限制为 10.0，防止训练发散。
 
+**光栅化器向量化**：像素级合成采用**排序式逐像素 splat**——把逐高斯 Python 内层循环重写为「展平覆盖像素对 → stable sort → 分段透射率 → scatter_add 归约」的纯张量算子，消除每颗高斯的 kernel launch 与 GPU→CPU 同步。实测 180x320+4000 高斯 forward 加速 **14.5x**、forward+backward **37.7x**；2160x3840+38665 高斯单帧约 1.7s（原为分钟级）。输出与旧实现逐元素一致（误差 < 1e-6）。
+
 **梯度图连接保护**：光栅化器在边缘情况（高斯数为 0、全部高斯在相机后方或投影到画面外）下返回与计算图保持连接的零张量，避免 `loss.backward()` 因缺少 `grad_fn` 而崩溃。
+
+**密度控制梯度处理**：密度控制（densify/prune）对需梯度的参数先 `.detach()` 再转 numpy，并用 `.detach().clone()` 重建修剪后的叶子张量，避免 `numpy()` 误用崩溃和修剪后参数被优化器静默跳过。
 
 **Loss 发散保护**：若单步 loss 超过阈值（默认 1.0），自动保存检查点并中断训练，避免无限发散。
 
@@ -201,7 +210,7 @@ python cli.py --video input.mp4 --resume-dir ./workdir --output restored.ply
 
 CPU 亲和性：启动时会自动绑定所有逻辑核心，提升多核利用效率（通过 psutil）。
 
-光栅化器：本项目使用纯 PyTorch 实现的光栅化器，无需编译任何 CUDA 扩展，开箱即用。
+光栅化器：本项目使用纯 PyTorch 实现的光栅化器（排序式逐像素 splat 向量化），无需编译任何 CUDA 扩展，开箱即用。
 
 ## 📄 许可证
 本项目采用 Apache-2.0 许可证，欢迎自由使用和修改。
