@@ -930,7 +930,7 @@ class PipelineWorker(QThread):
 
                 try:
                     avg_loss = trainer.train_epoch(
-                        frames_iter=frame_paths,
+                        frames_iter=frames,   # LazyFrames 对象（内存缓存帧）
                         camera_poses=train_poses,
                         stop_event=self._stop_event,
                         progress_callback=_prog,
@@ -964,7 +964,7 @@ class PipelineWorker(QThread):
                     self._log("  重新开始当前轮次训练...")
                     try:
                         avg_loss = trainer.train_epoch(
-                            frames_iter=frame_paths,
+                            frames_iter=frames,   # LazyFrames 对象（内存缓存帧）
                             camera_poses=train_poses,
                             stop_event=self._stop_event,
                             progress_callback=_prog,

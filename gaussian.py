@@ -9,6 +9,7 @@ import numpy as np
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
+from collections import OrderedDict
 from dataclasses import dataclass, field
 from typing import Optional, List, Dict, Callable, Union
 
@@ -47,13 +48,49 @@ def _load_frame_from_path(path: str) -> np.ndarray:
     return cv2.cvtColor(img, cv2.COLOR_BGR2RGB).astype(np.float32) / 255.0
 
 
+def _load_frame_raw(path: str) -> np.ndarray:
+    """读帧为 uint8 RGB（内存为 float32 的 1/4），供预加载缓存使用。"""
+    import cv2
+    img = cv2.imread(path, cv2.IMREAD_COLOR)
+    if img is None:
+        raise FileNotFoundError(f"Cannot read frame: {path}")
+    return cv2.cvtColor(img, cv2.COLOR_BGR2RGB)
+
+
 class LazyFrames:
-    def __init__(self, sources: List[Union[str, np.ndarray]]):
+    """帧容器：内存缓存 + 按需转 float32。
+
+    背景：训练每 epoch 顺序遍历全部帧，读盘 + 解码是主要开销（实测单帧
+    PNG 解码约 100ms，且 1000 轮 × 200 帧 = 20 万次磁盘读取，伤硬盘）。
+
+    方案：
+    - **预加载到内存**：构造时把全部帧解码为 uint8 RGB（200 帧约 5GB，
+      仅为 float32 的 1/4）。训练期间零磁盘读取。
+    - **按需转 float32**：访问时 `uint8.astype(np.float32)/255.0`（约 46ms/帧，
+      远快于读盘解码），避免全量 float32（200 帧约 20GB）的内存压力。
+    - `preload=False` 时回退为惰性加载（不预载，首次访问才读盘），
+      供内存不足场景使用。
+    """
+    def __init__(self, sources: List[Union[str, np.ndarray]], preload: bool = True,
+                 cache_size: int = 0):
         self._sources = sources
+        self._preload_enabled = preload
+        # 转 float32 结果缓存（LRU，容量 = cache_size 帧；0 表示不缓存转换结果）
+        self._cache_size = max(0, cache_size)
+        self._cache = OrderedDict()  # 路径 -> float32 ndarray
+        self._raw: Optional[List[Optional[np.ndarray]]] = None  # 预加载的 uint8 数组
+        self._hits = 0
+        self._misses = 0
+        if preload:
+            # 用显式 list[np.ndarray | None] 构造，避免 Pyright 推断为 list[None]
+            raw_list: List[Optional[np.ndarray]] = [None] * len(sources)
+            for i, src in enumerate(sources):
+                raw_list[i] = _load_frame_raw(src) if isinstance(src, str) else src
+            self._raw = raw_list
     def __len__(self): return len(self._sources)
     def __iter__(self):
-        for src in self._sources:
-            yield self._load(src)
+        for idx in range(len(self._sources)):
+            yield self.__getitem__(idx)
     def __getitem__(self, idx):
         n = len(self._sources)
         if isinstance(idx, slice):
@@ -61,12 +98,46 @@ class LazyFrames:
         if idx < 0: idx += n
         if idx < 0 or idx >= n:
             raise IndexError(f"Frame index {idx} out of range [0, {n-1}]")
-        return self._load(self._sources[idx])
-    @staticmethod
-    def _load(src):
-        if isinstance(src, str):
-            return _load_frame_from_path(src)
-        return src
+        src = self._sources[idx]
+        if not isinstance(src, str):
+            return src
+        # 转换结果缓存（LRU）
+        if self._cache_size > 0:
+            cached = self._cache.get(src)
+            if cached is not None:
+                self._hits += 1
+                self._cache.move_to_end(src)
+                return cached
+            self._misses += 1
+            img = self._convert(src, idx)
+            self._cache[src] = img
+            if len(self._cache) > self._cache_size:
+                self._cache.popitem(last=False)
+            return img
+        return self._convert(src, idx)
+    def _convert(self, src: str, idx: int) -> np.ndarray:
+        """从预加载 raw（或读盘）取帧并转 float32。"""
+        raw_frame = self._raw[idx] if self._raw is not None else None
+        if raw_frame is not None:
+            return raw_frame.astype(np.float32) / 255.0
+        return _load_frame_from_path(src)
+    def preload(self) -> None:
+        """手动触发预加载（幂等）。"""
+        if self._raw is None:
+            raw_list: List[Optional[np.ndarray]] = [None] * len(self._sources)
+            self._raw = raw_list
+        for i, src in enumerate(self._sources):
+            if isinstance(src, str) and self._raw[i] is None:
+                self._raw[i] = _load_frame_raw(src)
+            elif not isinstance(src, str):
+                self._raw[i] = src
+    def clear_cache(self) -> None:
+        self._cache.clear()
+    def cache_stats(self) -> Dict[str, int]:
+        return {"hits": self._hits, "misses": self._misses}
+    @property
+    def preloaded(self) -> bool:
+        return self._raw is not None
 
 
 # ---------- Quaternion utilities ----------

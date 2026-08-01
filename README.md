@@ -136,7 +136,7 @@ python gui.py
 | `poses.py` | 纯 OpenCV 增量式 SfM（ORB/SIFT），含 BA 和点云过滤 |
 | `colmap_poses.py` | COLMAP 封装，作为备选姿态估计后端 |
 | `point_cloud.py` | 从稀疏点云初始化高斯参数（SH 0–3），自适应离群点剔除 |
-| `gaussian.py` | 3DGS 核心：纯 PyTorch 光栅化器（排序式逐像素 splat 向量化，含梯度图连接保护）、Trainer、密度控制、学习率调度 |
+| `gaussian.py` | 3DGS 核心：纯 PyTorch 光栅化器（排序式逐像素 splat 向量化，含梯度图连接保护）、LazyFrames 帧内存预加载、Trainer、密度控制、学习率调度 |
 | `exporter.py` | 导出标准 PLY 格式，兼容官方查看器 |
 | `gui.py` | PySide6 暗色主题图形界面，帧预览分页浏览（列数×行数随窗口宽高自适应，可查看全部帧） |
 | `cli.py` | 命令行入口，集成完整流程 |
@@ -156,6 +156,8 @@ python gui.py
 **梯度裁剪**：全局梯度范数限制为 10.0，防止训练发散。
 
 **光栅化器向量化**：像素级合成采用**排序式逐像素 splat**——把逐高斯 Python 内层循环重写为「展平覆盖像素对 → stable sort → 分段透射率 → scatter_add 归约」的纯张量算子，消除每颗高斯的 kernel launch 与 GPU→CPU 同步。实测 180x320+4000 高斯 forward 加速 **14.5x**、forward+backward **37.7x**；2160x3840+38665 高斯单帧约 1.7s（原为分钟级）。输出与旧实现逐元素一致（误差 < 1e-6）。
+
+**帧内存预加载**：训练每 epoch 遍历全部帧，读盘 + PNG 解码是主要开销且伤硬盘。帧在训练开始前全部预解码为 **uint8 RGB** 缓存到内存（200 帧约 5GB，仅为 float32 的 1/4），训练期间**零磁盘读取**，访问时按需转 float32。实测 2 epoch × 200 帧从 57.3s（全读盘）降到 21.9s（内存缓存），**2.6x 加速且消除磁盘 IO**。
 
 **梯度图连接保护**：光栅化器在边缘情况（高斯数为 0、全部高斯在相机后方或投影到画面外）下返回与计算图保持连接的零张量，避免 `loss.backward()` 因缺少 `grad_fn` 而崩溃。
 

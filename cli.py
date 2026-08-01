@@ -307,7 +307,7 @@ def run_pipeline(args: argparse.Namespace) -> None:
         for epoch in range(start_epoch, args.num_epochs + 1):
             try:
                 avg_loss = trainer.train_epoch(
-                    frames_iter=frame_paths,
+                    frames_iter=frames,   # 传 LazyFrames 对象（内存缓存帧），避免每帧读盘
                     camera_poses=train_poses,
                     stop_event=None,   # CLI 无停止事件
                     progress_callback=None,
