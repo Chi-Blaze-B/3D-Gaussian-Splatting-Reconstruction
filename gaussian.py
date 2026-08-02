@@ -1106,8 +1106,27 @@ class AdaptiveDensityController:
 
         avg_grad = self._grad_accum / max(1, self._step_count)
         avg_opacity = self._opacity_accum / max(1, self._step_count)
-        median_grad = torch.median(avg_grad[avg_grad > 0]) if (avg_grad > 0).any() else torch.tensor(1.0, device=g.positions.device)
-        grad_thresh = max(self.grad_thresh_base, median_grad * 0.5)
+        # ===== 修复: grad_thresh 自适应匹配实际梯度量级 =====
+        # 旧实现: grad_thresh = max(grad_thresh_base=0.0002, median*0.5)
+        #   —— 硬底 0.0002 是官方 grad² 语义下的阈值，但本项目 loss 用 mean reduction
+        #      （除以 H*W 像素），梯度被稀释到 ~1e-7，导致 0/所有高斯超过阈值，
+        #      密度控制永远不触发。
+        # 新实现: 完全自适应，用梯度分布的相对分位数决定分裂/复制阈值，
+        #   不依赖绝对量级，无论 loss reduction 或场景尺度如何都能触发密度控制。
+        nz_grad = avg_grad[avg_grad > 0]
+        if nz_grad.numel() == 0:
+            return stats
+        # ===== 修复: grad_thresh 完全自适应，移除绝对硬底 =====
+        # 旧实现: grad_thresh = max(quantile, eps*1e3)。eps*1e3≈1.19e-4 是"防数值
+        #   误差"的绝对硬底，但本项目 loss 用 mean reduction，位置梯度量级 ~1e-7，
+        #   硬底比所有梯度（最大 ~5e-6）还大 → n_gt=0，densify 永不触发。
+        # 新实现: 用 p60 分位本身做阈值，仅在梯度为 0 的极端情况下用极小底防除零。
+        grad_thresh = torch.quantile(nz_grad, 0.6)
+        # 极小兜底：仅当 p60 为 0 时（全部梯度相同）才给一个相对 p95 的底
+        if grad_thresh <= 0:
+            grad_thresh = torch.quantile(nz_grad, 0.95)
+        if grad_thresh <= 0:
+            return stats
         max_log_scale = torch.max(g.log_scales, dim=1).values
         split_mask = (avg_grad > grad_thresh) & (max_log_scale > self.scale_thresh) & (avg_opacity > 0.01)
         duplicate_mask = (avg_grad > grad_thresh) & ~split_mask & (avg_opacity > 0.01)
@@ -1146,6 +1165,13 @@ class AdaptiveDensityController:
             dup_opa = g.opacities_raw[dup_idx].detach().cpu().numpy()
             dup_rot = g.rotations[dup_idx].detach().cpu().numpy()
             dup_sh = g.sh_coeffs[dup_idx].detach().cpu().numpy()
+            # 保留原高斯
+            new_pos.append(dup_pos)
+            new_log_scales.append(dup_log_scales)
+            new_opa.append(dup_opa)
+            new_rot.append(dup_rot)
+            new_sh.append(dup_sh)
+            # 新增带微扰的副本（克隆高梯度高斯，保留原物 → 总数增长）
             new_pos.append(dup_pos + np.random.randn(len(dup_idx), 3).astype(np.float32) * 0.001)
             new_log_scales.append(dup_log_scales)
             new_opa.append(dup_opa + np.random.normal(0, 0.1, len(dup_idx)).astype(np.float32))
@@ -1201,8 +1227,15 @@ class AdaptiveDensityController:
             prune_mask = avg_opacity < self.min_opacity
             if self._grad_accum is not None and n > 0:
                 avg_grad = self._grad_accum / max(1, self._step_count)
-                protect_mask = avg_grad > 0.005
-                prune_mask = prune_mask & ~protect_mask
+                # ===== 修复: 保护阈值自适应（与 densify 的 grad_thresh 一致） =====
+                # 旧实现: avg_grad > 0.005（官方 grad² 量级硬阈值），对 loss mean
+                #   reduction 的梯度（~1e-7）永远为 False，保护机制失效。
+                # 新实现: 用梯度中位数，保护"梯度高于中位数"的低透明度高斯。
+                nz_grad = avg_grad[avg_grad > 0]
+                if nz_grad.numel() > 0:
+                    protect_thresh = torch.quantile(nz_grad, 0.5)
+                    protect_mask = avg_grad > protect_thresh
+                    prune_mask = prune_mask & ~protect_mask
 
         n_pruned = int(prune_mask.sum())
         if n_pruned == 0:

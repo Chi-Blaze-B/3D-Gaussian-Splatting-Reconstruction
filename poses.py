@@ -36,11 +36,12 @@ SMALL_TRANSLATION = 1e-4
 MATCH_DIST = 90
 DESC_UPDATE_THRESH = 35
 MIN_FEATURES = 80
-MIN_TRI_ANGLE_DEG = 0.5
+MIN_TRI_ANGLE_DEG = 2.0
 INIT_MIN_TRANSLATION = 0.01
 KEYFRAME_CULLING_WINDOW = 10
 LOCAL_MAP_RADIUS = 2
-MAX_POINTS_IN_BA = 150          # was 500, reduce to avoid overfitting
+PNP_WINDOW = 12           # PnP 精修使用的最近关键帧数（原 LOCAL_MAP_RADIUS=2 匹配不足，全部关键帧太慢）
+MAX_POINTS_IN_BA = 300          # was 150, increase for better point quality
 EPS_MIN = 1e-8
 EPS_MAX = 0.1
 BA_MAX_OBS = 2000               # new: cap observations per BA call
@@ -77,6 +78,10 @@ class CameraPose:
         RT[:3, :3] = self.R
         RT[:3, 3] = self.t.flatten()
         return RT
+
+    def scaled(self, factor: float) -> "CameraPose":
+        """返回平移缩放后的新 CameraPose（frozen dataclass 不可原地改）。"""
+        return CameraPose(self.R, (self.t * factor).astype(np.float32))
 
 
 # ---------- Main Estimator ----------
@@ -165,12 +170,14 @@ def estimate_poses(
                     frame_poses[i] = new_pose
                     last_pose = new_pose
                     initialized = True
-                    _triangulate_new_points(i, matches, mask_pose.ravel().astype(bool),
-                                            kp_list, pts_prev, pts_curr,
-                                            frame_poses[i-1], new_pose,
-                                            focal0, fy0, cx, cy,
-                                            map_points, feat_map, desc_list, frame_to_points,
-                                            triang_thresh)
+                    _, new_pose = _triangulate_new_points(i, matches, mask_pose.ravel().astype(bool),
+                                                           kp_list, pts_prev, pts_curr,
+                                                           frame_poses[i-1], new_pose,
+                                                           focal0, fy0, cx, cy,
+                                                           map_points, feat_map, desc_list, frame_to_points,
+                                                           triang_thresh)
+                    frame_poses[i] = new_pose
+                    last_pose = new_pose
                     keyframes.append(i)
                     logger.info(f"Initialized with frames 0 and {i}")
                     continue
@@ -202,12 +209,14 @@ def estimate_poses(
                                             frame_poses[i] = new_pose
                                             last_pose = new_pose
                                             initialized = True
-                                            _triangulate_new_points(i, matches_cand, mask_pose2.ravel().astype(bool),
-                                                                    kp_list, pts_cand, pts_cur2,
-                                                                    frame_poses[idx_cand], new_pose,
-                                                                    focal0, fy0, cx, cy,
-                                                                    map_points, feat_map, desc_list, frame_to_points,
-                                                                    triang_thresh)
+                                            _, new_pose = _triangulate_new_points(i, matches_cand, mask_pose2.ravel().astype(bool),
+                                                                                  kp_list, pts_cand, pts_cur2,
+                                                                                  frame_poses[idx_cand], new_pose,
+                                                                                  focal0, fy0, cx, cy,
+                                                                                  map_points, feat_map, desc_list, frame_to_points,
+                                                                                  triang_thresh)
+                                            frame_poses[i] = new_pose
+                                            last_pose = new_pose
                                             keyframes.append(i)
                                             logger.info(f"Initialized with frames {idx_cand} and {i}")
                                             break
@@ -219,17 +228,21 @@ def estimate_poses(
         new_pose = CameraPose(R_curr, t_curr)
         inlier_mask = mask_pose.ravel().astype(bool)
 
-        _triangulate_new_points(i, matches, inlier_mask,
-                                kp_list, pts_prev, pts_curr,
-                                frame_poses[i-1], new_pose,
-                                focal0, fy0, cx, cy,
-                                map_points, feat_map, desc_list, frame_to_points,
-                                triang_thresh)
+        _, new_pose = _triangulate_new_points(i, matches, inlier_mask,
+                                              kp_list, pts_prev, pts_curr,
+                                              frame_poses[i-1], new_pose,
+                                              focal0, fy0, cx, cy,
+                                              map_points, feat_map, desc_list, frame_to_points,
+                                              triang_thresh)
 
         # ----- Local map tracking (PnP refinement) -----
+        # PnP 用已有 3D 点计算相机位姿，天然提供正确的尺度锚点（解决 t_rel 单位范数
+        # 导致的累积尺度漂移）。原条件 LOCAL_MAP_RADIUS=2 匹配点常不足，PnP 很少触发。
+        # 放宽到最近 PNP_WINDOW 个关键帧（而非全部——全部关键帧匹配太慢），
+        # 兼顾 PnP 触发率与速度。
         if len(keyframes) > 1:
-            local_kfs = keyframes[-LOCAL_MAP_RADIUS:]
             pts3d_local, pts2d_local = [], []
+            local_kfs = keyframes[-PNP_WINDOW:]
             for kf in local_kfs:
                 if kf == i:
                     continue
@@ -424,6 +437,7 @@ def _triangulate_new_points(curr_idx, matches, inlier_mask,
     K = np.array([[focal, 0, cx], [0, fy, cy], [0, 0, 1]], dtype=np.float32)
     P_prev = K @ pose_prev.RT[:3]
     P_curr = K @ pose_curr.RT[:3]
+    new_indices = []  # 记录本次新增的点（用于尺度归一化）
     cam_prev = -pose_prev.R.T @ pose_prev.t
     cam_curr = -pose_curr.R.T @ pose_curr.t
 
@@ -467,6 +481,50 @@ def _triangulate_new_points(curr_idx, matches, inlier_mask,
         map_points.append(pt_dict)
         feat_map[curr_idx-1][prev_feat] = pt_idx
         feat_map[curr_idx][curr_feat] = pt_idx
+        new_indices.append(pt_idx)
+
+    # ===== 修复: 尺度归一化（锚定到已有地图点的中位深度） =====
+    # 问题: 每次本质矩阵恢复的 t_rel 是单位范数（up-to-scale），链式叠加
+    #   t_curr = R_rel @ last_pose.t + t_rel 导致尺度随帧数累积漂移
+    #   （实测 20帧可见性 74% → 200帧 6%）。
+    # 修复: 新增点的中位深度应接近已有地图点的中位深度。用该比例同时缩放
+    #   新增点的坐标和当前相机平移 pose_curr.t，使全序列尺度一致。
+    # 注意: 深度用"相机前方 z 深度"（R_curr[2] @ (p - cam)）而非"到相机中心距离"，
+    #   后者在相机靠近点时病态（ref_median 骤降 → scale 爆炸，实测点云跨度 393万）。
+    #   scale 因子也 clamp 到 [0.05, 20]，防止极端值破坏点云。
+    if new_indices and map_points:
+        old_count = len(map_points) - len(new_indices)
+        if old_count >= 10:
+            old_depths = []
+            cam_curr_flat = cam_curr.flatten()
+            for p in map_points[:old_count]:
+                if p['xyz'].size == 3:
+                    # 相机前方 z 深度（正深度才有效）
+                    d = float(pose_curr.R[2] @ (p['xyz'] - cam_curr_flat))
+                    if d > 0:
+                        old_depths.append(d)
+            if len(old_depths) >= 5:
+                ref_median = np.median(old_depths)
+                new_depths = []
+                for pi in new_indices:
+                    d = float(pose_curr.R[2] @ (map_points[pi]['xyz'] - cam_curr_flat))
+                    if d > 0:
+                        new_depths.append(d)
+                if new_depths:
+                    new_median = np.median(new_depths)
+                    if new_median > 1e-8 and ref_median > 1e-8:
+                        scale = ref_median / new_median
+                        # clamp 尺度因子：严格限制防止逐帧累积放大。
+                        # 之前 [0.05,20] 允许连续帧各乘 ~20 → 点坐标指数爆炸
+                        # （实测个别点范数 >1e6）。限制到 [0.5,2] 只做温和微调。
+                        scale = np.clip(scale, 0.5, 2.0)
+                        # 只缩放显著偏离的尺度（防止数值噪声抖动）
+                        if scale > 1.5 or scale < 0.5:
+                            for pi in new_indices:
+                                map_points[pi]['xyz'] = (map_points[pi]['xyz'] * scale).astype(np.float32)
+                            # 同步缩放当前相机平移，保持相机-点几何一致
+                            pose_curr = pose_curr.scaled(scale)
+    return new_indices, pose_curr
 
 
 def _is_valid_point(pt3d, pose_prev, pose_curr, cam_prev, cam_curr,
@@ -563,12 +621,39 @@ def _bundle_adjustment(
         for pid in point_ids:
             param.extend(map_points[pid]['xyz'])
 
-    bound_scale = 100.0 * image_size
-    bounds_lower = [1.0, 1.0] + [-bound_scale] * len(other_kfs) * 6
-    bounds_upper = [10.0 * image_size, 10.0 * image_size] + [bound_scale] * len(other_kfs) * 6
+    # ===== 修复: BA 平移/点坐标边界基于场景尺度，防止相机尺度漂移 =====
+    # 旧实现: bound_scale = 100*image_size (~384000)，远超场景尺度（点云跨度~67），
+    #   允许 BA 把相机推到离点云极远处（实测相机轨迹跨度 2579 vs 点云 67），
+    #   导致投影后点云仅 ~7% 落入画面。
+    # 新实现: 用 map_points 的中位深度/跨度作为场景尺度基准，平移边界设为
+    #   场景跨度的数倍，相机被约束在点云附近，保持尺度一致。
+    scene_scale = 1.0
+    if map_points:
+        xs = np.array([p['xyz'] for p in map_points if p['xyz'].size == 3])
+        if len(xs) > 0:
+            scene_scale = float(np.linalg.norm(xs.max(axis=0) - xs.min(axis=0))) + 1e-6
+    # 相机平移边界：基于场景尺度与当前相机范围（确保初始猜测在界内）
+    # 平移可能因尺度漂移略超场景尺度，取场景尺度 5 倍与相机最大平移 2 倍的较大者
+    cam_t_max = 1.0
+    if other_kfs:
+        cam_ts = [np.linalg.norm(frame_poses[k].t.flatten()) for k in other_kfs
+                  if frame_poses[k] is not None]
+        if cam_ts:
+            cam_t_max = max(cam_ts)
+    t_bound = max(scene_scale * 5.0, cam_t_max * 2.0, 10.0)
+    # 旋转向量边界：cv2.Rodrigues 的旋转向量范数可远超 π（冗余表示，接近 360°
+    # 旋转时范数可达 ~4π 甚至更大），设任何有限边界都会导致 "Initial guess is
+    # outside of provided bounds"。旋转向量本身有界性由 Rodrigues 保证（同一旋转
+    # 有多个表示），因此对旋转不设边界（np.inf），只约束相机平移防尺度漂移。
+    r_bound = np.inf
+    bounds_lower = [1.0, 1.0] + [-r_bound] * len(other_kfs) * 3 + [-t_bound] * len(other_kfs) * 3
+    bounds_upper = [10.0 * image_size, 10.0 * image_size] + [r_bound] * len(other_kfs) * 3 + [t_bound] * len(other_kfs) * 3
     if optimize_points and point_ids:
-        bounds_lower += [-1e6] * len(point_ids) * 3
-        bounds_upper += [1e6] * len(point_ids) * 3
+        # 点坐标边界：不设硬限制（用 np.inf），避免 BA 因点坐标越界失败。
+        # 相机平移边界已约束尺度漂移（t_bound 基于场景尺度），
+        # 点坐标在 BA 中相对相机优化，无需单独限制（旧实现 ±1e6 同效）。
+        bounds_lower += [-np.inf] * len(point_ids) * 3
+        bounds_upper += [np.inf] * len(point_ids) * 3
 
     def residuals(params):
         f = params[0]
@@ -595,9 +680,17 @@ def _bundle_adjustment(
             pt_cam = pose.R @ pt3d.reshape(3, 1) + pose.t
             depth = float(pt_cam[2, 0])
 
-            if depth <= 1e-8:
-                res.append(1000.0)
-                res.append(1000.0)
+            # ===== 修复: 深度惩罚随深度单调递增，防止点被推到相机后方 =====
+            # 旧实现: depth<=1e-8 时惩罚固定 1000（soft_l1 下约束弱），
+            # 且 depth<eps 用 -log(depth/eps)，导致深度越接近 0 惩罚反而骤降，
+            # 点可以被推到负深度（45% 点在相机后方的根因）。
+            # 新实现: 对 depth<=1e-6 施加随深度减小的强对数障碍，单调递增惩罚，
+            # 保证 BA 不会把点推到相机后方。
+            if depth <= 1e-6:
+                # 深度为负或近零 -> 强惩罚（随深度减小单调递增）
+                barrier = -np.log(max(depth / 1e-6, 1e-10))
+                res.append(barrier)
+                res.append(barrier)
                 continue
 
             if depth < eps:
@@ -618,8 +711,21 @@ def _bundle_adjustment(
     try:
         # ===== 使用更宽容的 f_scale =====
         f_scale = reproj_thresh * BA_F_SCALE_MULTIPLIER
+        # ===== 诊断: 检查初始猜测是否越界（定位越界参数） =====
+        param_np = np.array(param, dtype=np.float64)
+        lb = np.array(bounds_lower, dtype=np.float64)
+        ub = np.array(bounds_upper, dtype=np.float64)
+        if len(param_np) == len(lb):
+            viol = (param_np < lb) | (param_np > ub)
+            if viol.any():
+                idxs = np.where(viol)[0]
+                msg = ", ".join(
+                    f"p[{i}]={param_np[i]:.2f} (bnd [{lb[i]:.2f},{ub[i]:.2f}])"
+                    for i in idxs[:5]
+                )
+                logger.info(f"[BA] initial guess violates bounds: {msg}")
         result = least_squares(
-            residuals, np.array(param, dtype=np.float64),
+            residuals, param_np,
             bounds=(bounds_lower, bounds_upper),
             method='trf', loss='soft_l1', f_scale=f_scale,
             max_nfev=max_iter, verbose=0,
@@ -677,13 +783,17 @@ def _prune_map_points(map_points, feat_map, frame_to_points, reproj_thresh,
             continue
         total_err = 0.0
         count = 0
+        neg_depth = 0
+        total_obs = 0
         for f_idx, kp_idx, u_obs, v_obs in pt['obs']:
             pose = frame_poses[f_idx]
             if pose is None:
                 continue
             pt_cam = pose.R @ xyz.reshape(3, 1) + pose.t
             depth = float(pt_cam[2, 0])
+            total_obs += 1
             if depth <= 0:
+                neg_depth += 1
                 continue
             x = float(pt_cam[0, 0]) / depth
             y = float(pt_cam[1, 0]) / depth
@@ -692,6 +802,10 @@ def _prune_map_points(map_points, feat_map, frame_to_points, reproj_thresh,
             err = np.sqrt((u_pred - u_obs)**2 + (v_pred - v_obs)**2)
             total_err += err
             count += 1
+        # ===== 修复: 负深度为主的点直接修剪（相机后方的点无效） =====
+        if total_obs > 0 and neg_depth / total_obs >= 0.5:
+            to_remove.append(idx)
+            continue
         if count > 0 and total_err / count > MAX_REPROJ_ERROR * reproj_thresh:
             to_remove.append(idx)
 
@@ -740,13 +854,17 @@ def _filter_point_cloud(map_points, frame_poses, focal, fy, cx, cy, reproj_thres
             continue
         total_err = 0.0
         count = 0
+        neg_depth = 0
+        total_obs = 0
         for f_idx, _, u_obs, v_obs in obs:
             pose = frame_poses[f_idx]
             if pose is None:
                 continue
             pt_cam = pose.R @ xyz.reshape(3, 1) + pose.t
             depth = float(pt_cam[2, 0])
+            total_obs += 1
             if depth <= 0:
+                neg_depth += 1
                 continue
             x = float(pt_cam[0, 0]) / depth
             y = float(pt_cam[1, 0]) / depth
@@ -755,6 +873,11 @@ def _filter_point_cloud(map_points, frame_poses, focal, fy, cx, cy, reproj_thres
             err = np.sqrt((u_pred - u_obs)**2 + (v_pred - v_obs)**2)
             total_err += err
             count += 1
+        # ===== 修复: 负深度为主的点直接过滤（相机后方的点无效） =====
+        # 旧实现: 负深度观测被跳过不计入误差，点保留 —— 导致大量点在相机后方
+        if total_obs > 0 and neg_depth / total_obs >= 0.5:
+            errors.append(float('inf'))
+            continue
         if count >= MIN_OBSERVATIONS:
             errors.append(total_err / count)
         else:

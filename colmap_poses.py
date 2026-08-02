@@ -82,10 +82,13 @@ def estimate_poses_with_colmap(
     *,
     colmap_exe: Optional[str] = None,
     image_path: Optional[str] = None,
-    max_image_size: int = 1024,
+    max_image_size: int = 2400,
     sift_peak_threshold: float = 0.005,
     sift_edge_threshold: int = 10,
-    sift_max_num_features: int = 4096,
+    sift_max_num_features: int = 12000,
+    matcher: str = "exhaustive",
+    matcher_overlap: int = 10,
+    loop_detection: bool = False,
 ) -> Tuple[CameraIntrinsics, List[Optional[CameraPose]], np.ndarray]:
     """Estimate camera poses using COLMAP.
 
@@ -94,9 +97,22 @@ def estimate_poses_with_colmap(
         output_dir: directory to store intermediate COLMAP results.
         colmap_exe: path to colmap executable (auto-detected if None).
         max_image_size: max image dimension for feature extraction.
+            Default 2400 (from tuned optimum): high resolution retains small-scale
+            texture → more/better SIFT matches → denser triangulated point cloud.
         sift_peak_threshold: SIFT peak threshold.
         sift_edge_threshold: SIFT edge threshold.
         sift_max_num_features: max number of SIFT features per image.
+            Default 12000 (from tuned optimum): more features → better matching
+            quality.  Note: raises runtime on long sequences, use
+            --pose-estimator opencv or reduce features for very long videos.
+        matcher: 'exhaustive' (match all pairs, robust for unordered image sets and
+            for unevenly-spaced two-stage frames; O(n²) pairs) or 'sequential'
+            (match only temporally adjacent frames, fastest for video).
+            Default 'exhaustive' (matches the tuned optimum).
+        matcher_overlap: sequential matcher overlap window (frames to either side).
+        loop_detection: enable sequential matcher loop closure detection
+            (matches far-away frames that revisit the same scene; requires a
+            vocabulary tree — leave off otherwise, sequential_matcher hangs).
 
     Returns:
         intrinsics: CameraIntrinsics object.
@@ -207,9 +223,21 @@ def estimate_poses_with_colmap(
         # ------------------------------------------------------------------
         # Step 2: Matching
         # ------------------------------------------------------------------
-        matching_cmd = [colmap_exe_path, "exhaustive_matcher",
-                        "--database_path", db_path]
-        _run_colmap(matching_cmd, "Exhaustive matching", colmap_bin_dir)
+        if matcher == "sequential":
+            # Best for video sequences: only match temporally adjacent frames.
+            # O(n·overlap) pairs instead of O(n²), and avoids feeding
+            # weak-baseline far-apart pairs to the mapper.
+            matching_cmd = [
+                colmap_exe_path, "sequential_matcher",
+                "--database_path", db_path,
+                "--SequentialMatching.overlap", str(matcher_overlap),
+                "--SequentialMatching.loop_detection", "1" if loop_detection else "0",
+                "--SequentialMatching.loop_detection_period", "10",
+            ]
+        else:
+            matching_cmd = [colmap_exe_path, "exhaustive_matcher",
+                            "--database_path", db_path]
+        _run_colmap(matching_cmd, "Matching", colmap_bin_dir)
 
         # ------------------------------------------------------------------
         # Verify matching quality (detect COLMAP 4.x bug)
@@ -225,19 +253,27 @@ def estimate_poses_with_colmap(
                     "Please check your input quality or use --pose-estimator opencv."
                 )
             c.execute(
-                "SELECT COUNT(DISTINCT rows), COUNT(DISTINCT cols) "
-                "FROM two_view_geometries"
+                "SELECT pair_id FROM two_view_geometries"
             )
-            distinct_rows, distinct_cols = c.fetchone()
-            if distinct_cols < 2:
+            pair_ids = [r[0] for r in c.fetchall()]
+            if pair_ids:
+                # pair_id 编码：高 16 位 = image_id1，低 16 位 = image_id2（COLMAP 约定）
+                img_ids = set()
+                for pid in pair_ids:
+                    img_ids.add(pid >> 16)
+                    img_ids.add(pid & 0xFFFF)
+                n_distinct_imgs = len(img_ids)
+            else:
+                n_distinct_imgs = 0
+            if n_distinct_imgs < 2:
                 raise RuntimeError(
-                    f"COLMAP matching failed: only {distinct_cols} distinct images "
+                    f"COLMAP matching failed: only {n_distinct_imgs} distinct images "
                     f"involved ({total_pairs} pairs). All matches may point to the "
                     "same image_id (known COLMAP 4.x bug). "
                     "Please check your input quality or use --pose-estimator opencv."
                 )
             print(f"  [COLMAP] Matching OK: {total_pairs} pairs, "
-                  f"{distinct_rows}/{distinct_cols} distinct rows/cols")
+                  f"{n_distinct_imgs} distinct images")
         finally:
             conn.close()
 

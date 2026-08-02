@@ -133,7 +133,7 @@ python gui.py
 | 模块 | 功能 |
 |------|------|
 | `frames.py` | 视频帧提取，支持三种采样策略，光流采用 Farneback/LK |
-| `poses.py` | 纯 OpenCV 增量式 SfM（ORB/SIFT），含 BA 和点云过滤 |
+| `poses.py` | 纯 OpenCV 增量式 SfM（ORB/SIFT），含 BA（深度障碍 + 基于场景尺度的相机边界 + 三角化尺度归一化 + PnP 尺度锚定）和点云过滤 |
 | `colmap_poses.py` | COLMAP 封装，作为备选姿态估计后端 |
 | `point_cloud.py` | 从稀疏点云初始化高斯参数（SH 0–3），自适应离群点剔除 |
 | `gaussian.py` | 3DGS 核心：纯 PyTorch 光栅化器（排序式逐像素 splat 向量化，含梯度图连接保护）、LazyFrames 帧内存预加载、Trainer、密度控制、学习率调度 |
@@ -145,7 +145,7 @@ python gui.py
 
 **损失函数**：`(1 - w_ssim) * L1 + w_ssim * SSIM`，SSIM 权重线性升温。
 
-**密度控制**：每 `densify_every` 步根据梯度累积和尺度分裂/复制高斯，每 `prune_every` 步修剪低不透明度高斯，并自动限制总数量。densify/prune 时对需梯度的参数先 `.detach()` 再转 numpy，修剪后用 `.detach().clone()` 重建叶子张量，确保后续反向传播正常。
+**密度控制**：每 `densify_every` 步根据梯度累积和尺度分裂/复制高斯，每 `prune_every` 步修剪低不透明度高斯，并自动限制总数量。分裂/复制阈值用**梯度分布的 p60 分位数自适应**（不依赖绝对量级，适配 loss 的 mean reduction；无绝对硬底，避免小梯度量级下永不触发）；复制时**保留原高斯 + 新增带微扰副本**（总数 = n + n_dup，与官方 densify_and_clone 一致）；修剪时保护梯度高于中位数的高斯；对需梯度的参数先 `.detach()` 再转 numpy，修剪后用 `.detach().clone()` 重建叶子张量。
 
 **初始高斯稠密化**：若初始化后高斯数量少于 2000 个，自动对每个高斯做 8 倍扩增（加噪声），确保训练有足够的起始高斯数。
 
@@ -206,7 +206,7 @@ python cli.py --video input.mp4 --resume-dir ./workdir --output restored.ply
 
 帧采样数量：通常 100~200 帧效果较好，过少会导致欠约束，过多增加训练时间。
 
-姿态估计：若 ORB 方法失败，可尝试 --pose-estimator colmap（需安装 COLMAP）。COLMAP 更鲁棒但速度较慢。
+姿态估计：**长序列（≥60 帧）建议用 `--pose-estimator colmap`**——COLMAP 是工业级 SfM，实测点云质量与帧注册率远高于自研 ORB+EM（30 帧可见性 86.9% vs 37.5%）。COLMAP 默认用调优最优配置（`max_image_size=2400`、`sift_max_num_features=12000`、exhaustive matcher），60 帧实测 24/60 注册、8728 点、可见性中位 57%。自研 ORB+EM 适合短序列（<60 帧），已修复 BA 深度障碍与尺度漂移问题。注意：COLMAP 对视频长序列的注册率低是 mapper 固有行为（只注册可稳定三角化的帧），但注册帧点云质量高，足以初始化高斯。
 
 显存管理：如果训练中显存溢出，程序会自动修剪高斯并降低上限，并保存检查点。
 
