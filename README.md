@@ -206,7 +206,7 @@ python cli.py --video input.mp4 --resume-dir ./workdir --output restored.ply
 
 帧采样数量：通常 100~200 帧效果较好，过少会导致欠约束，过多增加训练时间。
 
-姿态估计：**长序列（≥60 帧）建议用 `--pose-estimator colmap`**——COLMAP 是工业级 SfM，实测点云质量与帧注册率远高于自研 ORB+EM（30 帧可见性 86.9% vs 37.5%）。COLMAP 默认用调优最优配置（`max_image_size=2400`、`sift_max_num_features=12000`、exhaustive matcher），60 帧实测 24/60 注册、8728 点、可见性中位 57%。自研 ORB+EM 适合短序列（<60 帧），已修复 BA 深度障碍与尺度漂移问题。注意：COLMAP 对视频长序列的注册率低是 mapper 固有行为（只注册可稳定三角化的帧），但注册帧点云质量高，足以初始化高斯。
+姿态估计：**长序列（≥60 帧）建议用 `--pose-estimator colmap`**——COLMAP 是工业级 SfM，实测点云质量与帧注册率远高于自研 ORB+EM（30 帧可见性 86.9% vs 37.5%）。COLMAP 默认用调优最优配置（`max_image_size=2400`、`sift_max_num_features=12000`、exhaustive matcher），60 帧实测 54/60 注册、27329 点。自研 ORB+EM 适合短序列（<60 帧），已修复 BA 深度障碍与尺度漂移问题。注意：COLMAP 对视频长序列的注册率低是 mapper 固有行为（只注册可稳定三角化的帧），但注册帧点云质量高，足以初始化高斯。mapper 可能把场景拆成多个子模型，程序会自动选择注册图像数最多的模型（修复：不再硬编码选模型 0）。
 
 显存管理：如果训练中显存溢出，程序会自动修剪高斯并降低上限，并保存检查点。
 

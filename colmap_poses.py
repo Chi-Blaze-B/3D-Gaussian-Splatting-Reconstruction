@@ -286,29 +286,75 @@ def estimate_poses_with_colmap(
                "--output_path", sparse_dir]
         _run_colmap(cmd, "Mapper (SfM reconstruction)", colmap_bin_dir)
 
-        recon_path = Path(sparse_dir) / "0"
-        if not recon_path.exists():
+        # ------------------------------------------------------------------
+        # Step 4: Select best reconstruction among all mapper output models.
+        # The mapper may split the scene into multiple disconnected sub-models
+        # (sparse/0, sparse/1, ...). Model 0 is NOT guaranteed to be the largest —
+        # it can be a failed seed reconstruction with almost no images/points.
+        # Convert every model to TXT and pick the one with the most registered
+        # images (tie-break: most 3D points).
+        # ------------------------------------------------------------------
+        model_ids = sorted(
+            int(d.name) for d in Path(sparse_dir).iterdir()
+            if d.is_dir() and d.name.isdigit()
+        )
+        if not model_ids:
             raise RuntimeError(
                 "COLMAP mapper failed — no reconstruction produced.\n"
                 "Please check COLMAP logs or use --pose-estimator opencv."
             )
 
-        # ------------------------------------------------------------------
-        # Step 4: Convert binary model to TXT
-        # ------------------------------------------------------------------
-        txt_dir = str(recon_path) + "_txt"
-        os.makedirs(txt_dir, exist_ok=True)
-        cmd = [colmap_exe_path, "model_converter",
-               "--input_path", str(recon_path),
-               "--output_path", txt_dir,
-               "--output_type", "TXT"]
-        _run_colmap(cmd, "Model conversion (binary -> TXT)", colmap_bin_dir)
+        best_score = -1
+        best_txt_dir = None
+        best_meta = None
+        for mid in model_ids:
+            recon_path = Path(sparse_dir) / str(mid)
+            txt_dir = str(recon_path) + "_txt"
+            os.makedirs(txt_dir, exist_ok=True)
+            cmd = [colmap_exe_path, "model_converter",
+                   "--input_path", str(recon_path),
+                   "--output_path", txt_dir,
+                   "--output_type", "TXT"]
+            _run_colmap(cmd, f"Model conversion (model {mid} -> TXT)", colmap_bin_dir)
+
+            # Score = registered images, tie-broken by 3D point count.
+            n_images = 0
+            n_points = 0
+            img_txt = os.path.join(txt_dir, "images.txt")
+            pts_txt = os.path.join(txt_dir, "points3D.txt")
+            if os.path.isfile(img_txt):
+                with open(img_txt, "r", encoding="utf-8", errors="ignore") as f:
+                    for line in f:
+                        s = line.strip()
+                        # Registered image: 9+ tokens and not a 2D-observation line.
+                        if s and not s.startswith("#") and len(s.split()) >= 9 \
+                                and not s.split()[0].startswith("-"):
+                            n_images += 1
+            if os.path.isfile(pts_txt):
+                with open(pts_txt, "r", encoding="utf-8", errors="ignore") as f:
+                    for line in f:
+                        s = line.strip()
+                        if s and not s.startswith("#") and len(s.split()) >= 4:
+                            n_points += 1
+
+            score = n_images * 10000 + n_points
+            print(f"  [COLMAP] Model {mid}: {n_images} images, {n_points} points")
+            if score > best_score:
+                best_score = score
+                best_txt_dir = txt_dir
+                best_meta = (mid, n_images, n_points)
+
+        if best_txt_dir is None:
+            raise RuntimeError(
+                "COLMAP mapper produced no parseable reconstruction.\n"
+                "Please check COLMAP logs or use --pose-estimator opencv."
+            )
 
         # ------------------------------------------------------------------
-        # Step 5: Parse TXT and map poses back to original frame order
+        # Step 5: Parse the best model's TXT and map poses back to original
         # ------------------------------------------------------------------
         intrinsics, poses_dict, sparse_points = _parse_colmap_txt(
-            txt_dir, id_to_orig_name, name_to_frame_idx, len(frame_paths)
+            best_txt_dir, id_to_orig_name, name_to_frame_idx, len(frame_paths)
         )
 
         ordered_poses = [None] * len(frame_paths)
@@ -323,9 +369,12 @@ def estimate_poses_with_colmap(
         if sparse_points.size > 0:
             np.save(workdir / "sparse_points.npy", sparse_points)
 
+        best_mid = best_meta[0] if best_meta is not None else -1
+
         print(f"  [COLMAP] Estimated {len(valid_poses)} poses "
               f"(total frames: {len(frame_paths)}), "
-              f"{len(sparse_points)} sparse 3D points")
+              f"{len(sparse_points)} sparse 3D points "
+              f"(selected model {best_mid})")
         return intrinsics, ordered_poses, sparse_points
 
     finally:
