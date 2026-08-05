@@ -964,17 +964,24 @@ class Trainer:
         }
         torch.save(state, path)
 
-    # ===== 修复: load_training_state 增加 best_loss 恢复 =====
+    # ===== 修复: load_training_state 支持高斯基数与当前初始化不同的续训 =====
+    # 原实现用 .data.copy_() 把检查点参数写入当前高斯张量，但二者形状必须严格一致。
+    # 密度自适应（duplicate 使总数 N→N+N_dup、prune 使总数减少）会让训练过程中的
+    # 高斯基数与"本次从 SfM 点云初始化"的数量几乎必然不同 → copy_ 抛 shape 不匹配
+    # → 上层捕获后从头开始，损失所有训练进度。
+    # 正确做法：直接用检查点张量重建高斯参数（替换而非 copy），并重建优化器，
+    # 让优化器状态（moment/var，形状 N）对新数量自动对齐（Adam 会按零初始化新槽）。
     def load_training_state(self, path: str, device: str = "cpu") -> None:
         state = torch.load(path, map_location=device, weights_only=False)
         device = torch.device(device)
         g = self.gaussians
         params = state["gaussian_params"]
-        g.positions.data.copy_(params["positions"].to(device))
-        g.log_scales.data.copy_(params["log_scales"].to(device))
-        g.opacities_raw.data.copy_(params["opacities_raw"].to(device))
-        g.rotations.data.copy_(params["rotations"].to(device))
-        g.sh_coeffs.data.copy_(params["sh_coeffs"].to(device))
+        # 用检查点张量直接替换（而非 copy_），支持高斯基数变化
+        g.positions = params["positions"].to(device).requires_grad_(True)
+        g.log_scales = params["log_scales"].to(device).requires_grad_(True)
+        g.opacities_raw = params["opacities_raw"].to(device).requires_grad_(True)
+        g.rotations = params["rotations"].to(device).requires_grad_(True)
+        g.sh_coeffs = params["sh_coeffs"].to(device).requires_grad_(True)
 
         self.current_step = state["step_count"]
         self.best_loss = state.get("best_loss", float("inf"))  # ===== 新增（兼容旧检查点） =====
