@@ -59,7 +59,7 @@
    ```
 5. （可选）COLMAP 后端
    
-    需自行安装 COLMAP（https://github.com/colmap/colmap ），并确保 colmap 在此项目根目录下，即与所有`.py`文件一同放在同一个文件夹。
+   需自行安装 COLMAP（https://github.com/colmap/colmap ）。`colmap_poses.py` 查找顺序：项目内 `colmap-x64-windows-nocuda/bin/colmap.exe`（若有）→ 系统 PATH 中的 `colmap`。安装后将 colmap 加入 PATH 即可使用 `--pose-estimator colmap`。
    
 6. 克隆本仓库
    ```bash
