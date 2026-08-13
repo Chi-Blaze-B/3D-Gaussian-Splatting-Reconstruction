@@ -160,8 +160,7 @@ class StyledSpinBox(QWidget):
 
         self._edit = QLineEdit(self)
         self._edit.setAlignment(Qt.AlignCenter)
-        self._edit.setFixedWidth(56)
-        self._edit.setMaxLength(10)
+        self._edit.setMaxLength(12)
         self._edit.setText(str(self._value))
         self._edit.setStyleSheet(f"""
             QLineEdit {{
@@ -183,6 +182,19 @@ class StyledSpinBox(QWidget):
         layout.addWidget(self._btn_down)
         layout.addWidget(self._edit)
         layout.addWidget(self._btn_up)
+
+        # 编辑框宽度按数值范围自适应，避免大数（如 2000000）溢出
+        self._apply_edit_width()
+
+    def _apply_edit_width(self):
+        """根据 min/max 中最宽的文本计算编辑框宽度，保证大数值不溢出。"""
+        lo_txt = str(self._min_val)
+        hi_txt = str(self._max_val)
+        widest = lo_txt if len(lo_txt) > len(hi_txt) else hi_txt
+        fm = self._edit.fontMetrics()
+        text_w = fm.horizontalAdvance(widest)
+        # 12px 字号下约每字符 7px；留边距 + 边框 + 内边距约 22px
+        self._edit.setFixedWidth(max(int(text_w + 22), 56))
 
     def _increment(self):
         self._set_value(min(self._value + self._single_step, self._max_val))
@@ -212,6 +224,7 @@ class StyledSpinBox(QWidget):
     def setRange(self, lo, hi):
         self._min_val = lo
         self._max_val = hi
+        self._apply_edit_width()
 
     def setSingleStep(self, step):
         self._single_step = step
@@ -248,7 +261,6 @@ class StyledDoubleSpinBox(QWidget):
 
         self._edit = QLineEdit()
         self._edit.setAlignment(Qt.AlignCenter)
-        self._edit.setFixedWidth(64)
         self._edit.setMaxLength(12)
         self._edit.setText(str(self._value))
         self._edit.setStyleSheet(f"""
@@ -271,6 +283,20 @@ class StyledDoubleSpinBox(QWidget):
         layout.addWidget(self._btn_down)
         layout.addWidget(self._edit)
         layout.addWidget(self._btn_up)
+
+        # 编辑框宽度按数值范围自适应，避免大数溢出
+        self._apply_edit_width()
+
+    def _apply_edit_width(self):
+        """根据 min/max 中格式化后最宽的文本计算编辑框宽度。"""
+        def _fmt(v):
+            return f"{v:g}"
+        lo_txt = _fmt(self._min_val)
+        hi_txt = _fmt(self._max_val)
+        widest = lo_txt if len(lo_txt) > len(hi_txt) else hi_txt
+        fm = self._edit.fontMetrics()
+        text_w = fm.horizontalAdvance(widest)
+        self._edit.setFixedWidth(max(int(text_w + 22), 56))
 
     def _increment(self):
         self._set_value(min(self._value + self._single_step, self._max_val))
@@ -300,6 +326,7 @@ class StyledDoubleSpinBox(QWidget):
     def setRange(self, lo, hi):
         self._min_val = lo
         self._max_val = hi
+        self._apply_edit_width()
 
     def setSingleStep(self, step):
         self._single_step = step
