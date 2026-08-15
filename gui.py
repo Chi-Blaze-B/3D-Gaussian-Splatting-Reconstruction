@@ -918,6 +918,7 @@ class PipelineWorker(QThread):
             ssim_warmup_steps=c["ssim_warmup_steps"],
             ssim_weight_max=c["ssim_weight_max"],
             enable_k1=c["enable_k1"],
+            use_amp=c.get("amp", False),
         )
 
         train_poses = [p.RT.astype(np.float32) if p is not None else None for p in poses]
@@ -1392,6 +1393,12 @@ class MainWindow(QMainWindow):
         self.enable_k1_cb.setChecked(False)
         self.enable_k1_cb.setStyleSheet(f"color: {C['text_primary']}; font-size: 11px; font-weight: 500;")
 
+        self.amp_cb = QCheckBox("混合精度 (AMP / Tensor Core)")
+        self.amp_cb.setChecked(False)
+        self.amp_cb.setStyleSheet(f"color: {C['text_primary']}; font-size: 11px; font-weight: 500;")
+        self.amp_cb.setToolTip("混合精度 fp16（需 CUDA + fp16 显卡，Ampere+ 可用 Tensor Core）。"
+                               "光栅化器内部保持 fp32；无 Tensor Core 的低端卡无收益，请保持关闭。")
+
         # Device & estimator
         self.device_combo = StyledComboBox()
         if torch.cuda.is_available():
@@ -1419,6 +1426,7 @@ class MainWindow(QMainWindow):
         form.addRow(StyledLabel("动态背景:", font_size=11, color=C["text_secondary"]), self.random_bg_cb)
         form.addRow(StyledLabel("焦距自校准:", font_size=11, color=C["text_secondary"]), self.train_focal_cb)
         form.addRow(StyledLabel("径向畸变:", font_size=11, color=C["text_secondary"]), self.enable_k1_cb)
+        form.addRow(StyledLabel("混合精度:", font_size=11, color=C["text_secondary"]), self.amp_cb)
         form.addRow(StyledLabel("计算设备:", font_size=11, color=C["text_secondary"]), self.device_combo)
         form.addRow(StyledLabel("姿态估算:", font_size=11, color=C["text_secondary"]), self.pose_estimator_combo)
 
@@ -1515,6 +1523,7 @@ class MainWindow(QMainWindow):
             "random_background": self.random_bg_cb.isChecked(),
             "train_focal": self.train_focal_cb.isChecked(),
             "enable_k1": self.enable_k1_cb.isChecked(),
+            "amp": self.amp_cb.isChecked(),
             "device": device,
             "pose_estimator": pose_estimator,
         }

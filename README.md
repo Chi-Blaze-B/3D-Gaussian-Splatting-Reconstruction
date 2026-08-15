@@ -96,6 +96,7 @@ python cli.py --video input.mp4 --output output.ply
 | `--random-background` | 训练时随机黑白背景 | `False` |
 | `--train-focal` | 训练中微调焦距 | `False` |
 | `--enable-k1` | 训练径向畸变系数 k1 | `False` |
+| `--amp` | 混合精度 fp16（需 CUDA + fp16 显卡，Ampere+ 可用 Tensor Core；光栅化器内部保持 fp32，无 Tensor Core 无收益） | `False` |
 | `--pose-estimator` | 姿态估计后端：opencv / colmap | `opencv` |
 | `--focal-guess` | 初始焦距猜测（像素） | `None` |
 | `--resume-dir` | 从该工作目录恢复训练 | `None` |
@@ -145,7 +146,7 @@ python gui.py
 
 **损失函数**：`(1 - w_ssim) * L1 + w_ssim * SSIM`，SSIM 权重线性升温。
 
-**密度控制**：每 `densify_every` 步根据梯度累积和尺度分裂/复制高斯，每 `prune_every` 步修剪低不透明度高斯，并自动限制总数量。分裂/复制阈值用**梯度分布的 p60 分位数自适应**（不依赖绝对量级，适配 loss 的 mean reduction；无绝对硬底，避免小梯度量级下永不触发）；复制时**保留原高斯 + 新增带微扰副本**（总数 = n + n_dup，与官方 densify_and_clone 一致）；修剪时保护梯度高于中位数的高斯；对需梯度的参数先 `.detach()` 再转 numpy，修剪后用 `.detach().clone()` 重建叶子张量。
+**密度控制**：每 `densify_every` 步根据梯度累积和尺度分裂/复制高斯，每 `prune_every` 步修剪低不透明度高斯，并自动限制总数量。分裂/复制阈值用**梯度分布的 p60 分位数自适应**（不依赖绝对量级，适配 loss 的 mean reduction；无绝对硬底，避免小梯度量级下永不触发）；复制时**保留原高斯 + 新增带微扰副本**（总数 = n + n_dup，与官方 densify_and_clone 一致）；修剪时保护梯度高于中位数的高斯；对需梯度的参数先 `.detach()` 再转 numpy，修剪后用 `.detach().clone()` 重建叶子张量。**优化器动量按行保留**：密度控制时新增高斯动量补零、幸存者按 mask 保留（官方语义），不再重建 Adam 清空全部动量，避免训练震荡。
 
 **初始高斯稠密化**：若初始化后高斯数量少于 2000 个，自动对每个高斯做 8 倍扩增（加噪声），确保训练有足够的起始高斯数。
 
@@ -156,6 +157,10 @@ python gui.py
 **梯度裁剪**：全局梯度范数限制为 10.0，防止训练发散。
 
 **光栅化器向量化**：像素级合成采用**排序式逐像素 splat**——把逐高斯 Python 内层循环重写为「展平覆盖像素对 → stable sort → 分段透射率 → scatter_add 归约」的纯张量算子，消除每颗高斯的 kernel launch 与 GPU→CPU 同步。实测 180x320+4000 高斯 forward 加速 **14.5x**、forward+backward **37.7x**；2160x3840+38665 高斯单帧约 1.7s（原为分钟级）。输出与旧实现逐元素一致（误差 < 1e-6）。
+
+**光栅化器显存上界（分块）**：逐像素合成按深度有序高斯**分块**（每块至多 512 颗），块内覆盖网格只按块内最大包围盒物化——单颗大高斯（半径已 clamp 到 32）只撑大自己所在块，不再让全体陪跑。跨块透射率用**逐像素 log-transmittance 进位**（carry）累计，与整表算法在精确算术下等价（fp64 验证一致到 ~5e-13）。实测 256²、n=2000→4000 时峰值显存 **361→369MB 基本持平**（旧实现 1049→2099MB 翻倍）。附带收益：深堆叠像素上分块版比整表全局 cumsum 更准（整表大负数相减存在灾难性抵消，分块块内 cumsum 短）。
+
+**混合精度（AMP）**：`--amp` 开启 fp16 混合精度，**仅 CUDA 生效**。cov3d 组合矩阵乘与 SSIM 卷积走 fp16（Ampere+ 可命中 Tensor Core），光栅化器内部保持 fp32（其 cumsum/scatter 不使用 Tensor Core，硬上 fp16 反而伤数值），配 GradScaler 动态损失缩放避免梯度下溢。无 Tensor Core 的显卡（如 GTX 10 系）开启无收益甚至略慢，**默认关闭**。
 
 **帧内存预加载**：训练每 epoch 遍历全部帧，读盘 + PNG 解码是主要开销且伤硬盘。帧在训练开始前全部预解码为 **uint8 RGB** 缓存到内存（200 帧约 5GB，仅为 float32 的 1/4），训练期间**零磁盘读取**，访问时按需转 float32。实测 2 epoch × 200 帧从 57.3s（全读盘）降到 21.9s（内存缓存），**2.6x 加速且消除磁盘 IO**。
 
@@ -212,7 +217,9 @@ python cli.py --video input.mp4 --resume-dir ./workdir --output restored.ply
 
 CPU 亲和性：启动时会自动绑定所有逻辑核心，提升多核利用效率（通过 psutil）。
 
-光栅化器：本项目使用纯 PyTorch 实现的光栅化器（排序式逐像素 splat 向量化），无需编译任何 CUDA 扩展，开箱即用。
+光栅化器：本项目使用纯 PyTorch 实现的光栅化器（排序式逐像素 splat 向量化，分块显存上界），无需编译任何 CUDA 扩展，开箱即用。
+
+GPU 精度：`--amp` 混合精度仅对 Ampere+（RTX 30 系及以上）有 Tensor Core 收益；无 Tensor Core 的显卡（GTX 10 系等）请保持默认纯 FP32。
 
 ## 📄 许可证
 本项目采用 Apache-2.0 许可证，欢迎自由使用和修改。

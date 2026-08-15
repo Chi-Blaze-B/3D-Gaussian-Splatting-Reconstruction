@@ -37,6 +37,8 @@ CHECKPOINT_INTERVAL_STEPS = 500
 LR_DECAY_STEPS = 1000
 LR_DECAY_GAMMA = 0.998
 USE_LR_SCHEDULE = True
+# 光栅化器分块尺寸：把逐像素合成按深度有序高斯切块，显存上界 = RASTER_CHUNK × (2·max_radius+1)²
+RASTER_CHUNK = 512
 
 
 # ---------- Frame loader ----------
@@ -392,7 +394,14 @@ class DifferentiableRasterizer(nn.Module):
         out_color = _graph_link.view(1,1,1).expand(H, W, 3).contiguous()
         out_alpha = _graph_link.view(1,1).expand(H, W).contiguous()
 
-        # ---- 逐像素向量化合成（替代逐高斯 Python 循环） ----
+        # ---- 逐像素向量化合成（分块 + 跨块 carry，替代逐高斯 Python 循环） ----
+        # 显存上界：原实现整表物化 [batch_n, max_h, max_w]，max_h/max_w 取全部高斯里
+        #   最大那颗的包围盒（radius 已 clamp 到 max_radius → 最坏 65×65），一颗大
+        #   高斯让全体陪跑，38665 高斯时约 4-5GB。改为按深度有序高斯切块，每块只
+        #   用块内 max_h/max_w（大高斯只撑大自己的块），峰值 = RASTER_CHUNK×65×65。
+        # 跨块透射率：块 k 的 exclusive 前缀是"相对块首"的透射率，真正的 T_before
+        #   还要乘以前序所有块对该像素的累计 log(1-α)。逐像素 carry（acc_log）在
+        #   块 k 自己的 index_add_ 之前快照，与整表 cumsum 在精确算术下等价。
         mu_u = u_s; mu_v = v_s; rad = r_s
         A = cov2d_s[:, 0, 0]; B_ = cov2d_s[:, 0, 1]; C = cov2d_s[:, 1, 1]
         opa = opa_s; col = colors
@@ -413,78 +422,88 @@ class DifferentiableRasterizer(nn.Module):
         det_inv = 1.0 / (A_b * C_b - B_b * B_b + 1e-6)
         inv_A = det_inv * C_b; inv_B = -det_inv * B_b; inv_C = det_inv * A_b
 
-        h_sizes = (y_max_b - y_min_b).int(); w_sizes = (x_max_b - x_min_b).int()
-        max_h = int(h_sizes.max()); max_w = int(w_sizes.max())
-
-        gy = torch.arange(max_h, device=colors.device, dtype=torch.float32).view(1, -1, 1)
-        gx = torch.arange(max_w, device=colors.device, dtype=torch.float32).view(1, 1, -1)
-        gy_g = gy + y_min_b.view(-1, 1, 1); gx_g = gx + x_min_b.view(-1, 1, 1)
-        dy = gy_g - mu_v_b.view(-1, 1, 1); dx = gx_g - mu_u_b.view(-1, 1, 1)
-
-        y_valid = (gy_g >= y_min_b.view(-1, 1, 1)) & (gy_g < y_max_b.view(-1, 1, 1))
-        x_valid = (gx_g >= x_min_b.view(-1, 1, 1)) & (gx_g < x_max_b.view(-1, 1, 1))
-        valid_mask = y_valid & x_valid
-
-        exponent = -(inv_A.view(-1,1,1) * dx**2 + 2*inv_B.view(-1,1,1)*dx*dy + inv_C.view(-1,1,1)*dy**2)*0.5
-        exponent = exponent.clamp(max=0)
-        alpha = exponent.exp() * opa_b.view(-1,1,1)
-        alpha = alpha.masked_fill(~valid_mask, 0.0)
-
-        # 展平覆盖像素对：只保留 valid_mask 为真的格点
-        # flat indices: (gauss_idx, y_in_tile, x_in_tile) -> pixel (gauss_idx, y, x)
-        mask = valid_mask  # [B, max_h, max_w]
-        flat_alpha = alpha[mask]
-        n_pairs = flat_alpha.shape[0]
-        if n_pairs == 0:
-            return out_color + background.view(1,1,3) * (1.0 - out_alpha.unsqueeze(-1)), out_alpha
-
-        # 重建每个覆盖格的全局像素坐标（y, x）
-        gauss_idx_3d = torch.arange(batch_n, device=colors.device).view(-1, 1, 1).expand_as(mask)
-        # 广播 y/x 网格到与 mask 相同的 [B, max_h, max_w] 形状
-        y_3d = gy_g.expand_as(mask)
-        x_3d = gx_g.expand_as(mask)
-        gauss_ids = gauss_idx_3d[mask].long()
-        y_coord = y_3d[mask].long()
-        x_coord = x_3d[mask].long()
-        pix = y_coord * W + x_coord  # 展平像素索引 [n_pairs]
-
-        flat_color = col_b[gauss_ids]  # [n_pairs, 3]
-
-        # 按像素 stable sort（保持深度序：gauss_ids 已按深度排序）
-        pix_sorted, sort_idx = torch.sort(pix, stable=True)
-        a_sorted = flat_alpha[sort_idx]
-        c_sorted = flat_color[sort_idx]
-
-        # 分段透射率：T_before(p) = exp(Σ_{j<i} log(1-α_j))，按像素分组
-        log_ta = torch.log1p(-a_sorted)
-        log_cum = torch.cumsum(log_ta, dim=0)
-
-        # 段内 exclusive 前缀：log_T_before[i] = log_cum[i-1]（前一个元素的累计），段首为 0
-        # torch.cumsum 给出含自身的累计，段内前移一位即得 exclusive 前缀
-        log_cum_shift = torch.cat([torch.zeros(1, dtype=log_cum.dtype, device=log_cum.device), log_cum[:-1]])
-        # 像素组边界：新组起始处重置为 0
-        new_group = pix_sorted[1:] != pix_sorted[:-1]
-        group_starts = torch.cat([torch.tensor([True], device=pix_sorted.device), new_group])
-        # 组内 exclusive 前缀：
-        #   log_T_before[j] = log_cum_shift[j] - offset[j]
-        #   其中 offset[j] = 该元素所属组"组首元素前一个位置"的累计
-        #                  = log_cum_shift[组首位置]（组首自身 offset 使 log_T=0，自洽）
-        # 组首位置用 cummax 前向传播（不能用 cumsum-1，那给出的是组 id 而非组首索引）
-        arange = torch.arange(group_starts.shape[0], device=pix_sorted.device)
-        group_start_pos = torch.where(group_starts, arange, torch.zeros_like(arange))
-        group_start_pos = torch.cummax(group_start_pos, dim=0).values
-        seg_offset = log_cum_shift[group_start_pos]
-        log_T_before = log_cum_shift - seg_offset
-
-        T_before = torch.exp(log_T_before.clamp(min=-50.0))
-        weight = a_sorted * T_before  # α_i * T_before(p)
-
-        # 归约：color + alpha
         HpW = H * W
-        acc_color = torch.zeros(HpW, 3, dtype=colors.dtype, device=colors.device)
-        acc_color = acc_color.index_add_(0, pix_sorted, weight.unsqueeze(-1) * c_sorted)
-        acc_log = torch.zeros(HpW, dtype=colors.dtype, device=colors.device)
-        acc_log = acc_log.index_add_(0, pix_sorted, log_ta)
+        device = colors.device
+        acc_color = torch.zeros(HpW, 3, dtype=torch.float32, device=device)
+        acc_log = torch.zeros(HpW, dtype=torch.float32, device=device)
+
+        for start in range(0, batch_n, RASTER_CHUNK):
+            end = min(start + RASTER_CHUNK, batch_n)
+            n_chunk = end - start
+
+            y_lo = y_min_b[start:end]; y_hi = y_max_b[start:end]
+            x_lo = x_min_b[start:end]; x_hi = x_max_b[start:end]
+            mu_u_c = mu_u_b[start:end]; mu_v_c = mu_v_b[start:end]
+            iA = inv_A[start:end]; iB = inv_B[start:end]; iC = inv_C[start:end]
+            opa_c = opa_b[start:end]; col_c = col_b[start:end]
+
+            h_sizes = (y_hi - y_lo).int(); w_sizes = (x_hi - x_lo).int()
+            max_h = int(h_sizes.max()); max_w = int(w_sizes.max())
+            if max_h == 0 or max_w == 0:
+                continue
+
+            gy = torch.arange(max_h, device=device, dtype=torch.float32).view(1, -1, 1)
+            gx = torch.arange(max_w, device=device, dtype=torch.float32).view(1, 1, -1)
+            gy_g = gy + y_lo.view(-1, 1, 1); gx_g = gx + x_lo.view(-1, 1, 1)
+            dy = gy_g - mu_v_c.view(-1, 1, 1); dx = gx_g - mu_u_c.view(-1, 1, 1)
+
+            y_valid = (gy_g >= y_lo.view(-1, 1, 1)) & (gy_g < y_hi.view(-1, 1, 1))
+            x_valid = (gx_g >= x_lo.view(-1, 1, 1)) & (gx_g < x_hi.view(-1, 1, 1))
+            valid_mask = y_valid & x_valid
+
+            exponent = -(iA.view(-1,1,1) * dx**2 + 2*iB.view(-1,1,1)*dx*dy + iC.view(-1,1,1)*dy**2)*0.5
+            exponent = exponent.clamp(max=0)
+            alpha = exponent.exp() * opa_c.view(-1,1,1)
+            alpha = alpha.masked_fill(~valid_mask, 0.0)
+
+            # 展平覆盖像素对：只保留 valid_mask 为真的格点
+            mask = valid_mask  # [n_chunk, max_h, max_w]
+            flat_alpha = alpha[mask]
+            if flat_alpha.shape[0] == 0:
+                continue
+
+            # 重建每个覆盖格的全局像素坐标（y, x）
+            # 用 torch.arange(n_chunk) 常数（块内全是 valid_b 幸存者），避免 int() 同步
+            gauss_idx_3d = torch.arange(n_chunk, device=device).view(-1, 1, 1).expand_as(mask)
+            y_3d = gy_g.expand_as(mask)
+            x_3d = gx_g.expand_as(mask)
+            gauss_ids = gauss_idx_3d[mask].long()
+            y_coord = y_3d[mask].long()
+            x_coord = x_3d[mask].long()
+            pix = y_coord * W + x_coord  # 展平像素索引 [n_pairs]
+
+            flat_color = col_c[gauss_ids]  # [n_pairs, 3]
+
+            # 按像素 stable sort（保持深度序：gauss_ids 已按深度排序）
+            pix_sorted, sort_idx = torch.sort(pix, stable=True)
+            a_sorted = flat_alpha[sort_idx]
+            c_sorted = flat_color[sort_idx]
+
+            # 段内透射率（相对块首）：T_before(p) = exp(Σ_{j<i} log(1-α_j))，按像素分组
+            log_ta = torch.log1p(-a_sorted)
+            log_cum = torch.cumsum(log_ta, dim=0)
+            # 段内 exclusive 前缀：log_T_before[i] = log_cum[i-1]，段首为 0
+            log_cum_shift = torch.cat([torch.zeros(1, dtype=log_cum.dtype, device=log_cum.device), log_cum[:-1]])
+            new_group = pix_sorted[1:] != pix_sorted[:-1]
+            group_starts = torch.cat([torch.tensor([True], device=pix_sorted.device), new_group])
+            # 组首位置用 cummax 前向传播（不能用 cumsum-1，那给出的是组 id 而非组首索引）
+            arange = torch.arange(group_starts.shape[0], device=pix_sorted.device)
+            group_start_pos = torch.where(group_starts, arange, torch.zeros_like(arange))
+            group_start_pos = torch.cummax(group_start_pos, dim=0).values
+            seg_offset = log_cum_shift[group_start_pos]
+            log_T_before_chunk = log_cum_shift - seg_offset
+
+            # 跨块 carry：块内 exclusive 前缀 + 前序所有块对该像素的累计 log(1-α)
+            # 高级索引产生副本，acc_log 快照独立于后续 in-place index_add_，不会重复计入
+            carry = acc_log[pix_sorted]
+            log_T_before = carry + log_T_before_chunk
+
+            T_before = torch.exp(log_T_before.clamp(min=-50.0))
+            weight = a_sorted * T_before  # α_i * T_before(p)
+
+            # 归约：跨块累加进同一个 [H*W] 缓冲
+            acc_color = acc_color.index_add_(0, pix_sorted, weight.unsqueeze(-1) * c_sorted)
+            acc_log = acc_log.index_add_(0, pix_sorted, log_ta)
 
         out_color = out_color.view(HpW, 3) + acc_color
         out_alpha = out_alpha.view(HpW) + (1.0 - torch.exp(acc_log.clamp(min=-50.0)))
@@ -654,7 +673,8 @@ class Trainer:
                  random_background: bool = True, train_focal: bool = True,
                  max_gaussians: int = MAX_GAUSSIANS, sh_warmup_steps: int = SH_WARMUP_STEPS,
                  ssim_warmup_steps: int = SSIM_WARMUP_STEPS, ssim_weight_max: float = SSIM_WEIGHT_MAX,
-                 enable_k1: bool = False, use_lr_schedule: bool = USE_LR_SCHEDULE,
+                 enable_k1: bool = False, use_amp: bool = False,
+                 use_lr_schedule: bool = USE_LR_SCHEDULE,
                  lr_decay_steps: int = LR_DECAY_STEPS, lr_decay_gamma: float = LR_DECAY_GAMMA,
                  grad_thresh_base: float = GRAD_THRESH_BASE, scale_thresh: float = SCALE_THRESH,
                  min_opacity: float = MIN_OPACITY, densify_every: int = DENSIFY_EVERY,
@@ -673,6 +693,16 @@ class Trainer:
         self.random_background = random_background
         self.train_focal = train_focal
         self.enable_k1 = enable_k1
+        # 混合精度开关：仅 CUDA 生效（AMP 在 CPU 上无意义），需 fp16 硬件
+        self.use_amp = use_amp and torch.cuda.is_available() and str(device).startswith("cuda")
+        if self.use_amp:
+            try:
+                _scaler_cls = getattr(torch.amp, "GradScaler")  # torch>=2.3
+                self._scaler = _scaler_cls("cuda", enabled=True)
+            except (AttributeError, TypeError):  # torch 2.0-2.2 回退到旧 API
+                self._scaler = torch.cuda.amp.GradScaler(enabled=True)
+        else:
+            self._scaler = None
         self.sh_degree = min(sh_degree, 3)   # max 3
         self.sh_warmup_steps = sh_warmup_steps
         self.ssim_warmup_steps = ssim_warmup_steps
@@ -696,7 +726,6 @@ class Trainer:
         self.use_lr_schedule = use_lr_schedule
         self.lr_decay_steps = lr_decay_steps
         self.lr_decay_gamma = lr_decay_gamma
-        self._setup_optimizers()
         self.current_step = 0
         # ===== 修复: 添加 best_loss 成员变量 =====
         self.best_loss = float("inf")
@@ -711,9 +740,13 @@ class Trainer:
         else:
             self.rasterizer = rasterizer
         self._update_tanfov()
+        # ===== 修复(2026-08-14): 初始 8× 稠密化必须先于 _setup_optimizers =====
+        # 原实现优化器先包裹旧张量、再 densify_initial_gaussians 替换高斯张量 → 优化器
+        # 持有陈旧引用，前 densify_every 步位置参数不被更新（动量积累在死张量上）。
         if self.gaussians.num_gaussians < 2000:
             densify_initial_gaussians(self.gaussians, expansion_factor=8, noise_scale=0.02)
             print(f"  [INIT] Densified to {self.gaussians.num_gaussians} Gaussians")
+        self._setup_optimizers()
 
     def _setup_optimizers(self):
         self.optimizers = {}
@@ -734,6 +767,55 @@ class Trainer:
         else:
             self.optimizers["k1"] = None
         self.optimizers = {k: v for k, v in self.optimizers.items() if v is not None}
+
+    # ---------- 密度控制优化器状态原地保留（官方 3DGS 语义，2026-08-14） ----------
+    # 原实现：densify/prune 后 _setup_optimizers() 重建全新 Adam → 全部高斯动量清零，
+    #   训练震荡、收敛变慢。官方只在"新增高斯"处补零动量、存量高斯动量按行保留。
+    # 关键坑（HANDOFF §五）：torch.cat([活参, 新行]) 产生非叶子张量 → .grad 为 None
+    #   → Adam 静默跳过 → 训练悄悄冻结。必须从 .detach() 的片段构造真叶子张量。
+    _GAUSS_ATTR = {
+        "positions": "positions", "log_scales": "log_scales",
+        "opacities": "opacities_raw", "rotations": "rotations", "sh": "sh_coeffs",
+    }
+
+    def _cat_tensors_to_optimizer(self, new_tensors: Dict[str, torch.Tensor]) -> None:
+        """把新高斯追加到各参数尾部：存量动量按行保留，新增行动量补零。
+
+        new_tensors: {组名: 新行张量}，只接受 positions/log_scales/opacities/rotations/sh。
+        """
+        g = self.gaussians
+        for name, opt in self.optimizers.items():
+            if name not in new_tensors or name not in self._GAUSS_ATTR:
+                continue
+            t = new_tensors[name].detach()
+            p = opt.param_groups[0]["params"][0]
+            # 必须从 .detach() 片段构造叶子：cat 活参会产生非叶子，autograd 不再填 .grad
+            cat_p = torch.cat([p.detach(), t], dim=0).requires_grad_(True)
+            setattr(g, self._GAUSS_ATTR[name], cat_p)
+            opt.param_groups[0]["params"][0] = cat_p
+            stored = opt.state.get(p)
+            if stored is not None and "exp_avg" in stored:
+                stored["exp_avg"] = torch.cat([stored["exp_avg"], torch.zeros_like(t)], dim=0)
+                stored["exp_avg_sq"] = torch.cat([stored["exp_avg_sq"], torch.zeros_like(t)], dim=0)
+                del opt.state[p]
+                opt.state[cat_p] = stored
+
+    def _prune_optimizer(self, mask: torch.Tensor) -> None:
+        """按 bool mask 裁剪高斯参数：幸存者 Adam 动量按 mask 保留。"""
+        g = self.gaussians
+        for name, opt in self.optimizers.items():
+            if name not in self._GAUSS_ATTR:
+                continue
+            p = opt.param_groups[0]["params"][0]
+            new_p = p[mask].detach().clone().requires_grad_(True)
+            setattr(g, self._GAUSS_ATTR[name], new_p)
+            opt.param_groups[0]["params"][0] = new_p
+            stored = opt.state.get(p)
+            if stored is not None and "exp_avg" in stored:
+                stored["exp_avg"] = stored["exp_avg"][mask]
+                stored["exp_avg_sq"] = stored["exp_avg_sq"][mask]
+                del opt.state[p]
+                opt.state[new_p] = stored
 
     def _update_lr(self):
         if not self.use_lr_schedule:
@@ -811,7 +893,6 @@ class Trainer:
         rotations = self.gaussians.rotations
         opacities = self.gaussians.opacities
         sh_coeffs = self.gaussians.sh_coeffs
-        cov3d = self.gaussians.cov3d
 
         eff_deg = self.effective_sh_degree()
 
@@ -824,23 +905,6 @@ class Trainer:
         K[1,2] = self.cy
         K[2,2] = 1.0
 
-        rendered, _ = self.rasterizer(
-            means3D, cov3d, opacities, sh_coeffs, viewmat, K, self.background, sh_degree=eff_deg
-        )
-
-        if rendered.dim() == 3 and rendered.shape[0] == 3:
-            rendered = rendered.permute(1, 2, 0)
-
-        # ---------- 损失 ----------
-        l1_loss = F.l1_loss(rendered, target)
-        ssim_loss = compute_ssim_loss(rendered, target, kernel=self._ssim_kernel)
-        w_ssim = self.current_ssim_weight()
-        loss = (1.0 - w_ssim) * l1_loss + w_ssim * ssim_loss
-
-        for opt in self.optimizers.values():
-            opt.zero_grad()
-        loss.backward()
-
         params_to_clip = [
             self.gaussians.positions, self.gaussians.log_scales,
             self.gaussians.opacities_raw, self.gaussians.rotations,
@@ -850,10 +914,67 @@ class Trainer:
             params_to_clip.append(self.fx); params_to_clip.append(self.fy)
         if self.enable_k1 and self.k1 is not None and isinstance(self.k1, nn.Parameter):
             params_to_clip.append(self.k1)
-        torch.nn.utils.clip_grad_norm_(params_to_clip, max_norm=GRAD_CLIP_NORM)
 
-        for opt in self.optimizers.values():
-            opt.step()
+        amp_on = self.use_amp and self._scaler is not None
+        if amp_on:
+            assert self._scaler is not None  # amp_on 已保证
+            # AMP：cov3d 组合 matmul 走 fp16（Tensor Core 可命中）；光栅化器内部
+            #   保持 fp32（其 cumsum/scatter 不吃 Tensor Core，硬上 fp16 伤数值），
+            #   cov3d.float() 在边界回铸（autocast(enabled=False) 不会回铸输入）；
+            #   SSIM 卷积 fp16 计算、输出仍 fp32。
+            with torch.autocast(device_type="cuda", dtype=torch.float16):
+                cov3d = self.gaussians.cov3d
+                with torch.autocast(device_type="cuda", enabled=False):
+                    rendered, _ = self.rasterizer(
+                        means3D, cov3d.float(), opacities, sh_coeffs, viewmat, K,
+                        self.background, sh_degree=eff_deg
+                    )
+                if rendered.dim() == 3 and rendered.shape[0] == 3:
+                    rendered = rendered.permute(1, 2, 0)
+                # ---------- 损失 ----------
+                l1_loss = F.l1_loss(rendered, target)
+                ssim_loss = compute_ssim_loss(rendered, target, kernel=self._ssim_kernel)
+                w_ssim = self.current_ssim_weight()
+                loss = (1.0 - w_ssim) * l1_loss + w_ssim * ssim_loss
+
+            for opt in self.optimizers.values():
+                opt.zero_grad()
+            self._scaler.scale(loss).backward()
+            # 逐优化器守卫：无梯度优化器（k1 死参 / 光栅化器 early-return 帧下
+            #   log_scales/rotations/sh）跳过 scaler，否则 step 抛
+            #   "No inf checks were recorded for this optimizer"
+            has_grad = [
+                any(p.grad is not None for grp in opt.param_groups for p in grp["params"])
+                for opt in self.optimizers.values()
+            ]
+            for (opt, hg) in zip(self.optimizers.values(), has_grad):
+                if hg:
+                    self._scaler.unscale_(opt)
+            torch.nn.utils.clip_grad_norm_(params_to_clip, max_norm=GRAD_CLIP_NORM)
+            for (opt, hg) in zip(self.optimizers.values(), has_grad):
+                if hg:
+                    self._scaler.step(opt)
+            self._scaler.update()
+        else:
+            cov3d = self.gaussians.cov3d
+            rendered, _ = self.rasterizer(
+                means3D, cov3d, opacities, sh_coeffs, viewmat, K, self.background, sh_degree=eff_deg
+            )
+            if rendered.dim() == 3 and rendered.shape[0] == 3:
+                rendered = rendered.permute(1, 2, 0)
+
+            # ---------- 损失 ----------
+            l1_loss = F.l1_loss(rendered, target)
+            ssim_loss = compute_ssim_loss(rendered, target, kernel=self._ssim_kernel)
+            w_ssim = self.current_ssim_weight()
+            loss = (1.0 - w_ssim) * l1_loss + w_ssim * ssim_loss
+
+            for opt in self.optimizers.values():
+                opt.zero_grad()
+            loss.backward()
+            torch.nn.utils.clip_grad_norm_(params_to_clip, max_norm=GRAD_CLIP_NORM)
+            for opt in self.optimizers.values():
+                opt.step()
 
         self.current_step += 1
         self._update_lr()
@@ -894,8 +1015,8 @@ class Trainer:
 
             if checkpoint_path and self.current_step % CHECKPOINT_INTERVAL_STEPS == 0:
                 self.save_training_state(checkpoint_path)
-            if torch.cuda.is_available():
-                torch.cuda.empty_cache()
+            # 2026-08-14: 移除逐帧 torch.cuda.empty_cache() —— 分块光栅化后显存有界，
+            #   逐帧释放只会迫使缓存分配器反复分配、拖慢训练（原为对抗网格爆炸的 OOM 添加）
             if loss_threshold and loss > loss_threshold:
                 if checkpoint_path:
                     self.save_training_state(checkpoint_path)
@@ -1137,75 +1258,72 @@ class AdaptiveDensityController:
         max_log_scale = torch.max(g.log_scales, dim=1).values
         split_mask = (avg_grad > grad_thresh) & (max_log_scale > self.scale_thresh) & (avg_opacity > 0.01)
         duplicate_mask = (avg_grad > grad_thresh) & ~split_mask & (avg_opacity > 0.01)
-        keep_mask = ~(split_mask | duplicate_mask)
-        keep_idx = torch.where(keep_mask)[0]
         split_idx = torch.where(split_mask)[0]
         dup_idx = torch.where(duplicate_mask)[0]
+        n_split = split_idx.numel()
+        n_dup = dup_idx.numel()
 
-        new_pos = []; new_log_scales = []; new_opa = []; new_rot = []; new_sh = []
-
-        if len(keep_idx) > 0:
-            new_pos.append(g.positions[keep_idx].detach().cpu().numpy())
-            new_log_scales.append(g.log_scales[keep_idx].detach().cpu().numpy())
-            new_opa.append(g.opacities_raw[keep_idx].detach().cpu().numpy())
-            new_rot.append(g.rotations[keep_idx].detach().cpu().numpy())
-            new_sh.append(g.sh_coeffs[keep_idx].detach().cpu().numpy())
-
-        if len(split_idx) > 0:
-            base_pos = g.positions[split_idx].detach().cpu().numpy()
-            base_log_scales = g.log_scales[split_idx].detach().cpu().numpy()
-            base_opa = g.opacities_raw[split_idx].detach().cpu().numpy()
-            base_rot = g.rotations[split_idx].detach().cpu().numpy()
-            base_sh = g.sh_coeffs[split_idx].detach().cpu().numpy()
-            for scale_factor in [0.8, 0.6]:
-                jitter = np.random.randn(len(split_idx), 3).astype(np.float32) * 0.001
-                new_pos.append(base_pos + jitter * (1 if scale_factor == 0.8 else -0.5))
-                new_log_scales.append(base_log_scales + np.log(scale_factor))
-                new_opa.append(base_opa + np.random.normal(0, 0.1, len(split_idx)).astype(np.float32))
-                new_rot.append(base_rot + np.random.normal(0, 0.01, (len(split_idx), 4)).astype(np.float32))
-                new_sh.append(base_sh + np.random.normal(0, 0.01, base_sh.shape).astype(np.float32))
-            stats["split"] = len(split_idx) * 2
-
-        if len(dup_idx) > 0:
-            dup_pos = g.positions[dup_idx].detach().cpu().numpy()
-            dup_log_scales = g.log_scales[dup_idx].detach().cpu().numpy()
-            dup_opa = g.opacities_raw[dup_idx].detach().cpu().numpy()
-            dup_rot = g.rotations[dup_idx].detach().cpu().numpy()
-            dup_sh = g.sh_coeffs[dup_idx].detach().cpu().numpy()
-            # 保留原高斯
-            new_pos.append(dup_pos)
-            new_log_scales.append(dup_log_scales)
-            new_opa.append(dup_opa)
-            new_rot.append(dup_rot)
-            new_sh.append(dup_sh)
-            # 新增带微扰的副本（克隆高梯度高斯，保留原物 → 总数增长）
-            new_pos.append(dup_pos + np.random.randn(len(dup_idx), 3).astype(np.float32) * 0.001)
-            new_log_scales.append(dup_log_scales)
-            new_opa.append(dup_opa + np.random.normal(0, 0.1, len(dup_idx)).astype(np.float32))
-            new_rot.append(dup_rot + np.random.normal(0, 0.01, (len(dup_idx), 4)).astype(np.float32))
-            new_sh.append(dup_sh + np.random.normal(0, 0.01, dup_sh.shape).astype(np.float32))
-            stats["duplicate"] = len(dup_idx)
-
-        # ===== 修复: 防止 new_pos 为空导致 np.concatenate 报错 =====
-        if not new_pos:
+        # 无分裂/复制 → 不触碰参数与优化器（累积器继续累积到下一个 densify 窗口）
+        if n_split == 0 and n_dup == 0:
             return stats
 
-        new_pos = np.concatenate(new_pos, axis=0)
-        new_log_scales = np.concatenate(new_log_scales, axis=0)
-        new_opa = np.concatenate(new_opa, axis=0)
-        new_rot = np.concatenate(new_rot, axis=0)
-        new_sh = np.concatenate(new_sh, axis=0)
-
         device = g.positions.device
-        g.positions = torch.from_numpy(new_pos).float().to(device)
-        g.log_scales = torch.from_numpy(new_log_scales).float().to(device)
-        g.opacities_raw = torch.from_numpy(new_opa).float().to(device)
-        g.rotations = torch.from_numpy(new_rot).float().to(device)
-        g.sh_coeffs = torch.from_numpy(new_sh).float().to(device)
-        for param in [g.positions, g.log_scales, g.opacities_raw, g.rotations, g.sh_coeffs]:
-            param.requires_grad_(True)
+        dtype = g.positions.dtype
 
-        self.trainer._setup_optimizers()
+        # 先捕获分裂/复制候选的原始张量（_prune_optimizer 改参后旧索引失效）
+        if n_split > 0:
+            base_pos = g.positions[split_idx].detach()
+            base_log_scales = g.log_scales[split_idx].detach()
+            base_opa = g.opacities_raw[split_idx].detach()
+            base_rot = g.rotations[split_idx].detach()
+            base_sh = g.sh_coeffs[split_idx].detach()
+        if n_dup > 0:
+            dup_pos = g.positions[dup_idx].detach()
+            dup_log_scales = g.log_scales[dup_idx].detach()
+            dup_opa = g.opacities_raw[dup_idx].detach()
+            dup_rot = g.rotations[dup_idx].detach()
+            dup_sh = g.sh_coeffs[dup_idx].detach()
+
+        # 1. 删除 split 原体：keep ∪ dup 连同动量保留（dup 原体要保留动量）
+        if n_split > 0:
+            self.trainer._prune_optimizer(~split_mask)
+
+        # 2. split 孩子：每颗 split 高斯 2 个孩子（尺度 0.8/0.6，原 numpy 逻辑逐行翻译）
+        if n_split > 0:
+            pos_parts: List[torch.Tensor] = []
+            ls_parts: List[torch.Tensor] = []
+            opa_parts: List[torch.Tensor] = []
+            rot_parts: List[torch.Tensor] = []
+            sh_parts: List[torch.Tensor] = []
+            for scale_factor in [0.8, 0.6]:
+                jitter = torch.randn(n_split, 3, device=device, dtype=dtype) * 0.001
+                pos_parts.append(base_pos + jitter * (1.0 if scale_factor == 0.8 else -0.5))
+                ls_parts.append(base_log_scales + np.log(scale_factor))
+                opa_parts.append(base_opa + torch.randn(n_split, device=device, dtype=dtype) * 0.1)
+                rot_parts.append(base_rot + torch.randn(n_split, 4, device=device, dtype=dtype) * 0.01)
+                sh_parts.append(base_sh + torch.randn(n_split, base_sh.shape[1], base_sh.shape[2],
+                                                      device=device, dtype=dtype) * 0.01)
+            self.trainer._cat_tensors_to_optimizer({
+                "positions": torch.cat(pos_parts, dim=0),
+                "log_scales": torch.cat(ls_parts, dim=0),
+                "opacities": torch.cat(opa_parts, dim=0),
+                "rotations": torch.cat(rot_parts, dim=0),
+                "sh": torch.cat(sh_parts, dim=0),
+            })
+            stats["split"] = n_split * 2
+
+        # 3. dup clone：追加带微扰副本（dup 原体已在步骤 1 幸存，动量保留）
+        if n_dup > 0:
+            self.trainer._cat_tensors_to_optimizer({
+                "positions": dup_pos + torch.randn(n_dup, 3, device=device, dtype=dtype) * 0.001,
+                "log_scales": dup_log_scales,
+                "opacities": dup_opa + torch.randn(n_dup, device=device, dtype=dtype) * 0.1,
+                "rotations": dup_rot + torch.randn(n_dup, 4, device=device, dtype=dtype) * 0.01,
+                "sh": dup_sh + torch.randn(n_dup, dup_sh.shape[1], dup_sh.shape[2],
+                                           device=device, dtype=dtype) * 0.01,
+            })
+            stats["duplicate"] = n_dup
+
         self.reset_accumulators()
 
         n_current = g.num_gaussians
@@ -1249,16 +1367,7 @@ class AdaptiveDensityController:
             return 0
 
         keep_mask = ~prune_mask
-        keep_idx = torch.where(keep_mask)[0]
-        device = g.positions.device
-        g.positions = g.positions[keep_idx].detach().clone()
-        g.log_scales = g.log_scales[keep_idx].detach().clone()
-        g.opacities_raw = g.opacities_raw[keep_idx].detach().clone()
-        g.rotations = g.rotations[keep_idx].detach().clone()
-        g.sh_coeffs = g.sh_coeffs[keep_idx].detach().clone()
-        for param in [g.positions, g.log_scales, g.opacities_raw, g.rotations, g.sh_coeffs]:
-            param.requires_grad_(True)
-
-        self.trainer._setup_optimizers()
+        # 原地裁剪 + 动量按 mask 保留（不再重建优化器，不再清空动量）
+        self.trainer._prune_optimizer(keep_mask)
         self.reset_accumulators()
         return n_pruned

@@ -88,6 +88,9 @@ def build_parser() -> argparse.ArgumentParser:
                         help="Learn focal length during training (self‑calibration)")
     parser.add_argument("--enable-k1", action="store_true",
                         help="Learn radial distortion coefficient k1 (experimental)")
+    parser.add_argument("--amp", action="store_true",
+                        help="Mixed precision (AMP / fp16) — requires CUDA GPU with fp16; "
+                             "uses Tensor Cores on Ampere+. Rasterizer stays fp32. No effect on CPU.")
 
     # ---------- Pose Estimation ----------
     parser.add_argument(
@@ -284,6 +287,7 @@ def run_pipeline(args: argparse.Namespace) -> None:
         ssim_warmup_steps=args.ssim_warmup_steps,
         ssim_weight_max=args.ssim_weight_max,
         enable_k1=args.enable_k1,
+        use_amp=args.amp,
     )
 
     train_poses = [p.RT.astype(np.float32) if p is not None else None for p in poses]
