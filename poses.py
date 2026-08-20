@@ -87,7 +87,6 @@ class CameraPose:
 # ---------- Main Estimator ----------
 def estimate_poses(
     frame_paths: List[str],
-    output_dir: str,
     *,
     min_inliers: int = MIN_INLIERS,
     feature_type: str = "orb",
@@ -98,9 +97,9 @@ def estimate_poses(
         raise ValueError("frame_paths cannot be empty")
 
     logger.info("Loading images and extracting features...")
-    images, kp_list, desc_list = _extract_features(frame_paths, feature_type)
+    img_shape, kp_list, desc_list = _extract_features(frame_paths, feature_type)
 
-    h, w = images[0].shape[:2]
+    h, w = img_shape
     cx, cy = w / 2.0, h / 2.0
     focal0 = focal_guess if focal_guess is not None else max(w, h) * 1.2
     fy0 = focal0 * aspect_ratio
@@ -112,7 +111,7 @@ def estimate_poses(
     logger.info(f"Thresholds: reproj={reproj_thresh:.2f}, ransac={ransac_thresh:.2f}")
 
     map_points: List[Dict] = []
-    frame_poses: List[Optional[CameraPose]] = [None] * len(images)
+    frame_poses: List[Optional[CameraPose]] = [None] * len(frame_paths)
     feat_map = [[-1] * len(kp) for kp in kp_list]
     frame_to_points: Dict[int, Set[int]] = defaultdict(set)
 
@@ -126,8 +125,8 @@ def estimate_poses(
     init_candidates = []
     ba_counter = 0
 
-    for i in range(1, len(images)):
-        logger.info(f"Processing frame {i}/{len(images)-1}")
+    for i in range(1, len(frame_paths)):
+        logger.info(f"Processing frame {i}/{len(frame_paths)-1}")
 
         if len(kp_list[i]) < MIN_FEATURES // 2:
             logger.warning(f"Frame {i} has too few features, copying previous pose")
@@ -343,7 +342,8 @@ def estimate_poses(
 
 # ---------- Feature Extraction ----------
 def _extract_features(paths: List[str], feature_type: str = "orb"):
-    images, kps, descs = [], [], []
+    # 修复(2026-08): 不再把全部原图常驻内存（200 帧 1080p 约 1.2GB）——调用方只用首帧 shape。
+    kps, descs = [], []
     if feature_type == "sift":
         try:
             detector = cv2.SIFT_create(nfeatures=12000, contrastThreshold=0.03, edgeThreshold=10, sigma=1.6)
@@ -353,16 +353,19 @@ def _extract_features(paths: List[str], feature_type: str = "orb"):
     else:
         detector = cv2.ORB_create(nfeatures=12000, scaleFactor=1.2, nlevels=8, edgeThreshold=31, patchSize=31)
 
+    shape0 = None
     for p in paths:
         img = cv2.imread(p, cv2.IMREAD_COLOR)
         if img is None:
             raise FileNotFoundError(f"Cannot read image: {p}")
-        images.append(img)
+        if shape0 is None:
+            shape0 = img.shape[:2]
         gray = cv2.cvtColor(img, cv2.COLOR_BGR2GRAY)
         kp, desc = detector.detectAndCompute(gray, None)
         kps.append(kp)
         descs.append(desc if desc is not None else np.zeros((0, 32), dtype=np.uint8))
-    return images, kps, descs
+        del img, gray
+    return shape0, kps, descs
 
 
 # ---------- Match Features ----------
@@ -584,17 +587,19 @@ def _bundle_adjustment(
         return focal, fy
 
     # ===== 限制观测数量 =====
-    if len(obs) > BA_MAX_OBS:
-        np.random.seed(42)
-        idx = np.random.choice(len(obs), BA_MAX_OBS, replace=False)
+    # 修复(2026-08): 先用局部 RNG 并记录原始数量——旧版全局 np.random.seed(42) 污染
+    #   frames/point_cloud 的随机性；且日志在 obs 被覆盖后才 len(obs)，恒打印 "2000/2000"。
+    n_obs_orig = len(obs)
+    rng = np.random.default_rng(42)
+    if n_obs_orig > BA_MAX_OBS:
+        idx = rng.choice(n_obs_orig, BA_MAX_OBS, replace=False)
         obs = [obs[i] for i in idx]
-        logger.info(f"BA sampled {BA_MAX_OBS} observations out of {len(obs)}")
+        logger.info(f"BA sampled {BA_MAX_OBS} observations out of {n_obs_orig}")
 
     logger.info(f"BA started: {len(keyframe_ids)} keyframes, {len(obs)} obs")
 
     if is_global and len(obs) > 3000:
-        np.random.seed(42)
-        idx = np.random.choice(len(obs), 3000, replace=False)
+        idx = rng.choice(len(obs), 3000, replace=False)
         obs = [obs[i] for i in idx]
 
     obs_count = {f: 0 for f in keyframe_ids}
@@ -646,8 +651,15 @@ def _bundle_adjustment(
     # outside of provided bounds"。旋转向量本身有界性由 Rodrigues 保证（同一旋转
     # 有多个表示），因此对旋转不设边界（np.inf），只约束相机平移防尺度漂移。
     r_bound = np.inf
-    bounds_lower = [1.0, 1.0] + [-r_bound] * len(other_kfs) * 3 + [-t_bound] * len(other_kfs) * 3
-    bounds_upper = [10.0 * image_size, 10.0 * image_size] + [r_bound] * len(other_kfs) * 3 + [t_bound] * len(other_kfs) * 3
+    # 修复(2026-08): bounds 必须与交错参数排布一致（每关键帧 3 旋转 + 3 平移，见 param 构造）。
+    # 旧版先全部旋转再全部平移 → 前半关键帧平移拿到 ±inf（防尺度漂移失效）、
+    #   后半关键帧旋转被 ±t_bound 误约束（旋转向量范数可达 ~4π，越界即 BA 失败）。
+    lower_pose, upper_pose = [], []
+    for _kf in other_kfs:
+        lower_pose += [-r_bound] * 3 + [-t_bound] * 3
+        upper_pose += [r_bound] * 3 + [t_bound] * 3
+    bounds_lower = [1.0, 1.0] + lower_pose
+    bounds_upper = [10.0 * image_size, 10.0 * image_size] + upper_pose
     if optimize_points and point_ids:
         # 点坐标边界：不设硬限制（用 np.inf），避免 BA 因点坐标越界失败。
         # 相机平移边界已约束尺度漂移（t_bound 基于场景尺度），

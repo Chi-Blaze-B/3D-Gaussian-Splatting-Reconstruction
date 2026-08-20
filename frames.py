@@ -169,7 +169,7 @@ def _two_stage_extract(
     pose_dir = poses_output_dir or tempfile.mkdtemp(prefix="poses_coarse_")
     os.makedirs(pose_dir, exist_ok=True)
     try:
-        intrinsics, coarse_poses, _ = estimate_poses(coarse_paths, pose_dir, min_inliers=10)
+        intrinsics, coarse_poses, _ = estimate_poses(coarse_paths, min_inliers=10)
     except Exception as e:
         print(f"  [WARN] Coarse pose estimation failed: {e}. Using single‑stage smart sampling.")
         # Fallback: use flow‑only sampling (no parallax)
@@ -184,7 +184,8 @@ def _two_stage_extract(
     flow_scores = _compute_flow_magnitudes(cap, sample_indices, method=optical_flow_method)
     if not flow_scores:
         # If flow fails, fallback to uniform
-        cap.release()
+        # 修复(2026-08): 不能先 cap.release() —— fallback 需要开着的 cap 来 read()。
+        # 旧版 release 后 fallback 读 0 帧 → "need at least 2 frames"。
         return _fallback_smart_extract(cap, output_dir, total_frames, orig_fps, fps,
                                        min_frames, max_frames, w, h, optical_flow_method)
 
@@ -211,6 +212,7 @@ def _two_stage_extract(
     # Normalize and allocate frames
     num_frames = min(max(int(total_frames * fps / orig_fps), min_frames), max_frames)
     num_frames = max(num_frames, 1)
+    num_frames = min(num_frames, total_frames)  # 修复(2026-08): 短视频下 num_frames > total_frames 时 replace=False 会抛异常
     # Use sampling with replacement to avoid duplicates (but we want unique)
     probs = np.maximum(combined, 1e-6)
     probs /= probs.sum()
@@ -462,6 +464,7 @@ def _allocate_indices_from_scores(
     num_frames: int,
 ) -> np.ndarray:
     """Allocate frame indices proportionally to scores, with interpolation."""
+    num_frames = min(num_frames, max(1, total_frames))  # 修复(2026-08): 短视频下 num_frames 可能 > total_frames
     if len(scores) == 0:
         return np.linspace(0, total_frames - 1, num_frames, dtype=int)
 
@@ -508,12 +511,8 @@ def _fallback_smart_extract(
     optical_flow_method: str,
 ) -> List[str]:
     """Fallback to single‑stage smart extraction when two‑stage fails."""
-    # Re‑open cap if needed
-    if not cap.isOpened():
-        cap.open(cap.get(cv2.CAP_PROP_POS_FRAMES))  # this won't work; better to reopen by path
-        # But we can reuse the video path from somewhere; for simplicity, assume cap is valid.
-        # In practice, we might need to pass video_path.
-        pass
+    # 修复(2026-08): 删除了"cap 未打开时重开"的死块（cap.open(位置) 无效）。
+    #   调用方保证传入开着的 cap（two-stage 光流失败路径不再提前 release）。
     # Use single‑stage smart sampling (flow only)
     sample_step = max(1, total_frames // 100)
     sample_indices = np.arange(0, total_frames, sample_step, dtype=int)

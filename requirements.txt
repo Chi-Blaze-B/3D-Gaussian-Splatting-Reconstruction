@@ -1,46 +1,18 @@
-# =============================================================================
-#  3D Gaussian Splatting Reconstruction — 依赖清单
-# =============================================================================
+# 3D Gaussian Splatting Reconstruction — 核心可装依赖
 #
-#  ⚠️ 请勿直接执行 `pip install -r requirements.txt`！
-#     原因：PyTorch 需要指定 CUDA 版本，OpenCV 需要用 headless 版本。
-#
-#  📌 注意：本项目使用 纯 PyTorch 实现的光栅化器，无需编译 CUDA 扩展。
-#     因此不依赖 diff-gaussian-rasterization，也不依赖 VS 或 CUDA 编译工具链。
-#
-#  请按以下步骤依次安装（推荐使用 conda 环境）：
-#
-#  1. 创建 conda 环境（必须 Python 3.11）
-#     conda create -n gs python=3.11
-#     conda activate gs
-#
-#  2. 安装 PyTorch（CUDA 12.1 版本，CPU 用户请去掉 cu121 后缀）
-#     pip install torch torchvision torchaudio --index-url https://download.pytorch.org/whl/cu121
-#     # 或 CPU 版：pip install torch torchvision torchaudio --index-url https://download.pytorch.org/whl/cpu
-#
-#  3. 安装 OpenCV（必须用 headless 版本，避免 Qt 冲突）
-#     pip install opencv-python-headless
-#
-#  4. 安装其余核心依赖
-#     pip install numpy scipy PySide6 matplotlib psutil>=5.9.0
-#
-#  5. （可选）COLMAP 后端支持
-#     Windows 用户：项目已附带 colmap-x64-windows-nocuda/，无需额外安装。
-#     Linux/macOS 用户：需自行安装 COLMAP（确保 `colmap` 命令可用）。
-#
-#  6. （实验性）LPIPS 感知损失（代码中预留接口，但默认未启用）
-#     # pip install torchmetrics
-# =============================================================================
+# 说明：
+#   · PyTorch 必须按 CUDA 版本单独安装（勿在本文件指定，见 README「安装」节）：
+#       GPU:  pip install torch torchvision torchaudio --index-url https://download.pytorch.org/whl/cu121
+#       CPU:  pip install torch torchvision torchaudio --index-url https://download.pytorch.org/whl/cpu
+#   · OpenCV 必须用 headless 版本（避免与 PySide6 的 Qt 冲突）。
+#   · COLMAP（可选，--pose-estimator colmap）需用户自行安装并加入 PATH（见 README）。
 
-# 核心依赖（由上述步骤 2-4 安装）
-# torch>=2.0.0
-# torchvision>=0.15.0
-# opencv-python-headless>=4.8.0
-# numpy>=1.24.0
-# scipy>=1.10.0
-# PySide6>=6.5.0
-# matplotlib>=3.7.0
-# psutil>=5.9.0
+numpy>=1.24.0
+scipy>=1.10.0
+opencv-python-headless>=4.8.0
+PySide6>=6.5.0
+matplotlib>=3.7.0
+psutil>=5.9.0
 
-# 实验性依赖（默认未启用，无需安装）
+# 实验性依赖（代码预留接口，默认未启用）
 # torchmetrics>=0.11.0

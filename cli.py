@@ -17,7 +17,6 @@ import argparse
 import os
 import sys
 import time
-import signal
 from pathlib import Path
 
 import numpy as np
@@ -25,12 +24,11 @@ import torch
 
 from frames import extract_frames
 from poses import estimate_poses, CameraPose, CameraIntrinsics
-from point_cloud import initialize_gaussians
+from point_cloud import initialize_gaussians, migrate_legacy_scales
 from gaussian import Gaussian3D, DifferentiableRasterizer, Trainer, LazyFrames, LossDivergenceError
 from exporter import export_training_checkpoint
 
 import psutil
-import os
 
 def set_affinity_to_all_cores():
     """将当前进程绑定到所有逻辑核心"""
@@ -188,7 +186,20 @@ def run_pipeline(args: argparse.Namespace) -> None:
         K = np.load(intrinsics_file)
         poses_data = np.load(poses_file)
         sparse_points = np.load(sparse_file)
-        poses = [CameraPose(R=p[:3, :3].copy(), t=p[:3, 3].copy()) for p in poses_data]
+        poses = []
+        if poses_data.shape[0] == len(frame_paths):
+            # 新格式（2026-08 修复）：定长 [n,4,4]，NaN 行 = 该帧位姿缺失 → 帧↔位姿按索引对齐
+            for p in poses_data:
+                if np.isnan(p).any():
+                    poses.append(None)
+                else:
+                    poses.append(CameraPose(R=p[:3, :3].copy(), t=p[:3, 3].copy()))
+        else:
+            # 旧格式（gap 压缩）：顺序读 + 末尾补 None —— 中段缺失帧的对齐不可恢复
+            for p in poses_data:
+                poses.append(CameraPose(R=p[:3, :3].copy(), t=p[:3, 3].copy()))
+            while len(poses) < len(frame_paths):
+                poses.append(None)
         print(f"  Loaded poses from {workdir}")
     else:
         if args.pose_estimator == "colmap":
@@ -204,7 +215,6 @@ def run_pipeline(args: argparse.Namespace) -> None:
         else:  # opencv
             intrinsics, poses, sparse_points = estimate_poses(
                 frame_paths,
-                str(poses_dir),
                 min_inliers=25,
                 feature_type="orb",
                 focal_guess=args.focal_guess,
@@ -212,11 +222,13 @@ def run_pipeline(args: argparse.Namespace) -> None:
             )
             K = intrinsics.K
 
-        # Save for potential resume
+        # Save for potential resume —— 定长数组 + NaN 掩码（修复 2026-08：旧 gap 压缩丢失帧↔位姿对齐）
         np.save(intrinsics_file, K)
-        valid_poses = [p for p in poses if p is not None]
-        if valid_poses:
-            np.save(poses_file, np.stack([p.RT for p in valid_poses]))
+        poses_arr = np.full((len(poses), 4, 4), np.nan, dtype=np.float32)
+        for i, p in enumerate(poses):
+            if p is not None:
+                poses_arr[i] = p.RT
+        np.save(poses_file, poses_arr)
         if sparse_points is not None and sparse_points.size > 0:
             np.save(sparse_file, sparse_points)
 
@@ -237,7 +249,9 @@ def run_pipeline(args: argparse.Namespace) -> None:
     gauss_init_file = workdir / "gaussian_params.npz"
     if gauss_init_file.exists():
         params = dict(np.load(gauss_init_file))
-        gauss_init = {k: params[k] for k in ["positions", "scales", "opacities", "sh_coeffs", "rotations"]}
+        # 2026-08: 旧缓存把 log 尺度存在 "scales"（双重取 log bug），迁移为线性供 initialize 正确取 log
+        gauss_init = migrate_legacy_scales(params)
+        gauss_init = {k: gauss_init[k] for k in ["positions", "scales", "opacities", "sh_coeffs", "rotations"]}
         print(f"  Loaded initialized Gaussians from {workdir}")
     else:
         class _Intrinsics:
@@ -292,6 +306,7 @@ def run_pipeline(args: argparse.Namespace) -> None:
 
     train_poses = [p.RT.astype(np.float32) if p is not None else None for p in poses]
     start_epoch = 1
+    start_frame = 0
     pt_ckpt = workdir / "training_state.pt"
     best_loss = float("inf")
     training_start = time.time()
@@ -301,8 +316,13 @@ def run_pipeline(args: argparse.Namespace) -> None:
         try:
             trainer.load_training_state(str(pt_ckpt), device=device)
             saved = trainer.current_step
-            start_epoch = max(1, saved // max(len(frame_paths), 1))
-            print(f"  Resumed from epoch {start_epoch} (step {saved})")
+            n_valid = sum(1 for p in poses if p is not None)
+            # 帧级断点（2026-08 修复）：current_step 只统计"有效位姿帧" → 用有效帧数算 epoch，
+            #   用检查点里的 last_frame_index 精确续帧（不再重跑半轮、不再按帧总数取模漂移）。
+            start_epoch = max(1, saved // max(n_valid, 1) + 1)
+            start_frame = (trainer.last_frame_index + 1) if (n_valid > 0 and saved % n_valid != 0) else 0
+            print(f"  Resumed from epoch {start_epoch} (step {saved})"
+                  + (f", continuing at frame {start_frame}" if start_frame > 0 else ""))
         except Exception as e:
             print(f"  [WARN] Failed to load training state: {e}. Starting from scratch.")
 
@@ -317,7 +337,9 @@ def run_pipeline(args: argparse.Namespace) -> None:
                     progress_callback=None,
                     loss_threshold=1.0,
                     checkpoint_path=str(pt_ckpt),
+                    start_frame=start_frame,   # 2026-08: 恢复时从中断帧续（之后各轮跑全量）
                 )
+                start_frame = 0
             except LossDivergenceError as e:
                 print(f"\n  [LOSS DIVERGENCE] {e}")
                 trainer.save_training_state(str(pt_ckpt))

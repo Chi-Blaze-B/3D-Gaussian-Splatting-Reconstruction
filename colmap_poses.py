@@ -361,13 +361,9 @@ def estimate_poses_with_colmap(
         for frame_idx, pose in poses_dict.items():
             ordered_poses[frame_idx] = pose
 
-        # Save artifacts for resume compatibility
-        np.save(workdir / "intrinsics.npy", intrinsics.K)
+        # 2026-08: 移除重复写 workdir/*.npy —— cli.py/gui.py 的顶层保存（定长 NaN 掩码）才是
+        #   续训源；这里再写一份既无人读取，又会在 #3 修复后与顶层格式不一致。
         valid_poses = [p for p in ordered_poses if p is not None]
-        if valid_poses:
-            np.save(workdir / "poses.npy", np.stack([p.RT for p in valid_poses]))
-        if sparse_points.size > 0:
-            np.save(workdir / "sparse_points.npy", sparse_points)
 
         best_mid = best_meta[0] if best_meta is not None else -1
 

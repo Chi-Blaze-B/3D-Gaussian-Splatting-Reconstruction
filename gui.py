@@ -21,7 +21,6 @@ matplotlib.use("Agg")
 import matplotlib.pyplot as plt
 
 import psutil
-import os
 
 def set_affinity_to_all_cores():
     """将当前进程绑定到所有逻辑核心"""
@@ -47,7 +46,7 @@ from PySide6.QtGui import QPixmap, QImage, QFont, QColor, QPainter
 # ---------- Import simplified modules ----------
 from frames import extract_frames
 from poses import estimate_poses, CameraPose
-from point_cloud import initialize_gaussians
+from point_cloud import initialize_gaussians, migrate_legacy_scales
 from gaussian import Gaussian3D, DifferentiableRasterizer, Trainer, LazyFrames, LossDivergenceError
 from exporter import export_training_checkpoint
 
@@ -824,7 +823,20 @@ class PipelineWorker(QThread):
             K = np.load(workdir / "intrinsics.npy")
             poses_data = np.load(workdir / "poses.npy")
             sparse_points = np.load(workdir / "sparse_points.npy")
-            poses = [CameraPose(R=p[:3, :3].copy(), t=p[:3, 3].copy()) for p in poses_data]
+            poses = []
+            if poses_data.shape[0] == len(frame_paths):
+                # 新格式（2026-08 修复）：定长 [n,4,4]，NaN 行 = 该帧位姿缺失 → 按索引对齐
+                for p in poses_data:
+                    if np.isnan(p).any():
+                        poses.append(None)
+                    else:
+                        poses.append(CameraPose(R=p[:3, :3].copy(), t=p[:3, 3].copy()))
+            else:
+                # 旧格式（gap 压缩）：顺序读 + 末尾补 None —— 中段缺失帧对齐不可恢复
+                for p in poses_data:
+                    poses.append(CameraPose(R=p[:3, :3].copy(), t=p[:3, 3].copy()))
+                while len(poses) < len(frame_paths):
+                    poses.append(None)
             self._log(f"  已加载 {len(poses)} 个姿态（跳过估算）")
         else:
             if c["pose_estimator"] == "colmap":
@@ -843,7 +855,6 @@ class PipelineWorker(QThread):
                 self._log("  使用 ORB+EM 进行姿态估算...")
                 intrinsics, poses, sparse_points = estimate_poses(
                     frame_paths,
-                    str(poses_dir),
                     min_inliers=25,
                     feature_type="orb",
                     focal_guess=c.get("focal_guess"),
@@ -852,9 +863,12 @@ class PipelineWorker(QThread):
                 K = intrinsics.K
 
             np.save(workdir / "intrinsics.npy", K)
-            valid_poses = [p for p in poses if p is not None]
-            if valid_poses:
-                np.save(workdir / "poses.npy", np.stack([p.RT for p in valid_poses]))
+            # 定长数组 + NaN 掩码（修复 2026-08：旧 gap 压缩丢失帧↔位姿对齐）
+            poses_arr = np.full((len(poses), 4, 4), np.nan, dtype=np.float32)
+            for i, p in enumerate(poses):
+                if p is not None:
+                    poses_arr[i] = p.RT
+            np.save(workdir / "poses.npy", poses_arr)
             if sparse_points is not None and sparse_points.size > 0:
                 np.save(workdir / "sparse_points.npy", sparse_points)
 
@@ -876,7 +890,9 @@ class PipelineWorker(QThread):
 
         if has_gaussians:
             params = dict(np.load(workdir / "gaussian_params.npz"))
-            gauss_init = {k: params[k] for k in ["positions", "scales", "opacities", "sh_coeffs", "rotations"]}
+            # 2026-08: 旧缓存把 log 尺度存在 "scales"（双重取 log bug），迁移为线性供 initialize 正确取 log
+            gauss_init = migrate_legacy_scales(params)
+            gauss_init = {k: gauss_init[k] for k in ["positions", "scales", "opacities", "sh_coeffs", "rotations"]}
             self._log(f"  已加载 {params['positions'].shape[0]} 个高斯（跳过初始化）")
         else:
             class _I:
@@ -923,6 +939,7 @@ class PipelineWorker(QThread):
 
         train_poses = [p.RT.astype(np.float32) if p is not None else None for p in poses]
         start_epoch = 1
+        start_frame = 0
         pt_ckpt = str(workdir / "training_state.pt")
         best_loss = float("inf")
         training_start = time.time()
@@ -932,8 +949,13 @@ class PipelineWorker(QThread):
             try:
                 trainer.load_training_state(pt_ckpt, device=c["device"])
                 saved = trainer.current_step
-                resumed_epoch = max(1, saved // max(len(frame_paths), 1))
-                self._log(f"  已恢复训练状态: {saved} 帧已训练，从第 {resumed_epoch} 轮继续")
+                n_valid = sum(1 for p in poses if p is not None)
+                # 帧级断点（2026-08 修复）：current_step 只统计"有效位姿帧" → 用有效帧数算 epoch，
+                #   用检查点里的 last_frame_index 精确续帧（不再重跑半轮、不再按帧总数取模漂移）。
+                resumed_epoch = max(1, saved // max(n_valid, 1) + 1)
+                start_frame = (trainer.last_frame_index + 1) if (n_valid > 0 and saved % n_valid != 0) else 0
+                self._log(f"  已恢复训练状态: {saved} 帧已训练，从第 {resumed_epoch} 轮继续"
+                          + (f"，续帧 {start_frame}" if start_frame > 0 else ""))
                 start_epoch = resumed_epoch
             except Exception as e:
                 self._log(f"  [WARN] 加载检查点失败: {e}，从头开始")
@@ -964,7 +986,9 @@ class PipelineWorker(QThread):
                         progress_callback=_prog,
                         loss_threshold=1.0,
                         checkpoint_path=pt_ckpt,
+                        start_frame=start_frame,   # 2026-08: 恢复时从中断帧续（之后各轮跑全量）
                     )
+                    start_frame = 0
                 except LossDivergenceError as e:
                     self._log(f"\n  [LOSS DIVERGENCE] {e}")
                     trainer.save_training_state(pt_ckpt)
@@ -998,6 +1022,7 @@ class PipelineWorker(QThread):
                             progress_callback=_prog,
                             loss_threshold=1.0,
                             checkpoint_path=pt_ckpt,
+                            start_frame=0,   # OOM 恢复：当前轮从头跑
                         )
                     except Exception as e2:
                         self._log(f"  OOM 恢复后仍失败: {e2}")
@@ -1015,6 +1040,7 @@ class PipelineWorker(QThread):
 
                 if avg_loss < best_loss:
                     best_loss = avg_loss
+                    trainer.save_training_state(str(workdir / "best_training_state.pt"))  # 2026-08: GUI 也写最佳检查点（对齐 CLI）
 
                 pct = 45 + int((epoch - start_epoch + 1) / max(1, c["num_epochs"] - start_epoch + 1) * 50)
                 self._set_progress(min(pct, 95), f"训练轮次 {epoch}/{c['num_epochs']}")

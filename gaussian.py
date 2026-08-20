@@ -219,7 +219,9 @@ def eval_sh(deg: int, sh_coeffs: torch.Tensor, dirs: torch.Tensor) -> torch.Tens
     # Apply coefficients: color = sum_{l,m} coeffs[l,m] * basis[l,m]
     # coeffs shape: [N, C, 3], basis shape: [N, C]
     color = torch.einsum('nc, ncd -> nd', basis, sh_coeffs[:, :basis.shape[1], :])
-    return color
+    # 官方 SH 约定（2026-08）：DC 系数已存 (RGB-0.5)/C0，求值后补回 +0.5 → deg0 时 color == RGB。
+    # clamp_min(0) 与官方光栅化器一致，避免负颜色进入 alpha 合成造成病态梯度。
+    return torch.clamp(color + 0.5, min=0.0)
 
 
 # ---------- Gaussian3D ----------
@@ -246,6 +248,20 @@ class Gaussian3D:
     def parameters(self) -> List[torch.Tensor]:
         return [self.positions, self.log_scales, self.opacities_raw,
                 self.rotations, self.sh_coeffs]
+
+    def export_ply_dict(self) -> Dict[str, np.ndarray]:
+        """导出官方 3DGS PLY 所需的原始参数（不做激活转换）。
+
+        官方约定：scale 存 log σ、opacity 存 logit、sh_coeffs 通道 0 已是 (RGB-0.5)/C0、
+        rot 存 (w,x,y,z)。exporter 直接消费本方法的返回值。
+        """
+        return {
+            "positions": self.positions.detach().cpu().numpy(),
+            "scales": self.log_scales.detach().cpu().numpy(),        # 原始 log σ
+            "opacities": self.opacities_raw.detach().cpu().numpy(),  # 原始 logit
+            "rotations": self.rotations.detach().cpu().numpy(),      # (w,x,y,z)
+            "sh_coeffs": self.sh_coeffs.detach().cpu().numpy(),      # [N,16,3]
+        }
 
     def initialize_from_dict(self, data: Dict[str, np.ndarray], device: str = "cpu") -> "Gaussian3D":
         device = torch.device(device)
@@ -309,17 +325,17 @@ class DifferentiableRasterizer(nn.Module):
         self.image_height = image_height
         self.max_radius = max_radius
 
-    def forward(self, positions, cov3d, opacities, sh_coeffs, view_matrix, K, background, sh_degree=3):
-        return self._render_batch(positions, cov3d, opacities, sh_coeffs, view_matrix, K, background, sh_degree)
+    def forward(self, positions, cov3d, opacities, sh_coeffs, view_matrix, K, background, sh_degree=3, k1=None):
+        return self._render_batch(positions, cov3d, opacities, sh_coeffs, view_matrix, K, background, sh_degree, k1)
 
     # ---------- 向量化光栅化（方向 A：排序式逐像素 splat） ----------
-    def _render_batch(self, positions, cov3d, opacities, sh_coeffs, view_matrix, K, background, sh_degree):
+    def _render_batch(self, positions, cov3d, opacities, sh_coeffs, view_matrix, K, background, sh_degree, k1=None):
         """主实现：排序式逐像素 splat，详见 _render_batch_vectorized 的说明。"""
         return self._render_batch_vectorized(positions, cov3d, opacities, sh_coeffs,
-                                             view_matrix, K, background, sh_degree)
+                                             view_matrix, K, background, sh_degree, k1)
 
     # ---------- 向量化光栅化（方向 A：排序式逐像素 splat） ----------
-    def _render_batch_vectorized(self, positions, cov3d, opacities, sh_coeffs, view_matrix, K, background, sh_degree):
+    def _render_batch_vectorized(self, positions, cov3d, opacities, sh_coeffs, view_matrix, K, background, sh_degree, k1=None):
         """
         与 legacy/_render_batch_batched 数值语义等价，但把最后那段逐高斯
         Python 内层循环（每颗高斯 ~7 个 kernel launch）替换为纯向量化算子：
@@ -344,6 +360,9 @@ class DifferentiableRasterizer(nn.Module):
         t_cam = view_matrix[:3, 3]
         cam_positions = positions @ R_cam.T + t_cam
         cam_cov = R_cam @ cov3d @ R_cam.T
+        # 修复(2026-08): SH 求值方向必须用世界系（官方约定：高斯中心 - 相机中心）。
+        # 旧版用相机系方向使 SH 基底随相机旋转，视角相关效果不可移植。
+        center_world = -R_cam.T @ t_cam
 
         # Projection
         fx = K[0, 0]; fy = K[1, 1]; cx = K[0, 2]; cy = K[1, 2]
@@ -357,6 +376,28 @@ class DifferentiableRasterizer(nn.Module):
         B[:, 0, 0] = fx / z; B[:, 0, 2] = -fx * x_c / (z * z)
         B[:, 1, 1] = fy / z; B[:, 1, 2] = -fy * y_c / (z * z)
         cov2d = (B @ cam_cov) @ B.transpose(1, 2)
+
+        # ---- 一阶径向畸变（k1，2026-08 实现） ----
+        # 门控必须按 `k1 is not None`（即 enable_k1），绝不能按值 k1==0 跳过：
+        # 初始 k1=0 时其梯度 du·r² 非零但"按值跳过"会让 k1 永不产生梯度，特性永久失效。
+        # k1=None（默认）→ 整块跳过，与历史输出逐位一致。
+        if k1 is not None:
+            du = u - cx
+            dv = v - cy
+            xn = du / fx
+            yn = dv / fy
+            r2 = xn * xn + yn * yn
+            D = 1.0 + k1 * r2
+            u = cx + du * D
+            v = cy + dv * D
+            # 畸变雅可比 d(u_d,v_d)/d(u_c,v_c)，用于把针孔 2D 协方差变换到畸变图像空间
+            J00 = D + 2.0 * k1 * du * du / (fx * fx)
+            J01 = 2.0 * k1 * du * dv / (fy * fy)
+            J10 = 2.0 * k1 * du * dv / (fx * fx)
+            J11 = D + 2.0 * k1 * dv * dv / (fy * fy)
+            J = torch.stack([torch.stack([J00, J01], dim=-1),
+                             torch.stack([J10, J11], dim=-1)], dim=-2)  # [N,2,2]
+            cov2d = J @ cov2d @ J.transpose(1, 2)
 
         # Compute radius (3 sigma)
         a = cov2d[:, 0, 0]; c = cov2d[:, 1, 1]; b = cov2d[:, 0, 1]
@@ -386,7 +427,7 @@ class DifferentiableRasterizer(nn.Module):
         cov2d_s = cov2d_v[order]; opa_s = op_v[order]
 
         # Compute colors via SH
-        dirs = F.normalize(cam_positions[valid][order], dim=-1)
+        dirs = F.normalize(positions[valid][order] - center_world, dim=-1)
         colors = eval_sh(sh_degree, sh_coeffs[valid][order], dirs)
 
         # Ensure gradient connection even when all Gaussians land off-screen
@@ -514,7 +555,7 @@ class DifferentiableRasterizer(nn.Module):
         return out_color, out_alpha
 
     # ---------- 方向 B 实现（保留：批量同步 + 逐高斯串行合成） ----------
-    def _render_batch_batched(self, positions, cov3d, opacities, sh_coeffs, view_matrix, K, background, sh_degree):
+    def _render_batch_batched(self, positions, cov3d, opacities, sh_coeffs, view_matrix, K, background, sh_degree, k1=None):
         """
         与 legacy 数值语义一致；把内层循环每颗高斯的 4 次 GPU→CPU 同步
         改为每 batch 一次 .tolist() 批量拉取。像素级 over-blend 仍逐高斯串行。
@@ -532,6 +573,9 @@ class DifferentiableRasterizer(nn.Module):
         t_cam = view_matrix[:3, 3]
         cam_positions = positions @ R_cam.T + t_cam
         cam_cov = R_cam @ cov3d @ R_cam.T
+        # 修复(2026-08): SH 求值方向必须用世界系（官方约定：高斯中心 - 相机中心）。
+        # 旧版用相机系方向使 SH 基底随相机旋转，视角相关效果不可移植。
+        center_world = -R_cam.T @ t_cam
 
         # Projection
         fx = K[0, 0]; fy = K[1, 1]; cx = K[0, 2]; cy = K[1, 2]
@@ -545,6 +589,28 @@ class DifferentiableRasterizer(nn.Module):
         B[:, 0, 0] = fx / z; B[:, 0, 2] = -fx * x_c / (z * z)
         B[:, 1, 1] = fy / z; B[:, 1, 2] = -fy * y_c / (z * z)
         cov2d = (B @ cam_cov) @ B.transpose(1, 2)
+
+        # ---- 一阶径向畸变（k1，2026-08 实现） ----
+        # 门控必须按 `k1 is not None`（即 enable_k1），绝不能按值 k1==0 跳过：
+        # 初始 k1=0 时其梯度 du·r² 非零但"按值跳过"会让 k1 永不产生梯度，特性永久失效。
+        # k1=None（默认）→ 整块跳过，与历史输出逐位一致。
+        if k1 is not None:
+            du = u - cx
+            dv = v - cy
+            xn = du / fx
+            yn = dv / fy
+            r2 = xn * xn + yn * yn
+            D = 1.0 + k1 * r2
+            u = cx + du * D
+            v = cy + dv * D
+            # 畸变雅可比 d(u_d,v_d)/d(u_c,v_c)，用于把针孔 2D 协方差变换到畸变图像空间
+            J00 = D + 2.0 * k1 * du * du / (fx * fx)
+            J01 = 2.0 * k1 * du * dv / (fy * fy)
+            J10 = 2.0 * k1 * du * dv / (fx * fx)
+            J11 = D + 2.0 * k1 * dv * dv / (fy * fy)
+            J = torch.stack([torch.stack([J00, J01], dim=-1),
+                             torch.stack([J10, J11], dim=-1)], dim=-2)  # [N,2,2]
+            cov2d = J @ cov2d @ J.transpose(1, 2)
 
         # Compute radius (3 sigma)
         a = cov2d[:, 0, 0]; c = cov2d[:, 1, 1]; b = cov2d[:, 0, 1]
@@ -579,7 +645,7 @@ class DifferentiableRasterizer(nn.Module):
         cov2d_s = cov2d_v[order]; opa_s = op_v[order]
 
         # Compute colors via SH
-        dirs = F.normalize(cam_positions[valid][order], dim=-1)
+        dirs = F.normalize(positions[valid][order] - center_world, dim=-1)
         colors = eval_sh(sh_degree, sh_coeffs[valid][order], dirs)
 
         # Ensure gradient connection even when all Gaussians land off-screen
@@ -727,6 +793,8 @@ class Trainer:
         self.lr_decay_steps = lr_decay_steps
         self.lr_decay_gamma = lr_decay_gamma
         self.current_step = 0
+        # 修复(2026-08): 最近处理过的帧下标（帧级断点续训用）。train_epoch 每处理一帧更新。
+        self.last_frame_index = -1
         # ===== 修复: 添加 best_loss 成员变量 =====
         self.best_loss = float("inf")
         self.background = torch.rand(3, dtype=torch.float32, device=device)
@@ -875,7 +943,9 @@ class Trainer:
             self.view_matrix = torch.from_numpy(camera_pose.astype(np.float32)).to(self.device)
 
         if self.random_background:
-            self.background = torch.randint(0, 2, (3,), device=self.device, dtype=torch.float32)
+            # 修复(2026-08): 真黑白背景（README 宣称"随机黑白背景"）。
+            # 旧版每通道独立 0/1 → 8 种颜色而非黑白。
+            self.background = torch.randint(0, 2, (1,), device=self.device, dtype=torch.float32).expand(3)
         else:
             if not isinstance(self.background, torch.Tensor):
                 self.background = torch.tensor(self.background, dtype=torch.float32, device=self.device)
@@ -899,8 +969,10 @@ class Trainer:
         # Use PyTorch rasterizer
         viewmat = self.view_matrix
         K = torch.zeros(3, 3, dtype=torch.float32, device=self.device)
-        K[0,0] = self.fx.item() if isinstance(self.fx, torch.Tensor) else self.fx
-        K[1,1] = self.fy.item() if isinstance(self.fy, torch.Tensor) else self.fy
+        # 修复(2026-08): 旧版用 .item() 取 float 会切断计算图 → fx.grad 恒 None → 焦距从不更新。
+        # 直接赋 nn.Parameter 进 K 产生 CopySlices 图边，梯度沿投影回传（train_focal 生效）。
+        K[0,0] = self.fx if isinstance(self.fx, nn.Parameter) else float(self.fx)
+        K[1,1] = self.fy if isinstance(self.fy, nn.Parameter) else float(self.fy)
         K[0,2] = self.cx
         K[1,2] = self.cy
         K[2,2] = 1.0
@@ -927,7 +999,7 @@ class Trainer:
                 with torch.autocast(device_type="cuda", enabled=False):
                     rendered, _ = self.rasterizer(
                         means3D, cov3d.float(), opacities, sh_coeffs, viewmat, K,
-                        self.background, sh_degree=eff_deg
+                        self.background, sh_degree=eff_deg, k1=(self.k1 if self.enable_k1 else None)
                     )
                 if rendered.dim() == 3 and rendered.shape[0] == 3:
                     rendered = rendered.permute(1, 2, 0)
@@ -940,7 +1012,7 @@ class Trainer:
             for opt in self.optimizers.values():
                 opt.zero_grad()
             self._scaler.scale(loss).backward()
-            # 逐优化器守卫：无梯度优化器（k1 死参 / 光栅化器 early-return 帧下
+            # 逐优化器守卫：无梯度优化器（focal/k1 未启用、光栅化器 early-return 帧下
             #   log_scales/rotations/sh）跳过 scaler，否则 step 抛
             #   "No inf checks were recorded for this optimizer"
             has_grad = [
@@ -958,7 +1030,8 @@ class Trainer:
         else:
             cov3d = self.gaussians.cov3d
             rendered, _ = self.rasterizer(
-                means3D, cov3d, opacities, sh_coeffs, viewmat, K, self.background, sh_degree=eff_deg
+                means3D, cov3d, opacities, sh_coeffs, viewmat, K, self.background, sh_degree=eff_deg,
+                k1=(self.k1 if self.enable_k1 else None)
             )
             if rendered.dim() == 3 and rendered.shape[0] == 3:
                 rendered = rendered.permute(1, 2, 0)
@@ -1010,6 +1083,7 @@ class Trainer:
                     progress_callback(i + 1, n if n > 0 else i + 1, 0.0)
                 continue
             loss = self.step(frame, pose)
+            self.last_frame_index = i  # 帧级断点续训：记录最近处理过的帧下标
             total_loss += loss
             processed_count += 1
 
@@ -1029,14 +1103,8 @@ class Trainer:
             self.save_training_state(checkpoint_path)
         return avg_loss
 
-    def get_parameters(self) -> Dict[str, np.ndarray]:
-        return {
-            "positions": self.gaussians.positions.detach().cpu().numpy(),
-            "scales": np.exp(self.gaussians.log_scales.detach().cpu().numpy()),
-            "opacities": torch.sigmoid(self.gaussians.opacities_raw).detach().cpu().numpy(),
-            "rotations": self.gaussians.rotations.detach().cpu().numpy(),
-            "sh_coeffs": self.gaussians.sh_coeffs.detach().cpu().numpy(),
-        }
+    # 2026-08: get_parameters() 已移除 —— 它返回激活后的值（exp(sigmoid)），会破坏官方 PLY 约定。
+    # 改用 Gaussian3D.export_ply_dict() 返回原始参数。
 
     # ===== 修复: save_training_state 增加 best_loss 保存 =====
     def save_training_state(self, path: str) -> None:
@@ -1057,10 +1125,12 @@ class Trainer:
             },
             "optimizer_states": {name: opt.state_dict() for name, opt in self.optimizers.items()},
             "step_count": self.current_step,
+            "last_frame_index": self.last_frame_index,  # 2026-08: 帧级断点续训
             "best_loss": self.best_loss,  # ===== 新增 =====
             "background": self.background.detach().cpu(),
             "adaptive_density": {
                 "step_count": self.adaptive_density._step_count,
+                "cadence": self.adaptive_density._cadence,
                 "opacity_accum": self.adaptive_density._opacity_accum.detach().cpu() if self.adaptive_density._opacity_accum is not None else None,
                 "grad_accum": self.adaptive_density._grad_accum.detach().cpu() if self.adaptive_density._grad_accum is not None else None,
                 "max_gaussians": self.adaptive_density.max_gaussians,
@@ -1105,6 +1175,10 @@ class Trainer:
         g.sh_coeffs = params["sh_coeffs"].to(device).requires_grad_(True)
 
         self.current_step = state["step_count"]
+        self.last_frame_index = state.get("last_frame_index", -1)  # 旧检查点无此键 → -1
+        # ===== 2026-08 兼容提示 =====
+        # sh_coeffs 约定已改为官方 (RGB-0.5)/C0（eval_sh 求值补 +0.5）。旧检查点的
+        # sh_coeffs 存的是原始 RGB，在新约定下渲染会偏色 —— 预发布可接受，旧检查点需重训。
         self.best_loss = state.get("best_loss", float("inf"))  # ===== 新增（兼容旧检查点） =====
         self.sh_degree = state["sh_degree"]
         self.train_focal = state["train_focal"]
@@ -1152,6 +1226,7 @@ class Trainer:
 
         ad = self.adaptive_density
         ad._step_count = state["adaptive_density"]["step_count"]
+        ad._cadence = state["adaptive_density"].get("cadence", 0)  # 旧检查点无此键 → 0
         ad._opacity_accum = state["adaptive_density"]["opacity_accum"].to(device) if state["adaptive_density"]["opacity_accum"] is not None else None
         ad._grad_accum = state["adaptive_density"]["grad_accum"].to(device) if state["adaptive_density"]["grad_accum"] is not None else None
         ad.max_gaussians = state["adaptive_density"]["max_gaussians"]
@@ -1180,9 +1255,14 @@ class AdaptiveDensityController:
         self._step_count = 0
         self._opacity_accum = None
         self._grad_accum = None
+        # 修复(2026-08): 单调 cadence 计数器。旧版 densify 会重置 _step_count，
+        #   prune_every(1000) 永远达不到 → 常规低透明度修剪从未执行。
+        #   _step_count 仍是"窗口内步数"（用于累积器平均），_cadence 单调用于 densify/prune 节奏。
+        self._cadence = 0
 
     def step(self) -> None:
         self._step_count += 1
+        self._cadence += 1
         g = self.trainer.gaussians
         n = g.num_gaussians
         if n == 0:
@@ -1215,12 +1295,13 @@ class AdaptiveDensityController:
                 print(f"  [PRUNE] removed {n_pruned} Gaussians")
 
     def should_densify(self) -> bool:
-        return self._step_count > 0 and self._step_count % self.densify_every == 0
+        return self._cadence > 0 and self._cadence % self.densify_every == 0
 
     def should_prune(self) -> bool:
-        return self._step_count > 0 and self._step_count % self.prune_every == 0
+        return self._cadence > 0 and self._cadence % self.prune_every == 0
 
     def reset_accumulators(self) -> None:
+        # 只重置窗口计数器与累积器，不碰 _cadence（否则 prune 节奏再次被 densify 打断）
         self._step_count = 0
         self._opacity_accum = None
         self._grad_accum = None

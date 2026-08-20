@@ -11,6 +11,25 @@ Updated: Adaptive outlier threshold based on point cloud scale.
 import cv2
 import numpy as np
 
+# 官方 3DGS SH 常数：DC 系数 = (RGB - 0.5) / SH_C0；eval_sh 求值时补回 +0.5
+SH_C0 = 0.28209479177387814
+
+
+def migrate_legacy_scales(params: dict) -> dict:
+    """兼容旧 gaussian_params.npz 缓存的尺度语义。
+
+    修复(2026-08)前：point_cloud 把 LOG 尺度存在键 "scales"，initialize_from_dict 再取一次 log
+    → 双重取 log，全部高斯 σ 塌缩为 1e-6。修复后：新缓存存线性尺度并带 scale_domain='linear' 标记。
+    本函数把无标记的旧缓存（log 值）转回线性，供 initialize_from_dict 正确处理。
+    """
+    params = dict(params)
+    dom = params.get("scale_domain")
+    is_linear = dom is not None and np.asarray(dom).item() == "linear"
+    if not is_linear and "scales" in params:
+        params["scales"] = np.exp(params["scales"].astype(np.float64)).astype(np.float32)
+    params["scale_domain"] = np.array("linear")
+    return params
+
 
 def initialize_gaussians(
     sparse_points: np.ndarray,
@@ -52,6 +71,7 @@ def initialize_gaussians(
             "rotations": np.empty((0, 4), dtype=np.float32),
             "colors": np.empty((0, 3), dtype=np.float32),
             "counts": np.empty((0,), dtype=int),
+            "scale_domain": np.array("linear"),
         }
 
     if not frame_paths or not poses:
@@ -108,6 +128,7 @@ def initialize_gaussians(
             "rotations": np.empty((0, 4), dtype=np.float32),
             "colors": np.empty((0, 3), dtype=np.float32),
             "counts": np.empty((0,), dtype=int),
+            "scale_domain": np.array("linear"),
         }
 
     # --- Build projection matrices once ---
@@ -195,18 +216,21 @@ def initialize_gaussians(
     # --- Initialize parameters ---
     opacities = np.full(N, 0.5, dtype=np.float32)
     sh_coeffs = np.zeros((N, SH_NUM_BASES, 3), dtype=np.float32)
-    sh_coeffs[:, 0, :] = colors
+    # 修复(2026-08): 官方 SH 约定 —— DC 系数 = (RGB - 0.5) / C0（eval_sh 求值补回 +0.5）。
+    # 旧版直接存 RGB，eval_sh 无偏移 → 初始颜色暗 0.282×。
+    sh_coeffs[:, 0, :] = (colors - 0.5) / SH_C0
     rotations = np.tile([1.0, 0.0, 0.0, 0.0], (N, 1)).astype(np.float32)
-    log_scales = np.log(scales.astype(np.float32))
 
     result = {
         "positions": positions.astype(np.float32),
-        "scales": log_scales,
+        # 修复(2026-08): 存线性尺度（旧版误存 log，initialize_from_dict 再取 log → 双重取 log，σ 全塌缩 1e-6）
+        "scales": scales.astype(np.float32),
         "opacities": opacities,
         "sh_coeffs": sh_coeffs,
         "rotations": rotations,
         "colors": colors,
         "counts": counts,
+        "scale_domain": np.array("linear"),
     }
 
     print(f"Initialized {N} Gaussians, mean color range: [{colors.min():.2f}, {colors.max():.2f}]")
