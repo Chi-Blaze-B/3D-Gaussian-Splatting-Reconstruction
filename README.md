@@ -112,6 +112,7 @@ python cli.py --video input.mp4 --output output.ply
 | `--enable-k1` | 训练径向畸变系数 k1 | `False` |
 | `--amp` | 混合精度 fp16（需 CUDA + fp16 显卡，Ampere+ 可用 Tensor Core；光栅化器内部保持 fp32，无 Tensor Core 无收益） | `False` |
 | `--pose-estimator` | 姿态估计后端：opencv / colmap | `opencv` |
+| `--feature-type` | OpenCV 特征描述子：orb / sift（仅 opencv 后端生效） | `orb` |
 | `--focal-guess` | 初始焦距猜测（像素） | `None` |
 | `--resume-dir` | 从该工作目录恢复训练 | `None` |
 | `--eval-every` | 每 N 轮打印一次日志 | `500` |
@@ -231,7 +232,7 @@ python cli.py --video input.mp4 --resume-dir ./workdir --output restored.ply
 
 帧采样数量：通常 100~200 帧效果较好，过少会导致欠约束，过多增加训练时间。
 
-姿态估计：**长序列（≥60 帧）建议用 `--pose-estimator colmap`**——COLMAP 是工业级 SfM，实测点云质量与帧注册率远高于自研 ORB+EM（30 帧可见性 86.9% vs 37.5%）。COLMAP 默认用调优最优配置（`max_image_size=2400`、`sift_max_num_features=12000`、exhaustive matcher），60 帧实测 54/60 注册、27329 点。自研 ORB+EM 适合短序列（<60 帧），已修复 BA 深度障碍与尺度漂移问题。注意：COLMAP 对视频长序列的注册率低是 mapper 固有行为（只注册可稳定三角化的帧），但注册帧点云质量高，足以初始化高斯。mapper 可能把场景拆成多个子模型，程序会自动选择注册图像数最多的模型（修复：不再硬编码选模型 0）。
+姿态估计：**长序列（≥60 帧）建议用 `--pose-estimator colmap`**——COLMAP 是工业级 SfM，实测点云质量与帧注册率远高于自研 ORB+EM（30 帧可见性 86.9% vs 37.5%）。COLMAP 默认用调优最优配置（`max_image_size=2400`、`sift_max_num_features=12000`、exhaustive matcher），60 帧实测 54/60 注册、27329 点。自研 ORB+EM 适合短序列（<60 帧），已修复 BA 深度障碍与尺度漂移问题。注意：COLMAP 对视频长序列的注册率低是 mapper 固有行为（只注册可稳定三角化的帧），但注册帧点云质量高，足以初始化高斯。mapper 可能把场景拆成多个子模型，程序会自动选择注册图像数最多的模型（修复：不再硬编码选模型 0）。对短序列或纹理不足场景，OpenCV 后端可换 `--feature-type sift`（SIFT 浮点描述子用 L2 距离匹配，比 ORB 更稳健但更慢）。
 
 显存管理：如果训练中显存溢出，程序会自动修剪高斯并降低上限，并保存检查点。
 

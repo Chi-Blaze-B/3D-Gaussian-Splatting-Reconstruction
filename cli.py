@@ -98,6 +98,13 @@ def build_parser() -> argparse.ArgumentParser:
         default="opencv",
         help="Backend for camera pose estimation (opencv=ORB+EM, colmap=external COLMAP)"
     )
+    parser.add_argument(
+        "--feature-type",
+        type=str,
+        choices=["orb", "sift"],
+        default="orb",
+        help="Feature descriptor for OpenCV pose estimation (orb=fast binary, sift=robust float, slower)"
+    )
     parser.add_argument("--focal-guess", type=float, default=None, help="Initial focal length guess (optional)")
 
     # ---------- Resume ----------
@@ -162,6 +169,7 @@ def run_pipeline(args: argparse.Namespace) -> None:
             two_stage=two_stage,
             poses_output_dir=str(poses_dir / "coarse_poses") if two_stage else None,
             optical_flow_method="farneback",
+            feature_type=args.feature_type,
         )
         frame_paths_file.write_text("\n".join(frame_paths))
         print(f"  Extracted {len(frame_paths)} frames ({time.time()-t0:.1f}s)")
@@ -216,7 +224,7 @@ def run_pipeline(args: argparse.Namespace) -> None:
             intrinsics, poses, sparse_points = estimate_poses(
                 frame_paths,
                 min_inliers=25,
-                feature_type="orb",
+                feature_type=args.feature_type,
                 focal_guess=args.focal_guess,
                 aspect_ratio=1.0,
             )

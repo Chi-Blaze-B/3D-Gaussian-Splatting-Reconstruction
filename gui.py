@@ -803,6 +803,7 @@ class PipelineWorker(QThread):
                 two_stage=two_stage,
                 poses_output_dir=str(poses_dir / "coarse_poses") if two_stage else None,
                 optical_flow_method="farneback",
+                feature_type=c.get("feature_type", "orb"),
             )
             (workdir / "frame_paths.txt").write_text("\n".join(frame_paths))
             self._log(f"  已提取 {len(frame_paths)} 帧")
@@ -852,11 +853,12 @@ class PipelineWorker(QThread):
                     self.finished_signal.emit(False, f"COLMAP failed: {e}")
                     return
             else:
-                self._log("  使用 ORB+EM 进行姿态估算...")
+                feature_type = c.get("feature_type", "orb")
+                self._log(f"  使用 {'SIFT' if feature_type == 'sift' else 'OpenCV'} 进行姿态估算...")
                 intrinsics, poses, sparse_points = estimate_poses(
                     frame_paths,
                     min_inliers=25,
-                    feature_type="orb",
+                    feature_type=feature_type,
                     focal_guess=c.get("focal_guess"),
                     aspect_ratio=1.0,
                 )
@@ -1435,7 +1437,14 @@ class MainWindow(QMainWindow):
             self._device_map = {"自动": "auto", "CPU": "cpu"}
 
         self.pose_estimator_combo = StyledComboBox()
-        self.pose_estimator_combo.addItems(["ORB+EM", "COLMAP"])
+        self.pose_estimator_combo.addItems(["OpenCV", "COLMAP"])
+
+        # 特征描述子仅 OpenCV 后端适用；切到 COLMAP 时整行隐藏
+        self.feature_type_label = StyledLabel("特征描述子:", font_size=11, color=C["text_secondary"])
+        self.feature_type_combo = StyledComboBox()
+        self.feature_type_combo.addItems(["ORB", "SIFT"])
+        self.feature_type_combo.setToolTip("特征描述子：ORB 快速（二进制/Hamming）；SIFT 更稳健但较慢（浮点/L2）。")
+        self.pose_estimator_combo.currentTextChanged.connect(self._on_pose_estimator_changed)
 
         form.addRow(StyledLabel("采样模式:", font_size=11, color=C["text_secondary"]), self.sampling_combo)
         form.addRow(StyledLabel("采样帧率:", font_size=11, color=C["text_secondary"]), self.fps_spin)
@@ -1455,9 +1464,19 @@ class MainWindow(QMainWindow):
         form.addRow(StyledLabel("混合精度:", font_size=11, color=C["text_secondary"]), self.amp_cb)
         form.addRow(StyledLabel("计算设备:", font_size=11, color=C["text_secondary"]), self.device_combo)
         form.addRow(StyledLabel("姿态估算:", font_size=11, color=C["text_secondary"]), self.pose_estimator_combo)
+        form.addRow(self.feature_type_label, self.feature_type_combo)
 
         cl.addLayout(form)
         parent_layout.addWidget(card)
+
+        # 初始同步：默认 OpenCV 显示特征描述子
+        self._on_pose_estimator_changed(self.pose_estimator_combo.currentText())
+
+    def _on_pose_estimator_changed(self, text: str):
+        """特征描述子仅 OpenCV 适用；切到 COLMAP 时隐藏整行（QFormLayout 对隐藏行不占空间）。"""
+        is_colmap = text == "COLMAP"
+        self.feature_type_label.setVisible(not is_colmap)
+        self.feature_type_combo.setVisible(not is_colmap)
 
     def _apply_theme(self):
         self.setStyleSheet(f"""
@@ -1529,6 +1548,7 @@ class MainWindow(QMainWindow):
 
         # Map pose estimator
         pose_estimator = "colmap" if self.pose_estimator_combo.currentIndex() == 1 else "opencv"
+        feature_type = "sift" if self.feature_type_combo.currentIndex() == 1 else "orb"
 
         config = {
             "video": video,
@@ -1552,6 +1572,7 @@ class MainWindow(QMainWindow):
             "amp": self.amp_cb.isChecked(),
             "device": device,
             "pose_estimator": pose_estimator,
+            "feature_type": feature_type,
         }
 
         self.start_btn.setEnabled(False)

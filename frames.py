@@ -51,6 +51,7 @@ def extract_frames(
     two_stage: bool = False,
     poses_output_dir: Optional[str] = None,
     optical_flow_method: str = DEFAULT_OPTICAL_FLOW_METHOD,
+    feature_type: str = "orb",
 ) -> List[str]:
     """
     Extract frames from a video with optional intelligent sampling.
@@ -76,6 +77,8 @@ def extract_frames(
         Directory to store coarse pose intermediates (used for two-stage).
     optical_flow_method : str
         'farneback' or 'lk' - algorithm for optical flow.
+    feature_type : str
+        'orb' or 'sift' - descriptor used for the two-stage coarse pose pass.
 
     Returns
     -------
@@ -91,6 +94,7 @@ def extract_frames(
             min_frames, max_frames,
             poses_output_dir,
             optical_flow_method,
+            feature_type,
         )
 
     cap = cv2.VideoCapture(video_path)
@@ -141,6 +145,7 @@ def _two_stage_extract(
     max_frames: int,
     poses_output_dir: Optional[str],
     optical_flow_method: str,
+    feature_type: str = "orb",
 ) -> List[str]:
     """Two‑stage smart sampling with parallax, flow, and texture."""
     from poses import estimate_poses  # lazy import
@@ -169,7 +174,7 @@ def _two_stage_extract(
     pose_dir = poses_output_dir or tempfile.mkdtemp(prefix="poses_coarse_")
     os.makedirs(pose_dir, exist_ok=True)
     try:
-        intrinsics, coarse_poses, _ = estimate_poses(coarse_paths, min_inliers=10)
+        intrinsics, coarse_poses, _ = estimate_poses(coarse_paths, min_inliers=10, feature_type=feature_type)
     except Exception as e:
         print(f"  [WARN] Coarse pose estimation failed: {e}. Using single‑stage smart sampling.")
         # Fallback: use flow‑only sampling (no parallax)
@@ -259,7 +264,8 @@ def _extract_indices(
         resized = cv2.resize(bgr, (w, h), interpolation=cv2.INTER_AREA)
         fname = f"frame_{i:04d}.png"
         fpath = os.path.join(output_dir, fname)
-        cv2.imwrite(fpath, resized)
+        if not cv2.imwrite(fpath, resized):
+            raise OSError(f"Failed to write frame image: {fpath} (disk full or no permission?)")
         frames.append(os.path.abspath(fpath))
     return frames
 
@@ -297,7 +303,8 @@ def _extract_uniform(
         resized = cv2.resize(bgr, (w, h), interpolation=cv2.INTER_AREA)
         fname = f"coarse_{i:04d}.png"
         fpath = os.path.join(output_dir, fname)
-        cv2.imwrite(fpath, resized)
+        if not cv2.imwrite(fpath, resized):
+            raise OSError(f"Failed to write frame image: {fpath} (disk full or no permission?)")
         paths.append(os.path.abspath(fpath))
 
     if own_cap:
@@ -527,4 +534,5 @@ def _fallback_smart_extract(
 
     # Rewind cap and extract
     cap.set(cv2.CAP_PROP_POS_FRAMES, 0)
+    os.makedirs(output_dir, exist_ok=True)  # 与 _extract_uniform 一致：自包含建目录
     return _extract_indices(cap, indices, output_dir, w, h)

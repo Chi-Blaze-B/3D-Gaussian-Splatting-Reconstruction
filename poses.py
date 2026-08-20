@@ -35,6 +35,11 @@ MAX_REPROJ_ERROR = 4.0
 SMALL_TRANSLATION = 1e-4
 MATCH_DIST = 90
 DESC_UPDATE_THRESH = 35
+# SIFT 描述子是 float32 且行范数≈512（OpenCV 归一化到 512），必须用 L2 度量；
+# Hamming 距离只适用于 uint8 二进制描述子（ORB）。对 float 用 Hamming 在旧版
+# OpenCV 产生随机匹配、OpenCV 5.x 直接断言崩溃（2026-08 修复）。
+SIFT_MATCH_DIST = 400.0          # SIFT L2 绝对上限（好匹配典型 <300，随机对 ~700+）
+SIFT_DESC_UPDATE_THRESH = 150.0  # SIFT 描述子更新阈值
 MIN_FEATURES = 80
 MIN_TRI_ANGLE_DEG = 2.0
 INIT_MIN_TRANSLATION = 0.01
@@ -119,7 +124,9 @@ def estimate_poses(
     keyframes = [0]
     last_pose = frame_poses[0]
 
-    bf = cv2.BFMatcher(cv2.NORM_HAMMING, crossCheck=False)
+    # 匹配器距离度量必须匹配描述子类型（ORB uint8→Hamming；SIFT float32→L2）
+    norm_type, _, _ = _descriptor_metric(desc_list)
+    bf = cv2.BFMatcher(norm_type, crossCheck=False)
 
     initialized = False
     init_candidates = []
@@ -368,18 +375,36 @@ def _extract_features(paths: List[str], feature_type: str = "orb"):
     return shape0, kps, descs
 
 
+# ---------- Descriptor Metric ----------
+def _descriptor_metric(desc_list):
+    """Return (cv2_norm, match_dist, update_thresh) matching the real descriptor dtype.
+
+    ORB produces uint8 binary descriptors -> Hamming distance; SIFT produces float32
+    -> must use L2. Using Hamming on float descriptors either matches random noise
+    (OpenCV <5) or throws an assertion error (OpenCV 5.x). Empty descriptor arrays
+    default to ORB/Hamming (no matching runs on empty descriptors anyway).
+    """
+    for d in desc_list:
+        if d is not None and len(d) > 0:
+            if d.dtype != np.uint8:
+                return cv2.NORM_L2, SIFT_MATCH_DIST, SIFT_DESC_UPDATE_THRESH
+            return cv2.NORM_HAMMING, MATCH_DIST, DESC_UPDATE_THRESH
+    return cv2.NORM_HAMMING, MATCH_DIST, DESC_UPDATE_THRESH
+
+
 # ---------- Match Features ----------
 def _match_features(desc1, desc2, bf, ratio=0.75):
     if desc1 is None or desc2 is None or len(desc1) == 0 or len(desc2) == 0:
         return []
+    norm_type, match_dist, _ = _descriptor_metric([desc1])
     if len(desc2) < 2:
-        matches = cv2.BFMatcher(cv2.NORM_HAMMING, crossCheck=True).match(desc1, desc2)
-        return [m for m in matches if m.distance < MATCH_DIST]
+        matches = cv2.BFMatcher(norm_type, crossCheck=True).match(desc1, desc2)
+        return [m for m in matches if m.distance < match_dist]
     raw = bf.knnMatch(desc1, desc2, k=2)
     raw = [pair for pair in raw if len(pair) == 2]
     good = []
     for m, n in raw:
-        if m.distance < ratio * n.distance and m.distance < MATCH_DIST:
+        if m.distance < ratio * n.distance and m.distance < match_dist:
             good.append(m)
     return good
 
@@ -418,13 +443,12 @@ def _update_map_point_descriptor(pt_dict, new_desc):
         pt_dict['desc'] = new_desc.copy()
         pt_dict['desc_age'] = 0
         return
-    if old.dtype != np.uint8:
-        old = old.astype(np.uint8)
-    if new_desc.dtype != np.uint8:
-        new_desc = new_desc.astype(np.uint8)
-    dist = cv2.norm(old, new_desc, cv2.NORM_HAMMING)
+    # 2026-08: 距离度量必须匹配描述子类型——ORB(uint8) 用 Hamming，SIFT(float32) 用 L2。
+    # 旧版先把 float 强转 uint8 再算 Hamming，SIFT 描述子被毁掉后匹配纯属噪声。
+    norm_type, _, update_thresh = _descriptor_metric([new_desc])
+    dist = cv2.norm(old, new_desc, norm_type)
     age = pt_dict.get('desc_age', 0)
-    if pt_dict.get('obs_count', 0) < 3 or age > 5 or dist >= DESC_UPDATE_THRESH * 1.2:
+    if pt_dict.get('obs_count', 0) < 3 or age > 5 or dist >= update_thresh * 1.2:
         pt_dict['desc'] = new_desc.copy()
         pt_dict['desc_age'] = 0
     else:
