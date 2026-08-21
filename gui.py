@@ -1442,8 +1442,8 @@ class MainWindow(QMainWindow):
         # 特征描述子仅 OpenCV 后端适用；切到 COLMAP 时整行隐藏
         self.feature_type_label = StyledLabel("特征描述子:", font_size=11, color=C["text_secondary"])
         self.feature_type_combo = StyledComboBox()
-        self.feature_type_combo.addItems(["ORB", "SIFT"])
-        self.feature_type_combo.setToolTip("特征描述子：ORB 快速（二进制/Hamming）；SIFT 更稳健但较慢（浮点/L2）。")
+        self.feature_type_combo.addItems(["ORB+EM", "SIFT"])
+        self.feature_type_combo.setToolTip("特征描述子：ORB+EM 快速（二进制/Hamming）；SIFT 更稳健但较慢（浮点/L2）。")
         self.pose_estimator_combo.currentTextChanged.connect(self._on_pose_estimator_changed)
 
         form.addRow(StyledLabel("采样模式:", font_size=11, color=C["text_secondary"]), self.sampling_combo)
