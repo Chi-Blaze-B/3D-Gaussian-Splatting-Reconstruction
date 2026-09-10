@@ -11,10 +11,9 @@ Implements:
 No external COLMAP dependency — purely OpenCV + SciPy.
 """
 
-import os
 import logging
 from dataclasses import dataclass
-from typing import List, Optional, Tuple, Dict, Set, Any
+from typing import List, Optional, Tuple, Dict, Set
 from collections import defaultdict
 
 import numpy as np
@@ -26,31 +25,30 @@ MIN_INLIERS = 25
 KEYFRAME_ANGLE_DEG = 5.0
 KEYFRAME_TRANS_RATIO = 0.05
 COVIS_RATIO_THRESH = 0.25
-BA_MAX_ITER = 15                # was 30, reduced for speed and stability
-GLOBAL_BA_ITER = 25             # was 50
+BA_MAX_ITER = 15
+GLOBAL_BA_ITER = 25
 MIN_BA_WINDOW = 5
-PRUNE_INTERVAL = 200            # fixed
-MIN_OBSERVATIONS = 2 
+PRUNE_INTERVAL = 200
+MIN_OBSERVATIONS = 2
 MAX_REPROJ_ERROR = 4.0
 SMALL_TRANSLATION = 1e-4
 MATCH_DIST = 90
 DESC_UPDATE_THRESH = 35
 # SIFT 描述子是 float32 且行范数≈512（OpenCV 归一化到 512），必须用 L2 度量；
 # Hamming 距离只适用于 uint8 二进制描述子（ORB）。对 float 用 Hamming 在旧版
-# OpenCV 产生随机匹配、OpenCV 5.x 直接断言崩溃（2026-08 修复）。
-SIFT_MATCH_DIST = 400.0          # SIFT L2 绝对上限（好匹配典型 <300，随机对 ~700+）
-SIFT_DESC_UPDATE_THRESH = 150.0  # SIFT 描述子更新阈值
+# OpenCV 产生随机匹配、OpenCV 5.x 直接断言崩溃。
+SIFT_MATCH_DIST = 400.0
+SIFT_DESC_UPDATE_THRESH = 150.0
 MIN_FEATURES = 80
 MIN_TRI_ANGLE_DEG = 2.0
 INIT_MIN_TRANSLATION = 0.01
 KEYFRAME_CULLING_WINDOW = 10
-LOCAL_MAP_RADIUS = 2
-PNP_WINDOW = 12           # PnP 精修使用的最近关键帧数（原 LOCAL_MAP_RADIUS=2 匹配不足，全部关键帧太慢）
-MAX_POINTS_IN_BA = 300          # was 150, increase for better point quality
+PNP_WINDOW = 12
+MAX_POINTS_IN_BA = 300
 EPS_MIN = 1e-8
 EPS_MAX = 0.1
-BA_MAX_OBS = 2000               # new: cap observations per BA call
-BA_F_SCALE_MULTIPLIER = 3.0     # new: make loss more robust
+BA_MAX_OBS = 2000
+BA_F_SCALE_MULTIPLIER = 3.0
 
 logger = logging.getLogger(__name__)
 logging.basicConfig(level=logging.INFO, format="[Pose] %(message)s")
@@ -63,7 +61,6 @@ class CameraIntrinsics:
     fy: float
     cx: float
     cy: float
-    k1: float = 0.0
 
     @property
     def K(self) -> np.ndarray:
@@ -243,9 +240,8 @@ def estimate_poses(
 
         # ----- Local map tracking (PnP refinement) -----
         # PnP 用已有 3D 点计算相机位姿，天然提供正确的尺度锚点（解决 t_rel 单位范数
-        # 导致的累积尺度漂移）。原条件 LOCAL_MAP_RADIUS=2 匹配点常不足，PnP 很少触发。
-        # 放宽到最近 PNP_WINDOW 个关键帧（而非全部——全部关键帧匹配太慢），
-        # 兼顾 PnP 触发率与速度。
+        # 导致的累积尺度漂移）。放宽到最近 PNP_WINDOW 个关键帧（而非全部——全部关键帧
+        # 匹配太慢），兼顾 PnP 触发率与速度。
         if len(keyframes) > 1:
             pts3d_local, pts2d_local = [], []
             local_kfs = keyframes[-PNP_WINDOW:]
@@ -342,14 +338,14 @@ def estimate_poses(
         else:
             last_valid = p
 
-    intrinsics = CameraIntrinsics(fx=focal0, fy=fy0, cx=cx, cy=cy, k1=0.0)
+    intrinsics = CameraIntrinsics(fx=focal0, fy=fy0, cx=cx, cy=cy)
     logger.info(f"Final: fx={focal0:.2f}, fy={fy0:.2f}, points={len(all_xyz)}")
     return intrinsics, frame_poses, all_xyz
 
 
 # ---------- Feature Extraction ----------
 def _extract_features(paths: List[str], feature_type: str = "orb"):
-    # 修复(2026-08): 不再把全部原图常驻内存（200 帧 1080p 约 1.2GB）——调用方只用首帧 shape。
+    # 不再把全部原图常驻内存（200 帧 1080p 约 1.2GB）——调用方只用首帧 shape。
     kps, descs = [], []
     if feature_type == "sift":
         try:
@@ -377,12 +373,11 @@ def _extract_features(paths: List[str], feature_type: str = "orb"):
 
 # ---------- Descriptor Metric ----------
 def _descriptor_metric(desc_list):
-    """Return (cv2_norm, match_dist, update_thresh) matching the real descriptor dtype.
+    """按实际描述子 dtype 返回 (cv2_norm, match_dist, update_thresh)。
 
-    ORB produces uint8 binary descriptors -> Hamming distance; SIFT produces float32
-    -> must use L2. Using Hamming on float descriptors either matches random noise
-    (OpenCV <5) or throws an assertion error (OpenCV 5.x). Empty descriptor arrays
-    default to ORB/Hamming (no matching runs on empty descriptors anyway).
+    ORB 描述子 uint8 二进制 → Hamming；SIFT 描述子 float32 → L2。
+    对 float 描述子用 Hamming 在旧版 OpenCV 匹配随机噪声、OpenCV 5.x 直接断言崩溃。
+    空描述子数组默认按 ORB/Hamming（空数组不会触发匹配）。
     """
     for d in desc_list:
         if d is not None and len(d) > 0:
@@ -443,8 +438,7 @@ def _update_map_point_descriptor(pt_dict, new_desc):
         pt_dict['desc'] = new_desc.copy()
         pt_dict['desc_age'] = 0
         return
-    # 2026-08: 距离度量必须匹配描述子类型——ORB(uint8) 用 Hamming，SIFT(float32) 用 L2。
-    # 旧版先把 float 强转 uint8 再算 Hamming，SIFT 描述子被毁掉后匹配纯属噪声。
+    # 距离度量必须匹配描述子类型——ORB(uint8) 用 Hamming，SIFT(float32) 用 L2。
     norm_type, _, update_thresh = _descriptor_metric([new_desc])
     dist = cv2.norm(old, new_desc, norm_type)
     age = pt_dict.get('desc_age', 0)
@@ -510,15 +504,13 @@ def _triangulate_new_points(curr_idx, matches, inlier_mask,
         feat_map[curr_idx][curr_feat] = pt_idx
         new_indices.append(pt_idx)
 
-    # ===== 修复: 尺度归一化（锚定到已有地图点的中位深度） =====
-    # 问题: 每次本质矩阵恢复的 t_rel 是单位范数（up-to-scale），链式叠加
-    #   t_curr = R_rel @ last_pose.t + t_rel 导致尺度随帧数累积漂移
-    #   （实测 20帧可见性 74% → 200帧 6%）。
-    # 修复: 新增点的中位深度应接近已有地图点的中位深度。用该比例同时缩放
-    #   新增点的坐标和当前相机平移 pose_curr.t，使全序列尺度一致。
-    # 注意: 深度用"相机前方 z 深度"（R_curr[2] @ (p - cam)）而非"到相机中心距离"，
-    #   后者在相机靠近点时病态（ref_median 骤降 → scale 爆炸，实测点云跨度 393万）。
-    #   scale 因子也 clamp 到 [0.05, 20]，防止极端值破坏点云。
+    # ===== 尺度归一化（锚定到已有地图点的中位深度） =====
+    # 每次本质矩阵恢复的 t_rel 是单位范数（up-to-scale），链式叠加
+    #   t_curr = R_rel @ last_pose.t + t_rel 导致尺度随帧数累积漂移。
+    # 新增点的中位深度应接近已有地图点的中位深度。用该比例同时缩放新增点
+    # 坐标和当前相机平移，使全序列尺度一致。深度用"相机前方 z 深度"
+    # （R_curr[2] @ (p - cam)）而非"到相机中心距离"，后者在相机靠近点时病态。
+    # scale 因子 clamp 到 [0.5, 2]，防止极端值破坏点云。
     if new_indices and map_points:
         old_count = len(map_points) - len(new_indices)
         if old_count >= 10:
@@ -526,7 +518,6 @@ def _triangulate_new_points(curr_idx, matches, inlier_mask,
             cam_curr_flat = cam_curr.flatten()
             for p in map_points[:old_count]:
                 if p['xyz'].size == 3:
-                    # 相机前方 z 深度（正深度才有效）
                     d = float(pose_curr.R[2] @ (p['xyz'] - cam_curr_flat))
                     if d > 0:
                         old_depths.append(d)
@@ -541,15 +532,10 @@ def _triangulate_new_points(curr_idx, matches, inlier_mask,
                     new_median = np.median(new_depths)
                     if new_median > 1e-8 and ref_median > 1e-8:
                         scale = ref_median / new_median
-                        # clamp 尺度因子：严格限制防止逐帧累积放大。
-                        # 之前 [0.05,20] 允许连续帧各乘 ~20 → 点坐标指数爆炸
-                        # （实测个别点范数 >1e6）。限制到 [0.5,2] 只做温和微调。
                         scale = np.clip(scale, 0.5, 2.0)
-                        # 只缩放显著偏离的尺度（防止数值噪声抖动）
                         if scale > 1.5 or scale < 0.5:
                             for pi in new_indices:
                                 map_points[pi]['xyz'] = (map_points[pi]['xyz'] * scale).astype(np.float32)
-                            # 同步缩放当前相机平移，保持相机-点几何一致
                             pose_curr = pose_curr.scaled(scale)
     return new_indices, pose_curr
 
@@ -610,9 +596,8 @@ def _bundle_adjustment(
     if len(obs) < 10:
         return focal, fy
 
-    # ===== 限制观测数量 =====
-    # 修复(2026-08): 先用局部 RNG 并记录原始数量——旧版全局 np.random.seed(42) 污染
-    #   frames/point_cloud 的随机性；且日志在 obs 被覆盖后才 len(obs)，恒打印 "2000/2000"。
+    # 限制观测数量：先用局部 RNG 并记录原始数量——不能用全局 seed 污染
+    # frames/point_cloud 的随机性；日志在 obs 被覆盖前取原始数量。
     n_obs_orig = len(obs)
     rng = np.random.default_rng(42)
     if n_obs_orig > BA_MAX_OBS:
@@ -650,19 +635,14 @@ def _bundle_adjustment(
         for pid in point_ids:
             param.extend(map_points[pid]['xyz'])
 
-    # ===== 修复: BA 平移/点坐标边界基于场景尺度，防止相机尺度漂移 =====
-    # 旧实现: bound_scale = 100*image_size (~384000)，远超场景尺度（点云跨度~67），
-    #   允许 BA 把相机推到离点云极远处（实测相机轨迹跨度 2579 vs 点云 67），
-    #   导致投影后点云仅 ~7% 落入画面。
-    # 新实现: 用 map_points 的中位深度/跨度作为场景尺度基准，平移边界设为
-    #   场景跨度的数倍，相机被约束在点云附近，保持尺度一致。
+    # BA 平移/点坐标边界基于场景尺度，防止相机尺度漂移。
+    # 旧实现 bound_scale = 100*image_size (~384000) 允许 BA 把相机推到离点云
+    # 极远处，投影后点云几乎不入画面。现用点云跨度作为场景尺度基准。
     scene_scale = 1.0
     if map_points:
         xs = np.array([p['xyz'] for p in map_points if p['xyz'].size == 3])
         if len(xs) > 0:
             scene_scale = float(np.linalg.norm(xs.max(axis=0) - xs.min(axis=0))) + 1e-6
-    # 相机平移边界：基于场景尺度与当前相机范围（确保初始猜测在界内）
-    # 平移可能因尺度漂移略超场景尺度，取场景尺度 5 倍与相机最大平移 2 倍的较大者
     cam_t_max = 1.0
     if other_kfs:
         cam_ts = [np.linalg.norm(frame_poses[k].t.flatten()) for k in other_kfs
@@ -670,14 +650,11 @@ def _bundle_adjustment(
         if cam_ts:
             cam_t_max = max(cam_ts)
     t_bound = max(scene_scale * 5.0, cam_t_max * 2.0, 10.0)
-    # 旋转向量边界：cv2.Rodrigues 的旋转向量范数可远超 π（冗余表示，接近 360°
-    # 旋转时范数可达 ~4π 甚至更大），设任何有限边界都会导致 "Initial guess is
-    # outside of provided bounds"。旋转向量本身有界性由 Rodrigues 保证（同一旋转
-    # 有多个表示），因此对旋转不设边界（np.inf），只约束相机平移防尺度漂移。
+    # 旋转向量范数可远超 π（近 360° 时 ~4π），设任何有限边界都会触发
+    # "Initial guess is outside of provided bounds"。旋转向量的有界性由
+    # Rodrigues 保证，不设边界；只约束相机平移防尺度漂移。
     r_bound = np.inf
-    # 修复(2026-08): bounds 必须与交错参数排布一致（每关键帧 3 旋转 + 3 平移，见 param 构造）。
-    # 旧版先全部旋转再全部平移 → 前半关键帧平移拿到 ±inf（防尺度漂移失效）、
-    #   后半关键帧旋转被 ±t_bound 误约束（旋转向量范数可达 ~4π，越界即 BA 失败）。
+    # bounds 必须与交错参数排布一致（每关键帧 3 旋转 + 3 平移）。
     lower_pose, upper_pose = [], []
     for _kf in other_kfs:
         lower_pose += [-r_bound] * 3 + [-t_bound] * 3
@@ -685,9 +662,8 @@ def _bundle_adjustment(
     bounds_lower = [1.0, 1.0] + lower_pose
     bounds_upper = [10.0 * image_size, 10.0 * image_size] + upper_pose
     if optimize_points and point_ids:
-        # 点坐标边界：不设硬限制（用 np.inf），避免 BA 因点坐标越界失败。
-        # 相机平移边界已约束尺度漂移（t_bound 基于场景尺度），
-        # 点坐标在 BA 中相对相机优化，无需单独限制（旧实现 ±1e6 同效）。
+        # 点坐标不设硬限制：相机平移边界已约束尺度漂移，点坐标在 BA 中
+        # 相对相机优化，无需单独限制（旧实现 ±1e6 同效）。
         bounds_lower += [-np.inf] * len(point_ids) * 3
         bounds_upper += [np.inf] * len(point_ids) * 3
 
@@ -716,14 +692,9 @@ def _bundle_adjustment(
             pt_cam = pose.R @ pt3d.reshape(3, 1) + pose.t
             depth = float(pt_cam[2, 0])
 
-            # ===== 修复: 深度惩罚随深度单调递增，防止点被推到相机后方 =====
-            # 旧实现: depth<=1e-8 时惩罚固定 1000（soft_l1 下约束弱），
-            # 且 depth<eps 用 -log(depth/eps)，导致深度越接近 0 惩罚反而骤降，
-            # 点可以被推到负深度（45% 点在相机后方的根因）。
-            # 新实现: 对 depth<=1e-6 施加随深度减小的强对数障碍，单调递增惩罚，
-            # 保证 BA 不会把点推到相机后方。
+            # 深度惩罚随深度单调递增，防止点被推到相机后方。
+            # depth<=1e-6 施加随深度减小的强对数障碍；eps 以下同样强对数障碍。
             if depth <= 1e-6:
-                # 深度为负或近零 -> 强惩罚（随深度减小单调递增）
                 barrier = -np.log(max(depth / 1e-6, 1e-10))
                 res.append(barrier)
                 res.append(barrier)
@@ -745,9 +716,8 @@ def _bundle_adjustment(
         return np.array(res, dtype=np.float64)
 
     try:
-        # ===== 使用更宽容的 f_scale =====
         f_scale = reproj_thresh * BA_F_SCALE_MULTIPLIER
-        # ===== 诊断: 检查初始猜测是否越界（定位越界参数） =====
+        # 诊断：检查初始猜测是否越界（定位越界参数）
         param_np = np.array(param, dtype=np.float64)
         lb = np.array(bounds_lower, dtype=np.float64)
         ub = np.array(bounds_upper, dtype=np.float64)
@@ -765,7 +735,7 @@ def _bundle_adjustment(
             bounds=(bounds_lower, bounds_upper),
             method='trf', loss='soft_l1', f_scale=f_scale,
             max_nfev=max_iter, verbose=0,
-            ftol=1e-4, xtol=1e-4, gtol=1e-4   # relaxed tolerance
+            ftol=1e-4, xtol=1e-4, gtol=1e-4
         )
         if result.success:
             focal_new = max(float(result.x[0]), 1.0)
@@ -803,31 +773,47 @@ def _compute_adaptive_eps(map_points, default_eps=0.01):
     return default_eps
 
 
-def _prune_map_points(map_points, feat_map, frame_to_points, reproj_thresh,
-                      frame_poses, focal, fy, cx, cy):
-    if not map_points:
-        return
-    to_remove = []
-    for idx, pt in enumerate(map_points):
-        pt['idx'] = idx
-        if pt.get('obs_count', 0) < MIN_OBSERVATIONS:
-            to_remove.append(idx)
-            continue
+# ---------- Point error statistics（prune 与 filter 共用） ----------
+def _compute_point_errors(map_points, frame_poses, focal, fy, cx, cy):
+    """遍历所有 map_point 的观测，计算每个点的重投影误差统计。
+
+    返回三个等长数组（索引与 map_points 一一对应）：
+        mean_err: float64，有效观测的平均重投影误差；
+                  xyz 非有限或无有效观测时为 inf。
+        valid_count: int32，有效观测数（位姿存在且 depth > 0）。
+        neg_ratio: float64，负深度观测占已评估观测的比例；
+                   xyz 非有限时记为 1.0（视为无效点）；
+                   total_obs=0 时记为 0。
+    """
+    N = len(map_points)
+    mean_err = np.full(N, np.inf, dtype=np.float64)
+    valid_count = np.zeros(N, dtype=np.int32)
+    neg_ratio = np.zeros(N, dtype=np.float64)
+    if N == 0:
+        return mean_err, valid_count, neg_ratio
+
+    for i, pt in enumerate(map_points):
         xyz = pt['xyz']
-        if not np.isfinite(xyz).all():
-            to_remove.append(idx)
+        if xyz.size != 3 or not np.isfinite(xyz).all():
+            neg_ratio[i] = 1.0
             continue
+
+        obs = pt.get('obs', [])
+        if not obs:
+            continue
+
+        xyz_col = xyz.reshape(3, 1)
         total_err = 0.0
         count = 0
         neg_depth = 0
         total_obs = 0
-        for f_idx, kp_idx, u_obs, v_obs in pt['obs']:
+        for f_idx, _, u_obs, v_obs in obs:
             pose = frame_poses[f_idx]
             if pose is None:
                 continue
-            pt_cam = pose.R @ xyz.reshape(3, 1) + pose.t
-            depth = float(pt_cam[2, 0])
             total_obs += 1
+            pt_cam = pose.R @ xyz_col + pose.t
+            depth = float(pt_cam[2, 0])
             if depth <= 0:
                 neg_depth += 1
                 continue
@@ -835,14 +821,42 @@ def _prune_map_points(map_points, feat_map, frame_to_points, reproj_thresh,
             y = float(pt_cam[1, 0]) / depth
             u_pred = focal * x + cx
             v_pred = fy * y + cy
-            err = np.sqrt((u_pred - u_obs)**2 + (v_pred - v_obs)**2)
-            total_err += err
+            total_err += np.sqrt((u_pred - u_obs) ** 2 + (v_pred - v_obs) ** 2)
             count += 1
-        # ===== 修复: 负深度为主的点直接修剪（相机后方的点无效） =====
-        if total_obs > 0 and neg_depth / total_obs >= 0.5:
+
+        valid_count[i] = count
+        if total_obs > 0:
+            neg_ratio[i] = neg_depth / total_obs
+        if count > 0:
+            mean_err[i] = total_err / count
+
+    return mean_err, valid_count, neg_ratio
+
+
+# ---------- Prune / Filter ----------
+def _prune_map_points(map_points, feat_map, frame_to_points, reproj_thresh,
+                      frame_poses, focal, fy, cx, cy):
+    if not map_points:
+        return
+
+    # 保持 idx 与列表位置一致（后续 feat_map 重映射依赖此不变量）
+    for idx, pt in enumerate(map_points):
+        pt['idx'] = idx
+
+    mean_err, valid_count, neg_ratio = _compute_point_errors(
+        map_points, frame_poses, focal, fy, cx, cy)
+
+    err_thresh = MAX_REPROJ_ERROR * reproj_thresh
+    to_remove = []
+    for idx, pt in enumerate(map_points):
+        if pt.get('obs_count', 0) < MIN_OBSERVATIONS:
             to_remove.append(idx)
             continue
-        if count > 0 and total_err / count > MAX_REPROJ_ERROR * reproj_thresh:
+        # xyz 非有限 → neg_ratio=1.0；负深度为主 → 直接修剪
+        if neg_ratio[idx] >= 0.5:
+            to_remove.append(idx)
+            continue
+        if valid_count[idx] > 0 and mean_err[idx] > err_thresh:
             to_remove.append(idx)
 
     if not to_remove:
@@ -881,44 +895,17 @@ def _filter_point_cloud(map_points, frame_poses, focal, fy, cx, cy, reproj_thres
     all_xyz = np.array([p['xyz'] for p in map_points])
     if all_xyz.size == 0:
         return all_xyz, np.array([])
-    errors = []
-    for pt in map_points:
-        xyz = pt['xyz']
-        obs = pt.get('obs', [])
-        if len(obs) < MIN_OBSERVATIONS:
-            errors.append(float('inf'))
-            continue
-        total_err = 0.0
-        count = 0
-        neg_depth = 0
-        total_obs = 0
-        for f_idx, _, u_obs, v_obs in obs:
-            pose = frame_poses[f_idx]
-            if pose is None:
-                continue
-            pt_cam = pose.R @ xyz.reshape(3, 1) + pose.t
-            depth = float(pt_cam[2, 0])
-            total_obs += 1
-            if depth <= 0:
-                neg_depth += 1
-                continue
-            x = float(pt_cam[0, 0]) / depth
-            y = float(pt_cam[1, 0]) / depth
-            u_pred = focal * x + cx
-            v_pred = fy * y + cy
-            err = np.sqrt((u_pred - u_obs)**2 + (v_pred - v_obs)**2)
-            total_err += err
-            count += 1
-        # ===== 修复: 负深度为主的点直接过滤（相机后方的点无效） =====
-        # 旧实现: 负深度观测被跳过不计入误差，点保留 —— 导致大量点在相机后方
-        if total_obs > 0 and neg_depth / total_obs >= 0.5:
-            errors.append(float('inf'))
-            continue
-        if count >= MIN_OBSERVATIONS:
-            errors.append(total_err / count)
-        else:
-            errors.append(float('inf'))
-    errors = np.array(errors)
+
+    mean_err, valid_count, neg_ratio = _compute_point_errors(
+        map_points, frame_poses, focal, fy, cx, cy)
+
+    # 有效观测数不足或负深度为主（含 xyz 非有限）→ 标为 inf
+    errors = np.where(
+        (valid_count >= MIN_OBSERVATIONS) & (neg_ratio < 0.5),
+        mean_err,
+        np.inf,
+    )
+
     finite = np.isfinite(errors)
     if not np.any(finite):
         mask = np.zeros(len(map_points), dtype=bool)

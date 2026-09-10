@@ -31,16 +31,16 @@
 - **智能采样**：均匀、光流驱动、两阶段（视差+光流+纹理）三种帧采样策略。
 - **自适应密度控制**：训练中自动分裂/复制/修剪高斯，支持显存预算控制。
 - **暗色主题 GUI**：基于 PySide6，实时损失曲线、帧预览、日志输出，可配置所有高级参数。
-- **断点续训**：保存完整训练状态（参数、优化器、密度控制器、焦距、畸变系数、最佳损失等），随时恢复。
+- **断点续训**：保存完整训练状态（参数、优化器、密度控制器、焦距、最佳损失等），随时恢复。
 
 ---
 
 ## 📦 安装
 
-### 环境要求
+### 环境要求（示例）
 
 - Python 3.11（推荐）
-- CUDA 12.1（可选，CPU 也可运行）
+- CUDA 12.1（可选，CPU 也可运行，如使用建议选择显卡最适合的CUDA）
 
 ### 步骤
 
@@ -51,7 +51,7 @@
    ```
 2. 安装 PyTorch
    
-   GPU 版本（CUDA 12.1）：
+   GPU 版本（此处示例使用CUDA 12.1，建议根据情况选择显卡最适合的CUDA版本）：
    ```bash
    pip install torch torchvision torchaudio --index-url https://download.pytorch.org/whl/cu121
    ```
@@ -109,7 +109,6 @@ python cli.py --video input.mp4 --output output.ply
 | `--ssim-weight-max` | SSIM 最大权重 | `0.2` |
 | `--random-background` | 训练时随机黑白背景 | `False` |
 | `--train-focal` | 训练中微调焦距 | `False` |
-| `--enable-k1` | 训练径向畸变系数 k1 | `False` |
 | `--amp` | 混合精度 fp16（需 CUDA + fp16 显卡，Ampere+ 可用 Tensor Core；光栅化器内部保持 fp32，无 Tensor Core 无收益） | `False` |
 | `--pose-estimator` | 姿态估计后端：opencv / colmap | `opencv` |
 | `--feature-type` | OpenCV 特征描述子：orb / sift（仅 opencv 后端生效） | `orb` |
@@ -151,7 +150,7 @@ python gui.py
 | `frames.py` | 视频帧提取，支持三种采样策略，光流采用 Farneback/LK |
 | `poses.py` | 纯 OpenCV 增量式 SfM（ORB/SIFT），含 BA（深度障碍 + 基于场景尺度的相机边界 + 三角化尺度归一化 + PnP 尺度锚定）和点云过滤 |
 | `colmap_poses.py` | COLMAP 封装，作为备选姿态估计后端 |
-| `point_cloud.py` | 从稀疏点云初始化高斯参数（SH 0–3），自适应离群点剔除 |
+| `point_cloud.py` | 从稀疏点云初始化高斯参数（SH 0–3），自适应离群点剔除；颜色采样与高斯构造分离，复用帧内存缓存 |
 | `gaussian.py` | 3DGS 核心：纯 PyTorch 光栅化器（排序式逐像素 splat 向量化，含梯度图连接保护）、LazyFrames 帧内存预加载、Trainer、密度控制、学习率调度 |
 | `exporter.py` | 导出标准 PLY 格式，兼容官方查看器 |
 | `gui.py` | PySide6 暗色主题图形界面，帧预览分页浏览（列数×行数随窗口宽高自适应，可查看全部帧） |
@@ -173,7 +172,7 @@ python gui.py
 
 **光栅化器向量化**：像素级合成采用**排序式逐像素 splat**——把逐高斯 Python 内层循环重写为「展平覆盖像素对 → stable sort → 分段透射率 → scatter_add 归约」的纯张量算子，消除每颗高斯的 kernel launch 与 GPU→CPU 同步。实测 180x320+4000 高斯 forward 加速 **14.5x**、forward+backward **37.7x**；2160x3840+38665 高斯单帧约 1.7s（原为分钟级）。输出与旧实现逐元素一致（误差 < 1e-6）。
 
-**光栅化器显存上界（分块）**：逐像素合成按深度有序高斯**分块**（每块至多 512 颗），块内覆盖网格只按块内最大包围盒物化——单颗大高斯（半径已 clamp 到 32）只撑大自己所在块，不再让全体陪跑。跨块透射率用**逐像素 log-transmittance 进位**（carry）累计，与整表算法在精确算术下等价（fp64 验证一致到 ~5e-13）。实测 256²、n=2000→4000 时峰值显存 **361→369MB 基本持平**（旧实现 1049→2099MB 翻倍）。附带收益：深堆叠像素上分块版比整表全局 cumsum 更准（整表大负数相减存在灾难性抵消，分块块内 cumsum 短）。
+**光栅化器显存上界（分块）**：逐像素合成按深度有序高斯**分块**（每块至多 512 颗），块内覆盖网格只按块内最大包围盒物化——单颗大高斯（半径已 clamp 到 16）只撑大自己所在块，不再让全体陪跑。跨块透射率用**逐像素 log-transmittance 进位**（carry）累计，与整表算法在精确算术下等价（fp64 验证一致到 ~5e-13）。实测 256²、n=2000→4000 时峰值显存 **361→369MB 基本持平**（旧实现 1049→2099MB 翻倍）。附带收益：深堆叠像素上分块版比整表全局 cumsum 更准（整表大负数相减存在灾难性抵消，分块块内 cumsum 短）。
 
 **混合精度（AMP）**：`--amp` 开启 fp16 混合精度，**仅 CUDA 生效**。cov3d 组合矩阵乘与 SSIM 卷积走 fp16（Ampere+ 可命中 Tensor Core），光栅化器内部保持 fp32（其 cumsum/scatter 不使用 Tensor Core，硬上 fp16 反而伤数值），配 GradScaler 动态损失缩放避免梯度下溢。无 Tensor Core 的显卡（如 GTX 10 系）开启无收益甚至略慢，**默认关闭**。
 
@@ -187,7 +186,6 @@ python gui.py
 
 **焦距自校准**：若启用 `--train-focal`，在训练中优化焦距参数（fx, fy），适应实际内参。
 
-**径向畸变**：实验性支持优化一阶径向畸变系数 k1（仅 `--enable-k1`）。
 
 ## 💾 断点续训
 
@@ -198,7 +196,7 @@ python gui.py
 | `frame_paths.txt` | 帧路径列表 |
 | `intrinsics.npy`、`poses.npy`、`sparse_points.npy` | 姿态和稀疏点云 |
 | `gaussian_params.npz` | 初始化后的高斯参数 |
-| `training_state.pt` | 完整训练状态（参数、优化器、密度控制器、焦距、k1、SH 阶数等） |
+| `training_state.pt` | 完整训练状态（参数、优化器、密度控制器、焦距、SH 阶数等） |
 | `best_training_state.pt` | 历史最优（最低 loss）训练状态，始终保留不覆盖 |
 
 **最佳检查点保护**：`best_training_state.pt` 始终保留训练过程中的最优模型，与常规检查点分开保存，不会因后续训练震荡而被覆盖。
@@ -226,7 +224,6 @@ python cli.py --video input.mp4 --resume-dir ./workdir --output restored.ply
 
 --random-background：能提升前景物体重建质量，但背景透明区域可能受干扰。
 
---enable-k1：仅当镜头畸变明显时开启，否则可能引入噪声。
 
 ## 📝 注意事项
 

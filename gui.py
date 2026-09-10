@@ -32,8 +32,6 @@ def set_affinity_to_all_cores():
     except Exception as e:
         print(f"[WARN] 无法设置 CPU 亲和性: {e}")
 
-os.environ["PYTORCH_CUDA_ALLOC_CONF"] = "expandable_segments:True"
-
 from PySide6.QtWidgets import (
     QApplication, QMainWindow, QWidget, QVBoxLayout, QHBoxLayout,
     QLabel, QPushButton, QLineEdit, QFileDialog, QProgressBar, QTextEdit,
@@ -46,7 +44,7 @@ from PySide6.QtGui import QPixmap, QImage, QFont, QColor, QPainter
 # ---------- Import simplified modules ----------
 from frames import extract_frames
 from poses import estimate_poses, CameraPose
-from point_cloud import initialize_gaussians, migrate_legacy_scales
+from point_cloud import initialize_gaussians, sample_point_colors, migrate_legacy_scales
 from gaussian import Gaussian3D, DifferentiableRasterizer, Trainer, LazyFrames, LossDivergenceError
 from exporter import export_training_checkpoint
 
@@ -901,12 +899,8 @@ class PipelineWorker(QThread):
                 pass
             _i = _I()
             _i.K = K
-            gauss_init = initialize_gaussians(
-                sparse_points=sparse_points,
-                poses=poses,
-                frame_paths=frame_paths,
-                intrinsics=_i,
-            )
+            colors, counts = sample_point_colors(sparse_points, poses, frames, _i)
+            gauss_init = initialize_gaussians(sparse_points, colors, counts)
             np.savez(workdir / "gaussian_params.npz", **gauss_init)
 
         num_gs = gauss_init["positions"].shape[0]
@@ -920,7 +914,6 @@ class PipelineWorker(QThread):
         gaussians = Gaussian3D()
         gaussians.initialize_from_dict(gauss_init, device=c["device"])
         rasterizer = DifferentiableRasterizer(image_width=w, image_height=h)
-
         trainer = Trainer(
             gaussians=gaussians,
             rasterizer=rasterizer,
@@ -935,7 +928,6 @@ class PipelineWorker(QThread):
             sh_warmup_steps=c["sh_warmup_steps"],
             ssim_warmup_steps=c["ssim_warmup_steps"],
             ssim_weight_max=c["ssim_weight_max"],
-            enable_k1=c["enable_k1"],
             use_amp=c.get("amp", False),
         )
 
@@ -1417,10 +1409,6 @@ class MainWindow(QMainWindow):
         self.train_focal_cb.setChecked(True)
         self.train_focal_cb.setStyleSheet(f"color: {C['text_primary']}; font-size: 11px; font-weight: 500;")
 
-        self.enable_k1_cb = QCheckBox("启用径向畸变校正 (k1)")
-        self.enable_k1_cb.setChecked(False)
-        self.enable_k1_cb.setStyleSheet(f"color: {C['text_primary']}; font-size: 11px; font-weight: 500;")
-
         self.amp_cb = QCheckBox("混合精度 (AMP / Tensor Core)")
         self.amp_cb.setChecked(False)
         self.amp_cb.setStyleSheet(f"color: {C['text_primary']}; font-size: 11px; font-weight: 500;")
@@ -1460,7 +1448,6 @@ class MainWindow(QMainWindow):
         form.addRow(StyledLabel("SSIM 最大权重:", font_size=11, color=C["text_secondary"]), self.ssim_weight_spin)
         form.addRow(StyledLabel("动态背景:", font_size=11, color=C["text_secondary"]), self.random_bg_cb)
         form.addRow(StyledLabel("焦距自校准:", font_size=11, color=C["text_secondary"]), self.train_focal_cb)
-        form.addRow(StyledLabel("径向畸变:", font_size=11, color=C["text_secondary"]), self.enable_k1_cb)
         form.addRow(StyledLabel("混合精度:", font_size=11, color=C["text_secondary"]), self.amp_cb)
         form.addRow(StyledLabel("计算设备:", font_size=11, color=C["text_secondary"]), self.device_combo)
         form.addRow(StyledLabel("姿态估算:", font_size=11, color=C["text_secondary"]), self.pose_estimator_combo)
@@ -1568,7 +1555,6 @@ class MainWindow(QMainWindow):
             "ssim_weight_max": self.ssim_weight_spin.value(),
             "random_background": self.random_bg_cb.isChecked(),
             "train_focal": self.train_focal_cb.isChecked(),
-            "enable_k1": self.enable_k1_cb.isChecked(),
             "amp": self.amp_cb.isChecked(),
             "device": device,
             "pose_estimator": pose_estimator,
@@ -1592,7 +1578,7 @@ class MainWindow(QMainWindow):
         self._log(f"💾  输出:      {config['output']}")
         self._log(f"🎯  采样模式:  {config['sampling_mode']}")
         self._log(f"⚙️   帧率:      {config['fps']} FPS")
-        self._log(f"📐  缩放比例:  {config['scale']}")
+        self._log(f"📐  缩放比例:  {config['scale']:.2f}")
         self._log(f"🎞️   帧数范围:  {config['min_frames']}–{config['max_frames']}")
         self._log(f"🔄  训练轮次:  {config['num_epochs']}")
         self._log(f"💻  计算设备:  {config['device']}")
@@ -1602,7 +1588,6 @@ class MainWindow(QMainWindow):
         self._log(f"📈 SSIM 升温: {config['ssim_warmup_steps']} 步")
         self._log(f"🎲 动态背景:  {'是' if config['random_background'] else '否'}")
         self._log(f"🔍 焦距自校准: {'是' if config['train_focal'] else '否'}")
-        self._log(f"🔮 径向畸变:  {'是' if config['enable_k1'] else '否'}")
         self._log(f"🗺️  姿态估算:  {config['pose_estimator']}")
 
         self.worker = PipelineWorker(config)

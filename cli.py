@@ -24,7 +24,7 @@ import torch
 
 from frames import extract_frames
 from poses import estimate_poses, CameraPose, CameraIntrinsics
-from point_cloud import initialize_gaussians, migrate_legacy_scales
+from point_cloud import initialize_gaussians, sample_point_colors, migrate_legacy_scales
 from gaussian import Gaussian3D, DifferentiableRasterizer, Trainer, LazyFrames, LossDivergenceError
 from exporter import export_training_checkpoint
 
@@ -84,8 +84,6 @@ def build_parser() -> argparse.ArgumentParser:
                         help="Randomly sample black/white background during training")
     parser.add_argument("--train-focal", action="store_true",
                         help="Learn focal length during training (self‑calibration)")
-    parser.add_argument("--enable-k1", action="store_true",
-                        help="Learn radial distortion coefficient k1 (experimental)")
     parser.add_argument("--amp", action="store_true",
                         help="Mixed precision (AMP / fp16) — requires CUDA GPU with fp16; "
                              "uses Tensor Cores on Ampere+. Rasterizer stays fp32. No effect on CPU.")
@@ -266,12 +264,8 @@ def run_pipeline(args: argparse.Namespace) -> None:
             pass
         _intr = _Intrinsics()
         _intr.K = K
-        gauss_init = initialize_gaussians(
-            sparse_points=sparse_points,
-            poses=poses,
-            frame_paths=frame_paths,
-            intrinsics=_intr,
-        )
+        colors, counts = sample_point_colors(sparse_points, poses, frames, _intr)
+        gauss_init = initialize_gaussians(sparse_points, colors, counts)
         np.savez(gauss_init_file, **gauss_init)
 
     print(f"  Initialized {gauss_init['positions'].shape[0]} Gaussians ({time.time()-t0:.1f}s)")
@@ -287,8 +281,6 @@ def run_pipeline(args: argparse.Namespace) -> None:
         print(f"  Random background: enabled")
     if args.train_focal:
         print(f"  Train focal: enabled")
-    if args.enable_k1:
-        print(f"  Train k1: enabled")
 
     gaussians = Gaussian3D()
     gaussians.initialize_from_dict(gauss_init, device=device)
@@ -308,7 +300,6 @@ def run_pipeline(args: argparse.Namespace) -> None:
         sh_warmup_steps=args.sh_warmup_steps,
         ssim_warmup_steps=args.ssim_warmup_steps,
         ssim_weight_max=args.ssim_weight_max,
-        enable_k1=args.enable_k1,
         use_amp=args.amp,
     )
 
