@@ -27,7 +27,7 @@
 纯 Python + PyTorch 实现的视频转 3D 高斯溅射（3DGS）完整工作流。输入一段视频，输出一个 `.ply` 文件，可用官方 3DGS 查看器（https://github.com/graphdeco-inria/gaussian-splatting ）浏览重建的三维场景。
 
 - **纯 PyTorch 光栅化器**：完全基于 PyTorch 实现，无需编译 CUDA 扩展，支持 SH 0–3 阶球谐函数，排序式逐像素 splat 向量化（大幅加速），开箱即用。
-- **鲁棒姿态估计**：内置 ORB/SIFT 增量式 SfM（无 COLMAP 依赖），也可选用 COLMAP 作为后端。
+- **鲁棒姿态估计**：内置 ORB/SIFT 增量式 SfM（无 COLMAP 依赖），BA 带自适应鲁棒加权与多重保护；也可选用 COLMAP 作为后端。
 - **智能采样**：均匀、光流驱动、两阶段（视差+光流+纹理）三种帧采样策略。
 - **自适应密度控制**：训练中自动分裂/复制/修剪高斯，支持显存预算控制。
 - **暗色主题 GUI**：基于 PySide6，实时损失曲线、帧预览、日志输出，可配置所有高级参数。
@@ -40,7 +40,7 @@
 ### 环境要求（示例）
 
 - Python 3.11（推荐）
-- CUDA 12.1（可选，CPU 也可运行，如使用建议选择显卡最适合的CUDA）
+- CUDA 12.1（可选，CPU 也可运行，如使用建议选择显卡最适合的 CUDA）
 
 ### 步骤
 
@@ -49,47 +49,44 @@
    conda create -n gs python=3.11
    conda activate gs
    ```
-2. 安装 PyTorch
-   
-   GPU 版本（此处示例使用CUDA 12.1，建议根据情况选择显卡最适合的CUDA版本）：
+2. **安装 PyTorch**
+
+   GPU 版本（此处示例使用 CUDA 12.1，建议根据情况选择显卡最适合的 CUDA 版本）：
    ```bash
    pip install torch torchvision torchaudio --index-url https://download.pytorch.org/whl/cu121
    ```
-   
+
    CPU 版本：
    ```bash
    pip install torch torchvision torchaudio --index-url https://download.pytorch.org/whl/cpu
    ```
-   
-3. 安装 OpenCV（headless）
+3. **安装 OpenCV（headless）**
    ```bash
    pip install opencv-python-headless
    ```
    必须使用 headless 版本，避免与 PySide6 的 Qt 库冲突。
-   
-4. 安装其他依赖
+4. **安装其他依赖**
    ```bash
    pip install numpy scipy PySide6 matplotlib psutil>=5.9.0
    ```
-5. （可选）COLMAP 后端
-   
+5. **（可选）COLMAP 后端**
+
    需自行安装 COLMAP（https://github.com/colmap/colmap ）。`colmap_poses.py` 查找顺序：项目内 `colmap-x64-windows-nocuda/bin/colmap.exe`（若有）→ 系统 PATH 中的 `colmap`。安装后将 colmap 加入 PATH 即可使用 `--pose-estimator colmap`。
-   
-6. 克隆本仓库
+6. **克隆本仓库**
    ```bash
    git clone https://github.com/Chi-Blaze-B/3D-Gaussian-Splatting-Reconstruction
    ```
 
 ## 🚀 使用方式
 
-1. 命令行接口（CLI）
+### 1. 命令行接口（CLI）
 
 基本用法：
 ```bash
 python cli.py --video input.mp4 --output output.ply
 ```
 
-常用参数表：
+#### 常用参数表
 
 | 参数 | 说明 | 默认值 |
 |------|------|--------|
@@ -116,17 +113,24 @@ python cli.py --video input.mp4 --output output.ply
 | `--resume-dir` | 从该工作目录恢复训练 | `None` |
 | `--eval-every` | 每 N 轮打印一次日志 | `500` |
 
-示例：
+#### 示例
+
 ```bash
+# 基础用法
+python cli.py --video input.mp4 --output out.ply
+
 # 智能采样 + SH3 + 焦距自校准
 python cli.py --video input.mp4 --output out.ply --sampling-mode smart --sh-degree 3 --train-focal
 
 # 两阶段采样 + COLMAP + 完整功能
 python cli.py --video input.mp4 --output out.ply --sampling-mode two-stage --pose-estimator colmap \
     --sh-degree 3 --random-background --train-focal --max-gaussians 500000
+
+# 短序列 + SIFT 特征
+python cli.py --video input.mp4 --output out.ply --feature-type sift --sh-degree 3
 ```
 
-2. 图形界面（GUI）
+### 2. 图形界面（GUI）
 
 启动 GUI：
 ```bash
@@ -148,13 +152,32 @@ python gui.py
 | 模块 | 功能 |
 |------|------|
 | `frames.py` | 视频帧提取，支持三种采样策略，光流采用 Farneback/LK |
-| `poses.py` | 纯 OpenCV 增量式 SfM（ORB/SIFT），含 BA（深度障碍 + 基于场景尺度的相机边界 + 三角化尺度归一化 + PnP 尺度锚定）和点云过滤 |
+| `poses.py` | 纯 OpenCV 增量式 SfM（ORB/SIFT），带自适应鲁棒 BA 与多重防护，点云过滤 |
 | `colmap_poses.py` | COLMAP 封装，作为备选姿态估计后端 |
 | `point_cloud.py` | 从稀疏点云初始化高斯参数（SH 0–3），自适应离群点剔除；颜色采样与高斯构造分离，复用帧内存缓存 |
 | `gaussian.py` | 3DGS 核心：纯 PyTorch 光栅化器（排序式逐像素 splat 向量化，含梯度图连接保护）、LazyFrames 帧内存预加载、Trainer、密度控制、学习率调度 |
 | `exporter.py` | 导出标准 PLY 格式，兼容官方查看器 |
 | `gui.py` | PySide6 暗色主题图形界面，帧预览分页浏览（列数×行数随窗口宽高自适应，可查看全部帧） |
 | `cli.py` | 命令行入口，集成完整流程 |
+
+## 🎯 姿态估计后端选择
+
+三种后端，按你的场景选择：
+
+| 后端 | 命令 | 适用场景 |
+|------|------|----------|
+| OpenCV + ORB（默认） | `--pose-estimator opencv --feature-type orb` | 纹理丰富的常规场景，速度最快 |
+| OpenCV + SIFT | `--pose-estimator opencv --feature-type sift` | 纹理不足或短序列，更稳健但慢 3~5 倍 |
+| COLMAP（推荐长序列） | `--pose-estimator colmap` | 长序列（≥60 帧），工业级 SfM，注册率与点云质量更高 |
+
+**推荐准则**：
+
+- **短序列（<60 帧）**：用 OpenCV 后端。纹理丰富用 ORB，纹理不足换 SIFT。
+- **长序列（≥60 帧）**：优先用 COLMAP。实测 60 帧视频 COLMAP 注册 54/60、27329 点；自研 OpenCV 后端注册率偏低。
+- **想要零依赖、纯 Python**：OpenCV 后端。ORB 覆盖大部分场景，SIFT 作为备选。
+- **不确定用哪个**：先用默认（OpenCV + ORB）跑一遍，结果不满意再换后端对比。
+
+**OpenCV 后端的内部机制**（了解即可）：前端用 ORB/SIFT 特征 + 本质矩阵恢复运动，后端 BA 用自适应鲁棒加权（自动识别并降权异常观测），并有多重保护机制处理视频质量波动、初值异常、过拟合等情况。这些都在内部自动完成，无需手动配置。
 
 ## 📈 训练细节
 
@@ -186,7 +209,6 @@ python gui.py
 
 **焦距自校准**：若启用 `--train-focal`，在训练中优化焦距参数（fx, fy），适应实际内参。
 
-
 ## 💾 断点续训
 
 所有中间结果和训练状态保存在 `--workdir` 指定目录下：
@@ -214,35 +236,42 @@ python cli.py --video input.mp4 --resume-dir ./workdir --output restored.ply
 **SH 颜色约定**：已对齐官方 3DGS——DC 系数存 `(RGB-0.5)/C0`、求值补 `+0.5`、视角方向用世界系；导出的 `.ply` 可直接被官方查看器 / SuperSplat 加载。旧检查点的 SH 系数与新约定不兼容（预发布，加载处有注释）。
 
 ## ⚙️ 高级参数调优建议
---sampling-mode two-stage：适用于快速运动或视角变化剧烈的视频，能更好保留细节。
 
---sh-degree 3：获得最强的视角相关效果，但训练时间略增。
+**采样模式**
 
---max-gaussians：根据显存设置，推荐 300k~500k（8GB 显存可尝试 300k，24GB 可到 1M）。
+- `--sampling-mode two-stage`：适用于快速运动或视角变化剧烈的视频，能更好保留细节。
 
---train-focal：若视频本身运动估计不准，开启此选项可改善几何一致性。
+**训练**
 
---random-background：能提升前景物体重建质量，但背景透明区域可能受干扰。
+- `--sh-degree 3`：获得最强的视角相关效果，但训练时间略增。
+- `--max-gaussians`：根据显存设置，推荐 300k~500k（8GB 显存可尝试 300k，24GB 可到 1M）。
+- `--train-focal`：若视频本身运动估计不准，开启此选项可改善几何一致性。
+- `--random-background`：能提升前景物体重建质量，但背景透明区域可能受干扰。
 
+**姿态估计**
+
+- `--feature-type orb`（默认）：快，纹理丰富场景足够。
+- `--feature-type sift`：低纹理 / 短序列更稳健，速度慢 3~5 倍。
+- `--pose-estimator colmap`：长序列推荐。
 
 ## 📝 注意事项
 
-帧采样数量：通常 100~200 帧效果较好，过少会导致欠约束，过多增加训练时间。
-
-姿态估计：**长序列（≥60 帧）建议用 `--pose-estimator colmap`**——COLMAP 是工业级 SfM，实测点云质量与帧注册率远高于自研 ORB+EM（30 帧可见性 86.9% vs 37.5%）。COLMAP 默认用调优最优配置（`max_image_size=2400`、`sift_max_num_features=12000`、exhaustive matcher），60 帧实测 54/60 注册、27329 点。自研 ORB+EM 适合短序列（<60 帧），已修复 BA 深度障碍与尺度漂移问题。注意：COLMAP 对视频长序列的注册率低是 mapper 固有行为（只注册可稳定三角化的帧），但注册帧点云质量高，足以初始化高斯。mapper 可能把场景拆成多个子模型，程序会自动选择注册图像数最多的模型（修复：不再硬编码选模型 0）。对短序列或纹理不足场景，OpenCV 后端可换 `--feature-type sift`（SIFT 浮点描述子用 L2 距离匹配，比 ORB 更稳健但更慢）。
-
-显存管理：如果训练中显存溢出，程序会自动修剪高斯并降低上限，并保存检查点。
-
-CPU 亲和性：启动时会自动绑定所有逻辑核心，提升多核利用效率（通过 psutil）。
-
-光栅化器：本项目使用纯 PyTorch 实现的光栅化器（排序式逐像素 splat 向量化，分块显存上界），无需编译任何 CUDA 扩展，开箱即用。
-
-GPU 精度：`--amp` 混合精度仅对 Ampere+（RTX 30 系及以上）有 Tensor Core 收益；无 Tensor Core 的显卡（GTX 10 系等）请保持默认纯 FP32。
+- **帧采样数量**：通常 100~200 帧效果较好，过少会导致欠约束，过多增加训练时间。
+- **姿态估计后端**：
+  - 长序列（≥60 帧）优先用 `--pose-estimator colmap`。COLMAP 对视频长序列的注册率低是其 mapper 的固有行为（只注册可稳定三角化的帧），但注册帧点云质量高，足以初始化高斯。mapper 可能把场景拆成多个子模型，程序会自动选择注册图像数最多的模型。
+  - 短序列（<60 帧）用 OpenCV 后端即可。默认 ORB 覆盖大部分场景；纹理不足或想更稳健可换 `--feature-type sift`。
+  - 自研 OpenCV 后端已处理常见的 BA 深度异常、尺度漂移、焦距漂移、少观测过拟合等问题，无需手动干预。
+- **显存管理**：如果训练中显存溢出，程序会自动修剪高斯并降低上限，并保存检查点。
+- **CPU 亲和性**：启动时会自动绑定所有逻辑核心，提升多核利用效率（通过 psutil）。
+- **光栅化器**：本项目使用纯 PyTorch 实现的光栅化器（排序式逐像素 splat 向量化，分块显存上界），无需编译任何 CUDA 扩展，开箱即用。
+- **GPU 精度**：`--amp` 混合精度仅对 Ampere+（RTX 30 系及以上）有 Tensor Core 收益；无 Tensor Core 的显卡（GTX 10 系等）请保持默认纯 FP32。
 
 ## 📄 许可证
+
 本项目采用 Apache-2.0 许可证，欢迎自由使用和修改。
 
 ## 🙏 致谢
+
 3D Gaussian Splatting 原始论文和开源代码。
 
 OpenCV、PyTorch、SciPy、PySide6 等优秀开源库。
