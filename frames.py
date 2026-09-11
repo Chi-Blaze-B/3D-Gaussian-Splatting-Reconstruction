@@ -1,23 +1,10 @@
 """
 从视频中提取帧，支持三种策略：
 
-- 均匀采样（默认）：等间隔抽取目标数量的帧。对缓慢移动的手机视频最稳定，
-  可复现，无失败模式。
-- 单阶段智能采样：用清晰度和帧间变化做门控，剔除几乎无特征（白墙、模糊）
-  或几乎无变化（相机静止）的帧。
-- 两阶段智能采样：在单阶段门控基础上，用粗位姿的视差做加权，让视角覆盖好、
-  基线足够的帧占更大比例。
+- 均匀采样（默认）：等间隔抽取目标数量的帧。
+- 单阶段智能采样：用清晰度和帧间变化做门控。
+- 两阶段智能采样：单阶段门控 + 粗位姿视差加权。
 
-核心设计：门控与加权分离
-    门控是硬剔除，剔除不适合参与姿态估计的帧；加权是软分配，对通过门控的帧
-    按视差等信号分配帧数。若门控过严（通过帧数低于 min_frames），回退到均匀
-    采样，避免返回过少帧导致 SfM 无法工作。
-
-光流在本项目中的作用是门控，而非加权。手机视频中 EIS 数字防抖和自动曝光
-会污染光流幅度，使其不适合作为"信息量"的度量；但光流可以可靠地识别"帧间
-几乎无变化"的帧（相机静止、场景无运动），用于剔除。
-
-确定性：所有采样与分配均不使用随机数，同一视频每次运行得到相同帧集合。
 """
 
 import os
@@ -47,13 +34,25 @@ FARNEBACK_PARAMS = {
 # 每次打分的最大采样帧数，控制打分阶段耗时上界
 MAX_SCORE_SAMPLES = 100
 
-# 门控分位数：剔除分数最低的对应比例
-SHARPNESS_QUANTILE = 0.15   # 清晰度最低的 15%
-FLOW_QUANTILE = 0.15        # 帧间变化最低的 15%
+# 打分时的缩放后短边长度，保证不同视频之间分数尺度可比
+SCORE_MAX_SIDE = 480
 
-# 门控绝对下限（防止整个视频都很平淡时分位数失去意义）
-SHARPNESS_ABS_MIN = 20.0    # 拉普拉斯方差下限
-FLOW_ABS_MIN = 0.15         # 每帧平均光流幅度下限（像素）
+# 门控分位数：剔除分数最低的对应比例
+SHARPNESS_QUANTILE = 0.05
+FLOW_QUANTILE = 0.05
+
+# 门控相对下限：阈值不低于中位数的对应比例。
+# 用相对下限代替固定绝对下限，避免固定常数在不同尺度/纹理的视频上失效
+# （例如 4K 手机视频拉普拉斯方差中位数可能只有 3~5，固定阈值 20 会误杀 97% 帧）。
+SHARPNESS_MEDIAN_RATIO = 0.08
+FLOW_MEDIAN_RATIO = 0.08
+
+# 时间覆盖兜底：每个时间分箱至少保留 min_per_bin 个通过帧
+TIME_COVERAGE_BINS = 20
+TIME_COVERAGE_MIN_PER_BIN = 12
+
+# 最终选择的时间分层段数。各段均分名额，避免低权重段被完全跳过。
+SELECT_BINS = 20
 
 # 两阶段粗提取帧数
 COARSE_FRAMES = 40
@@ -84,7 +83,7 @@ def extract_frames(
         min_frames, max_frames: 最终帧数上下界。
         smart_sampling: 是否启用单阶段智能采样（门控）。
         two_stage: 是否启用两阶段智能采样（粗位姿 + 视差加权）。
-        poses_output_dir: 粗位姿中间产物输出目录（两阶段用，None 时使用临时目录）。
+        poses_output_dir: 预留参数（当前未使用，仅为 API 兼容）。
         optical_flow_method: 'farneback' 或 'lk'。
         feature_type: 'orb' 或 'sift'，用于两阶段粗位姿估计。
 
@@ -94,7 +93,7 @@ def extract_frames(
     if two_stage:
         return _two_stage_extract(
             video_path, output_dir, fps, scale,
-            min_frames, max_frames, poses_output_dir,
+            min_frames, max_frames,
             optical_flow_method, feature_type,
         )
     if smart_sampling:
@@ -145,7 +144,7 @@ def _smart_extract(
     max_frames: int,
     flow_method: str,
 ) -> List[str]:
-    """单阶段智能采样：清晰度 + 光流门控，通过门控的帧均匀分配。"""
+    """单阶段智能采样：清晰度 + 光流门控，通过门控的帧按时间分层选择。"""
     cap = cv2.VideoCapture(video_path)
     if not cap.isOpened():
         raise FileNotFoundError(f"无法打开视频: {video_path}")
@@ -183,19 +182,20 @@ def _smart_extract_from_cap(
     1. 在约 MAX_SCORE_SAMPLES 个采样帧上计算清晰度和光流。
     2. 插值扩展到每一帧。
     3. 门控：剔除清晰度或光流低于阈值的帧。
-    4. 通过门控的帧按均匀权重，确定性选择最终帧。
-    5. 若通过帧数低于 min_frames，回退到均匀采样。
+    4. 时间覆盖兜底：每个时间分箱至少保留少量帧。
+    5. 时间分层选择：每段均分名额，段内按权重确定性选择。
+    6. 若通过帧数低于 min_frames，回退到均匀采样。
     """
     sample_indices = _make_sample_indices(total)
-    sample_step = _sample_step(total)
     sharpness, flow = _compute_gating_scores(
-        cap, sample_indices, sample_step, flow_method,
+        cap, sample_indices, flow_method,
     )
     sharp_full = _interp_to_full(sample_indices, sharpness, total)
     flow_full = _interp_to_full(sample_indices, flow, total)
 
     num_frames = _target_frame_count(total, orig_fps, fps, min_frames, max_frames)
     valid = _gating_mask(sharp_full, flow_full)
+    valid = _enforce_time_coverage(valid, sharp_full, flow_full, total)
     n_valid = int(valid.sum())
 
     if n_valid < min_frames:
@@ -204,7 +204,8 @@ def _smart_extract_from_cap(
     else:
         target = min(num_frames, n_valid)
         weights = valid.astype(np.float64)
-        indices = _deterministic_select(weights, target)
+        # 单阶段没有视差，权重全为 1，但依然走时间分层，保证时间均匀
+        indices = _stratified_select(weights, valid, target, n_bins=SELECT_BINS)
 
     os.makedirs(output_dir, exist_ok=True)
     paths, _ = _extract_indices(cap, indices, output_dir, w, h)
@@ -219,7 +220,6 @@ def _two_stage_extract(
     scale: float,
     min_frames: int,
     max_frames: int,
-    poses_output_dir: Optional[str],
     flow_method: str,
     feature_type: str,
 ) -> List[str]:
@@ -227,7 +227,7 @@ def _two_stage_extract(
 
     阶段 1：均匀抽取 COARSE_FRAMES 帧，估计粗略相机位姿。
     阶段 2：在全部帧上计算清晰度、光流、视差；清晰度 + 光流门控，
-            视差加权，确定性选择最终帧。若粗位姿估计失败，回退到单阶段。
+            视差加权，时间分层选择最终帧。若粗位姿估计失败，回退到单阶段。
     """
     from poses import estimate_poses  # 延迟导入，避免无两阶段需求时的依赖
 
@@ -244,8 +244,6 @@ def _two_stage_extract(
     )
 
     coarse_dir = tempfile.mkdtemp(prefix="coarse_")
-    pose_dir = poses_output_dir or tempfile.mkdtemp(prefix="poses_coarse_")
-    os.makedirs(pose_dir, exist_ok=True)
 
     try:
         # ---------- 阶段 1：粗提取 + 粗位姿 ----------
@@ -269,11 +267,10 @@ def _two_stage_extract(
                 min_frames, max_frames, w, h, flow_method,
             )
 
-        # ---------- 阶段 2：打分 + 门控 + 视差加权 ----------
+        # ---------- 阶段 2：打分 + 门控 + 视差加权 + 分层选择 ----------
         sample_indices = _make_sample_indices(total)
-        sample_step = _sample_step(total)
         sharpness, flow = _compute_gating_scores(
-            cap, sample_indices, sample_step, flow_method,
+            cap, sample_indices, flow_method,
         )
         sharp_full = _interp_to_full(sample_indices, sharpness, total)
         flow_full = _interp_to_full(sample_indices, flow, total)
@@ -281,17 +278,19 @@ def _two_stage_extract(
 
         num_frames = _target_frame_count(total, orig_fps, fps, min_frames, max_frames)
         valid = _gating_mask(sharp_full, flow_full)
+        valid = _enforce_time_coverage(valid, sharp_full, flow_full, total)
         n_valid = int(valid.sum())
 
         if n_valid < min_frames:
             indices = np.linspace(0, total - 1, num_frames, dtype=int)
         else:
-            weights = parallax_full * valid
+            # 视差加权：白墙等低视差帧保留基础权重，占比低但不会被完全跳过。
+            # 时间分层选择再保证每段都有名额。
+            weights = (0.3 + 0.7 * parallax_full) * valid
             if weights.sum() <= 1e-9:
-                # 视差全为零（位姿退化）：退化为均匀分配
                 weights = valid.astype(np.float64)
             target = min(num_frames, n_valid)
-            indices = _deterministic_select(weights, target)
+            indices = _stratified_select(weights, valid, target, n_bins=SELECT_BINS)
 
         os.makedirs(output_dir, exist_ok=True)
         paths, _ = _extract_indices(cap, indices, output_dir, w, h)
@@ -299,22 +298,93 @@ def _two_stage_extract(
     finally:
         cap.release()
         shutil.rmtree(coarse_dir, ignore_errors=True)
-        if poses_output_dir is None:
-            shutil.rmtree(pose_dir, ignore_errors=True)
+
+
+# ---------- 时间分层选择 ----------
+def _stratified_select(
+    weights: np.ndarray,
+    valid: np.ndarray,
+    num_frames: int,
+    n_bins: int = SELECT_BINS,
+) -> np.ndarray:
+    """按时间分层选择帧。
+
+    把时间轴均分为 n_bins 段，名额尽量平均分配到每段（每段约 num_frames/n_bins）。
+    段内按 weights 确定性选择。这样可以保证即使某段权重很低（白墙、静止），
+    也能分到一定名额，不会被全局按权重选择时完全跳过。
+
+    参数：
+        weights: 长度等于总帧数的权重数组。非有效帧权重会被强制置 0。
+        valid: 长度等于总帧数的布尔掩码，标出可选的帧。
+        num_frames: 目标选择帧数。
+        n_bins: 时间分层段数。若超过 num_frames 会被夹到 num_frames，
+                避免出现某些段无名额。
+
+    返回：
+        排序后的选中帧索引数组。
+    """
+    n = len(weights)
+    if n == 0 or num_frames <= 0:
+        return np.array([], dtype=int)
+    num_frames = min(num_frames, int(valid.sum()))
+    if num_frames <= 0:
+        return np.array([], dtype=int)
+
+    # 段数不能超过目标帧数，否则每段名额不足，会有大量空段
+    n_bins = max(1, min(n_bins, num_frames))
+
+    edges = np.linspace(0, n, n_bins + 1, dtype=int)
+    per_bin = num_frames // n_bins
+    extra = num_frames % n_bins
+
+    selected: List[int] = []
+    for b in range(n_bins):
+        lo, hi = int(edges[b]), int(edges[b + 1])
+        if hi <= lo:
+            continue
+        k = per_bin + (1 if b < extra else 0)
+        k = min(k, hi - lo)
+        if k <= 0:
+            continue
+
+        seg_valid = valid[lo:hi]
+        if not seg_valid.any():
+            # 该段没有有效帧，跳过（真的没有可用素材）
+            continue
+
+        seg_w = weights[lo:hi].copy()
+        seg_w[~seg_valid] = 0.0
+
+        if seg_w.sum() <= 1e-9:
+            # 段内权重全 0 但存在有效帧：段内均匀取 k 个
+            valid_local = np.where(seg_valid)[0]
+            take = min(k, len(valid_local))
+            idx_local = np.linspace(0, len(valid_local) - 1, take).astype(int)
+            seg_indices = valid_local[idx_local]
+        else:
+            seg_indices = _deterministic_select(seg_w, k)
+
+        selected.extend((seg_indices + lo).tolist())
+
+    return np.asarray(sorted(set(selected)), dtype=int)
 
 
 # ---------- 打分：清晰度 + 光流 ----------
 def _compute_gating_scores(
     cap: cv2.VideoCapture,
     indices: np.ndarray,
-    sample_step: int,
     flow_method: str,
+    score_max_side: int = SCORE_MAX_SIDE,
 ) -> Tuple[np.ndarray, np.ndarray]:
     """一次遍历同时计算每个采样帧的清晰度和光流分数。
 
     清晰度：拉普拉斯方差。反映图像是否模糊以及是否几乎无内容（白墙）。
     光流：与前一采样帧的平均位移幅度，再除以采样间隔得到"每帧光流"。
           反映帧间是否有真实变化，用于剔除相机静止或重复帧。
+
+    注意：打分前先把帧缩放到短边 score_max_side（默认 480）。原始分辨率
+    差异巨大（如 4K vs 720p）时，拉普拉斯方差与光流幅度会被分辨率主导，
+    导致阈值不可比；统一缩放后分数尺度稳定，相对阈值才有意义。
 
     返回：
         sharpness: 长度等于 indices 的清晰度数组
@@ -337,6 +407,16 @@ def _compute_gating_scores(
             prev_gray = None
             prev_idx = None
             continue
+
+        # 缩放到统一短边，保证不同视频之间的分数尺度可比
+        h0, w0 = bgr.shape[:2]
+        s = score_max_side / max(h0, w0)
+        if s < 1.0:
+            bgr = cv2.resize(
+                bgr,
+                (max(2, int(w0 * s)), max(2, int(h0 * s))),
+                interpolation=cv2.INTER_AREA,
+            )
         gray = cv2.cvtColor(bgr, cv2.COLOR_BGR2GRAY)
 
         # 清晰度：拉普拉斯方差
@@ -366,12 +446,53 @@ def _compute_gating_scores(
 def _gating_mask(sharp_full: np.ndarray, flow_full: np.ndarray) -> np.ndarray:
     """根据清晰度和光流计算门控掩码。
 
-    阈值 = max(绝对下限, 分位数)。绝对下限防止视频整体平淡时分位数失去意义；
-    分位数让阈值自适应视频自身的分数分布。
+    阈值 = max(分位数, 中位数 × 比例)。
+
+    原来的实现用固定绝对下限（如 sharpness>=20、flow>=0.15），在低纹理
+    或低分辨率视频上会把绝大多数帧误杀，导致通过门控的帧高度集中。
+    改用中位数比例后，阈值随视频自身的分数尺度自适应，鲁棒性显著提升。
     """
-    sharp_thresh = max(SHARPNESS_ABS_MIN, float(np.quantile(sharp_full, SHARPNESS_QUANTILE)))
-    flow_thresh = max(FLOW_ABS_MIN, float(np.quantile(flow_full, FLOW_QUANTILE)))
+    sharp_q = float(np.quantile(sharp_full, SHARPNESS_QUANTILE))
+    flow_q = float(np.quantile(flow_full, FLOW_QUANTILE))
+    sharp_med = float(np.median(sharp_full))
+    flow_med = float(np.median(flow_full))
+
+    sharp_thresh = max(sharp_q, SHARPNESS_MEDIAN_RATIO * sharp_med)
+    flow_thresh = max(flow_q, FLOW_MEDIAN_RATIO * flow_med)
     return (sharp_full >= sharp_thresh) & (flow_full >= flow_thresh)
+
+
+def _enforce_time_coverage(
+    valid: np.ndarray,
+    sharp_full: np.ndarray,
+    flow_full: np.ndarray,
+    total: int,
+    n_bins: int = TIME_COVERAGE_BINS,
+    min_per_bin: int = TIME_COVERAGE_MIN_PER_BIN,
+) -> np.ndarray:
+    """时间覆盖兜底：每个时间分箱至少保留 min_per_bin 个通过帧。
+
+    即使门控阈值合理，若视频某一段整体平淡（相机静止、纹理少），那一段可能
+    没有帧通过门控，最终选帧仍会挤在其他段，造成视角/时间分布不均。这里对
+    分箱内通过帧不足的段，按 清晰度 × 光流 的乘积补足若干帧。
+
+    返回新的布尔掩码，不修改入参。
+    """
+    valid = valid.copy()
+    if total <= 0:
+        return valid
+    edges = np.linspace(0, total, n_bins + 1, dtype=int)
+    for b in range(n_bins):
+        lo, hi = int(edges[b]), int(edges[b + 1])
+        if hi <= lo:
+            continue
+        if int(valid[lo:hi].sum()) >= min_per_bin:
+            continue
+        seg_score = sharp_full[lo:hi] * flow_full[lo:hi]
+        k = min(min_per_bin, hi - lo)
+        top = np.argsort(seg_score)[-k:] + lo
+        valid[top] = True
+    return valid
 
 
 def _lk_flow_magnitude(prev: np.ndarray, curr: np.ndarray) -> float:
@@ -477,7 +598,7 @@ def _gaussian_smooth(scores: np.ndarray, sigma: float = 2.0) -> np.ndarray:
 
 
 def _deterministic_select(weights: np.ndarray, num_frames: int) -> np.ndarray:
-    """按权重确定性选择 num_frames 个下标。
+    """按权重确定性选择 num_frames 个下标（段内使用）。
 
     使用分层采样：把累积分布 [0,1] 均分为 num_frames 段，每段取中点反查对应
     下标。不使用随机数，同一输入每次得到相同结果，便于复现。
