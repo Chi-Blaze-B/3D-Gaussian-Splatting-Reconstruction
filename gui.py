@@ -44,7 +44,7 @@ from PySide6.QtGui import QPixmap, QImage, QFont, QColor, QPainter
 # ---------- Import simplified modules ----------
 from frames import extract_frames
 from poses import estimate_poses, CameraPose
-from point_cloud import initialize_gaussians, sample_point_colors, migrate_legacy_scales
+from point_cloud import initialize_gaussians, sample_point_colors
 from gaussian import Gaussian3D, DifferentiableRasterizer, Trainer, LazyFrames, LossDivergenceError
 from exporter import export_training_checkpoint
 
@@ -890,9 +890,7 @@ class PipelineWorker(QThread):
 
         if has_gaussians:
             params = dict(np.load(workdir / "gaussian_params.npz"))
-            # 2026-08: 旧缓存把 log 尺度存在 "scales"（双重取 log bug），迁移为线性供 initialize 正确取 log
-            gauss_init = migrate_legacy_scales(params)
-            gauss_init = {k: gauss_init[k] for k in ["positions", "scales", "opacities", "sh_coeffs", "rotations"]}
+            gauss_init = {k: params[k] for k in["positions", "scales", "opacities", "sh_coeffs", "rotations", "scale_domain"]}
             self._log(f"  已加载 {params['positions'].shape[0]} 个高斯（跳过初始化）")
         else:
             class _I:
