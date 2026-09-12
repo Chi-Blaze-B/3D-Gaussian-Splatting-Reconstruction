@@ -2,8 +2,8 @@
 #
 # 说明：
 #   · PyTorch 必须按 CUDA 版本单独安装（勿在本文件指定，见 README「安装」节）：
-#       GPU:  pip install torch torchvision torchaudio --index-url https://download.pytorch.org/whl/cu121
-#       CPU:  pip install torch torchvision torchaudio --index-url https://download.pytorch.org/whl/cpu
+#       GPU:  pip install torch --index-url https://download.pytorch.org/whl/cu121
+#       CPU:  pip install torch --index-url https://download.pytorch.org/whl/cpu
 #   · OpenCV 必须用 headless 版本（避免与 PySide6 的 Qt 冲突）。
 #   · COLMAP（可选，--pose-estimator colmap）需用户自行安装并加入 PATH（见 README）。
 

@@ -53,12 +53,12 @@
 
    GPU 版本（此处示例使用 CUDA 12.1，建议根据情况选择显卡最适合的 CUDA 版本）：
    ```bash
-   pip install torch torchvision torchaudio --index-url https://download.pytorch.org/whl/cu121
+   pip install torch --index-url https://download.pytorch.org/whl/cu121
    ```
 
    CPU 版本：
    ```bash
-   pip install torch torchvision torchaudio --index-url https://download.pytorch.org/whl/cpu
+   pip install torch --index-url https://download.pytorch.org/whl/cpu
    ```
 3. **安装 OpenCV（headless）**
    ```bash
