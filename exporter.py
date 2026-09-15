@@ -1,17 +1,21 @@
 """
-PLY export utilities for 3D Gaussian Splatting.
+3D Gaussian Splatting 的 PLY 导出工具。
 
-Writes Gaussian parameters to a .ply file compatible with the official
-3DGS viewer (https://github.com/graphdeco-inria/gaussian-splatting).
+将高斯参数写入与官方 3DGS 查看器兼容的 .ply 文件
+（https://github.com/graphdeco-inria/gaussian-splatting）。
 
-修复(2026-08): 字段名与数值约定完全对齐官方 save_ply ——
+字段名与数值约定完全对齐官方 save_ply：
   x y z nx ny nz f_dc_0..2 f_rest_0..44 opacity scale_0..2 rot_0..3
   nx/ny/nz = 0（法线未用）；scale 存 log σ；opacity 存 logit（未过 sigmoid）；
   SH 存原始系数（通道 0 已是 (RGB-0.5)/C0，求值方补 +0.5）；rot 存 (w,x,y,z)。
 """
 
-import numpy as np
+import logging
 from typing import Optional
+
+import numpy as np
+
+logger = logging.getLogger(__name__)
 
 
 def write_ply(
@@ -24,25 +28,25 @@ def write_ply(
     *,
     sh_degree: int = 0,
 ) -> None:
-    """Write Gaussian Splatting PLY file in official 3DGS convention.
+    """按官方 3DGS 约定写出高斯 PLY 文件。
 
-    Parameters
+    参数
     ----------
-    output_path : str — destination .ply file path.
-    positions : (N, 3) float32 — XYZ coordinates.
-    scales : (N,), (N, 1) or (N, 3) float32 — RAW log σ（不要传 exp 后的线性尺度）。
-    opacities : (N,) float32 — RAW logit（不要传 sigmoid 后的概率）。
+    output_path : str — 目标 .ply 文件路径。
+    positions : (N, 3) float32 — XYZ 坐标。
+    scales : (N,), (N, 1) 或 (N, 3) float32 — 原始 log σ（不要传 exp 后的线性尺度）。
+    opacities : (N,) float32 — 原始 logit（不要传 sigmoid 后的概率）。
     rotations : (N, 4) float32 — 四元数 (w, x, y, z)。
     sh_coeffs : (N, num_bases, 3) float32 — 原始 SH 系数（通道 0 已按 (RGB-0.5)/C0）。
-    sh_degree : int — 最大 SH 阶数；决定写入多少 f_rest 字段（(deg+1)²-1）×3。
+    sh_degree : int — 最大 SH 阶数；决定写入多少 f_rest 字段（((deg+1)²-1)×3）。
     """
     N = positions.shape[0]
 
-    # --- Normalize SH coefficients shape ---
+    # 归一化 SH 系数形状
     if sh_coeffs.ndim == 2:
         sh_coeffs = sh_coeffs[:, np.newaxis, :]  # (N, 1, 3)
 
-    # 按 sh_degree 截断/补齐：声明阶数与实际字段一致（--sh-degree 0 → 无 f_rest 字段）
+    # 按 sh_degree 截断/补齐，保证声明阶数与实际字段一致（--sh-degree 0 → 无 f_rest 字段）
     target_bases = (sh_degree + 1) ** 2
     current_bases = sh_coeffs.shape[1]
     if current_bases < target_bases:
@@ -51,7 +55,7 @@ def write_ply(
     elif current_bases > target_bases:
         sh_coeffs = sh_coeffs[:, :target_bases, :]
 
-    # --- Normalize scales (RAW log σ, [N,3]) ---
+    # 归一化尺度（原始 log σ，[N,3]）
     if scales.ndim == 1:
         scales = np.stack([scales, scales, scales], axis=1)
     elif scales.shape[1] == 1:
@@ -64,7 +68,7 @@ def write_ply(
     n_rest = rest_cm.shape[1] * rest_cm.shape[2]
     rest_flat = rest_cm.reshape(N, n_rest)
 
-    # --- Build PLY header ---
+    # PLY 头
     header_lines = [
         "ply",
         "format binary_little_endian 1.0",
@@ -107,7 +111,7 @@ def write_ply(
 
     data = np.zeros(N, dtype=dtype_fields)
 
-    # Positions
+    # 位置
     data["x"] = positions[:, 0].astype(np.float32)
     data["y"] = positions[:, 1].astype(np.float32)
     data["z"] = positions[:, 2].astype(np.float32)
@@ -121,13 +125,13 @@ def write_ply(
     for i in range(n_rest):
         data[f"f_rest_{i}"] = rest_flat[:, i].astype(np.float32)
 
-    # Opacity（原始 logit）
+    # 透明度（原始 logit）
     data["opacity"] = opacities.astype(np.float32)
-    # Scales（原始 log σ）
+    # 尺度（原始 log σ）
     data["scale_0"] = scales[:, 0].astype(np.float32)
     data["scale_1"] = scales[:, 1].astype(np.float32)
     data["scale_2"] = scales[:, 2].astype(np.float32)
-    # Rotations（w,x,y,z → 官方 rot_0..3 = w,x,y,z）
+    # 旋转（w,x,y,z → 官方 rot_0..3 = w,x,y,z）
     data["rot_0"] = rotations[:, 0].astype(np.float32)
     data["rot_1"] = rotations[:, 1].astype(np.float32)
     data["rot_2"] = rotations[:, 2].astype(np.float32)
@@ -138,7 +142,7 @@ def write_ply(
         f.write(header_text.encode("ascii"))
         f.write(data.tobytes())
 
-    print(f"Wrote {N} Gaussians to {output_path}")
+    logger.info("已写出 %d 个高斯到 %s", N, output_path)
 
 
 def export_training_checkpoint(
@@ -146,16 +150,12 @@ def export_training_checkpoint(
     output_path: str,
     sh_degree: Optional[int] = None,
 ) -> None:
-    """Export the current training state as a PLY file.
+    """把当前训练状态导出为 PLY。
 
-    sh_degree: if None, uses trainer.sh_degree (default 3).
+    sh_degree 为 None 时使用 trainer.sh_degree（默认 3）。
     """
     if sh_degree is None:
-        sh_degree = getattr(trainer, 'sh_degree', 3)
-    assert isinstance(sh_degree, int)  # 恒真：上面已把 None 解析为 trainer.sh_degree（int）
-    deg: int = sh_degree
-    # 2026-08: 改用 Gaussian3D.export_ply_dict() 取原始参数（旧 get_parameters 已删，
-    #   它返回 exp/sigmoid 后的值会破坏官方 PLY 约定）
+        sh_degree = getattr(trainer, "sh_degree", 3)
     p = trainer.gaussians.export_ply_dict()
     write_ply(
         output_path,
@@ -164,5 +164,5 @@ def export_training_checkpoint(
         opacities=p["opacities"],
         rotations=p["rotations"],
         sh_coeffs=p["sh_coeffs"],
-        sh_degree=deg,
+        sh_degree=sh_degree,
     )

@@ -1,9 +1,10 @@
 """
-视频转 3D 高斯溅射 — PySide6 图形界面
+视频转 3D 高斯泼溅 — PySide6 图形界面
 
 设计语言：深邃蓝灰背景 + 明亮青蓝强调色 + 清晰层次
 """
 
+import logging
 import os
 import sys
 import time
@@ -22,15 +23,27 @@ import matplotlib.pyplot as plt
 
 import psutil
 
-def set_affinity_to_all_cores():
-    """将当前进程绑定到所有逻辑核心"""
+logger = logging.getLogger(__name__)
+
+
+def setup_logging() -> None:
+    logging.basicConfig(
+        level=logging.INFO,
+        format="%(asctime)s [%(levelname)s] %(message)s",
+        datefmt="%H:%M:%S",
+    )
+
+
+def set_affinity_to_all_cores() -> None:
+    """将当前进程绑定到所有逻辑核心。"""
     try:
         p = psutil.Process(os.getpid())
         all_cpus = list(range(psutil.cpu_count()))
         p.cpu_affinity(all_cpus)
-        print(f"[INFO] CPU 亲和性设置为 {len(all_cpus)} 个核心")
+        logger.info("CPU 亲和性设置为 %d 个核心", len(all_cpus))
     except Exception as e:
-        print(f"[WARN] 无法设置 CPU 亲和性: {e}")
+        logger.warning("无法设置 CPU 亲和性: %s", e)
+
 
 from PySide6.QtWidgets import (
     QApplication, QMainWindow, QWidget, QVBoxLayout, QHBoxLayout,
@@ -41,7 +54,7 @@ from PySide6.QtWidgets import (
 from PySide6.QtCore import Qt, QThread, Signal, QPoint, QPropertyAnimation, QTimer
 from PySide6.QtGui import QPixmap, QImage, QFont, QColor, QPainter
 
-# ---------- Import simplified modules ----------
+# ---------- 导入简化后的模块 ----------
 from frames import extract_frames
 from poses import estimate_poses, CameraPose
 from point_cloud import initialize_gaussians, sample_point_colors
@@ -99,7 +112,7 @@ def input_fg():
 
 
 # ============================================================================
-# 自定义控件 (保持原有风格，未大幅改动)
+# 自定义控件
 # ============================================================================
 
 class RoundedCard(QFrame):
@@ -190,7 +203,6 @@ class StyledSpinBox(QWidget):
         widest = lo_txt if len(lo_txt) > len(hi_txt) else hi_txt
         fm = self._edit.fontMetrics()
         text_w = fm.horizontalAdvance(widest)
-        # 12px 字号下约每字符 7px；留边距 + 边框 + 内边距约 22px
         self._edit.setFixedWidth(max(int(text_w + 22), 56))
 
     def _increment(self):
@@ -577,7 +589,7 @@ class PreviewImage(QLabel):
 
 
 # ============================================================================
-# 损失曲线控件
+# 损失曲线页
 # ============================================================================
 
 class LossCurvePage(QWidget):
@@ -772,14 +784,14 @@ class PipelineWorker(QThread):
         frame_dir = workdir / "frames"
         poses_dir = workdir / "poses"
 
-        # Check for resume
+        # 检查断点续训条件
         has_frames = (workdir / "frame_paths.txt").exists() and frame_dir.exists() and any(frame_dir.iterdir())
         has_poses = (workdir / "intrinsics.npy").exists() and (workdir / "sparse_points.npy").exists()
         has_gaussians = (workdir / "gaussian_params.npz").exists()
         has_training_state = (workdir / "training_state.pt").exists()
         can_resume = has_frames and has_poses and has_gaussians
 
-        # ---------- Step 1: Extract Frames ----------
+        # ---------- 步骤 1：提取帧 ----------
         self._log("[1/5] 正在提取视频帧...")
         self._set_progress(0, "正在提取视频帧...")
 
@@ -806,7 +818,7 @@ class PipelineWorker(QThread):
             (workdir / "frame_paths.txt").write_text("\n".join(frame_paths))
             self._log(f"  已提取 {len(frame_paths)} 帧")
 
-        # 两种路径（新提取 / 从已有 workdir 加载）都通知 GUI 刷新帧预览
+        # 两条路径（新提取 / 从已有 workdir 加载）都通知 GUI 刷新帧预览
         self.frame_paths_signal.emit(frame_paths)
 
         self._set_progress(10, f"{len(frame_paths)} 帧就绪")
@@ -814,9 +826,9 @@ class PipelineWorker(QThread):
         h, w = frames[0].shape[:2]
         self._log(f"  分辨率: {w}x{h}")
 
-        # ---------- Step 2: Estimate Poses ----------
-        self._log("\n[2/5] 正在估算相机姿态...")
-        self._set_progress(20, "正在估算相机姿态...")
+        # ---------- 步骤 2：估计相机位姿 ----------
+        self._log("\n[2/5] 正在估算相机位姿...")
+        self._set_progress(20, "正在估算相机位姿...")
 
         if has_poses:
             K = np.load(workdir / "intrinsics.npy")
@@ -824,35 +836,35 @@ class PipelineWorker(QThread):
             sparse_points = np.load(workdir / "sparse_points.npy")
             poses = []
             if poses_data.shape[0] == len(frame_paths):
-                # 新格式（2026-08 修复）：定长 [n,4,4]，NaN 行 = 该帧位姿缺失 → 按索引对齐
+                # 定长 [n,4,4]，NaN 行 = 该帧位姿缺失，按索引对齐
                 for p in poses_data:
                     if np.isnan(p).any():
                         poses.append(None)
                     else:
                         poses.append(CameraPose(R=p[:3, :3].copy(), t=p[:3, 3].copy()))
             else:
-                # 旧格式（gap 压缩）：顺序读 + 末尾补 None —— 中段缺失帧对齐不可恢复
+                # 旧格式：顺序读 + 末尾补 None，中段缺失帧对齐不可恢复
                 for p in poses_data:
                     poses.append(CameraPose(R=p[:3, :3].copy(), t=p[:3, 3].copy()))
                 while len(poses) < len(frame_paths):
                     poses.append(None)
-            self._log(f"  已加载 {len(poses)} 个姿态（跳过估算）")
+            self._log(f"  已加载 {len(poses)} 个位姿（跳过估算）")
         else:
             if c["pose_estimator"] == "colmap":
                 try:
                     from colmap_poses import estimate_poses_with_colmap
-                    self._log("  使用 COLMAP 进行姿态估算...")
+                    self._log("  使用 COLMAP 进行位姿估算...")
                     intrinsics, poses, sparse_points = estimate_poses_with_colmap(
                         frame_paths, str(workdir)
                     )
                     K = intrinsics.K
                 except (ImportError, RuntimeError) as e:
                     self._log(f"  [ERROR] COLMAP 失败: {e}")
-                    self.finished_signal.emit(False, f"COLMAP failed: {e}")
+                    self.finished_signal.emit(False, f"COLMAP 失败: {e}")
                     return
             else:
                 feature_type = c.get("feature_type", "orb")
-                self._log(f"  使用 {'SIFT' if feature_type == 'sift' else 'OpenCV'} 进行姿态估算...")
+                self._log(f"  使用 {'SIFT+EM' if feature_type == 'sift' else 'ORB+E+EM'} 进行位姿估算...")
                 intrinsics, poses, sparse_points = estimate_poses(
                     frame_paths,
                     min_inliers=25,
@@ -863,7 +875,7 @@ class PipelineWorker(QThread):
                 K = intrinsics.K
 
             np.save(workdir / "intrinsics.npy", K)
-            # 定长数组 + NaN 掩码（修复 2026-08：旧 gap 压缩丢失帧↔位姿对齐）
+            # 定长数组 + NaN 掩码，保证帧↔位姿索引对齐
             poses_arr = np.full((len(poses), 4, 4), np.nan, dtype=np.float32)
             for i, p in enumerate(poses):
                 if p is not None:
@@ -872,25 +884,25 @@ class PipelineWorker(QThread):
             if sparse_points is not None and sparse_points.size > 0:
                 np.save(workdir / "sparse_points.npy", sparse_points)
 
-        # Ensure poses list length matches frames
+        # 确保 poses 数量与帧数一致
         while len(poses) < len(frame_paths):
             poses.append(None)
         valid_count = sum(1 for p in poses if p is not None)
-        self._log(f"  {valid_count} 个有效姿态 (共 {len(frame_paths)} 帧)")
-        self._set_progress(30, "姿态估算完成")
+        self._log(f"  {valid_count} 个有效位姿 (共 {len(frame_paths)} 帧)")
+        self._set_progress(30, "位姿估算完成")
 
         if valid_count < 3:
-            self._log("  错误: 有效姿态太少，请检查视频质量")
-            self.finished_signal.emit(False, "Too few valid poses")
+            self._log("  错误: 有效位姿太少，请检查视频质量")
+            self.finished_signal.emit(False, "有效位姿过少")
             return
 
-        # ---------- Step 3: Initialize Gaussians ----------
+        # ---------- 步骤 3：初始化高斯 ----------
         self._log("\n[3/5] 正在初始化3D高斯...")
         self._set_progress(35, "正在初始化高斯...")
 
         if has_gaussians:
             params = dict(np.load(workdir / "gaussian_params.npz"))
-            gauss_init = {k: params[k] for k in["positions", "scales", "opacities", "sh_coeffs", "rotations", "scale_domain"]}
+            gauss_init = {k: params[k] for k in ["positions", "scales", "opacities", "sh_coeffs", "rotations", "scale_domain"]}
             self._log(f"  已加载 {params['positions'].shape[0]} 个高斯（跳过初始化）")
         else:
             class _I:
@@ -905,7 +917,7 @@ class PipelineWorker(QThread):
         self._log(f"  共 {num_gs} 个高斯")
         self._set_progress(40, f"{num_gs} 个高斯就绪")
 
-        # ---------- Step 4: Training ----------
+        # ---------- 步骤 4：训练 ----------
         self._log(f"\n[4/5] 正在训练 ({c['device']}，{c['num_epochs']} 轮)...")
         self._set_progress(45, "正在训练...")
 
@@ -936,14 +948,14 @@ class PipelineWorker(QThread):
         best_loss = float("inf")
         training_start = time.time()
 
-        # Resume if possible
+        # 如可续训则恢复
         if can_resume and has_training_state:
             try:
                 trainer.load_training_state(pt_ckpt, device=c["device"])
                 saved = trainer.current_step
                 n_valid = sum(1 for p in poses if p is not None)
-                # 帧级断点（2026-08 修复）：current_step 只统计"有效位姿帧" → 用有效帧数算 epoch，
-                #   用检查点里的 last_frame_index 精确续帧（不再重跑半轮、不再按帧总数取模漂移）。
+                # current_step 仅统计有效位姿帧，故 epoch 由有效帧数推算，
+                # 帧级续训用 last_frame_index，避免重跑半轮或按帧总数取模漂移
                 resumed_epoch = max(1, saved // max(n_valid, 1) + 1)
                 start_frame = (trainer.last_frame_index + 1) if (n_valid > 0 and saved % n_valid != 0) else 0
                 self._log(f"  已恢复训练状态: {saved} 帧已训练，从第 {resumed_epoch} 轮继续"
@@ -952,7 +964,7 @@ class PipelineWorker(QThread):
             except Exception as e:
                 self._log(f"  [WARN] 加载检查点失败: {e}，从头开始")
 
-        # ========== 训练主循环（修复版） ==========
+        # ========== 训练主循环 ==========
         try:
             for epoch in range(start_epoch, c["num_epochs"] + 1):
                 # 检查停止标志（外层）
@@ -978,7 +990,7 @@ class PipelineWorker(QThread):
                         progress_callback=_prog,
                         loss_threshold=1.0,
                         checkpoint_path=pt_ckpt,
-                        start_frame=start_frame,   # 2026-08: 恢复时从中断帧续（之后各轮跑全量）
+                        start_frame=start_frame,   # 续训时从中断帧开始，之后各轮全量
                     )
                     start_frame = 0
                 except LossDivergenceError as e:
@@ -987,24 +999,22 @@ class PipelineWorker(QThread):
                     self.finished_signal.emit(False, "损失发散")
                     return
                 except KeyboardInterrupt:
-                    # ===== 修复: 捕获停止信号 =====
                     self._log("\n  [STOP] 训练已中断，正在保存检查点...")
                     trainer.save_training_state(pt_ckpt)
                     self.finished_signal.emit(False, "已取消")
                     return
                 except torch.cuda.OutOfMemoryError:
-                    # ===== 修复: OOM 处理 =====
                     self._log(f"\n  [OOM] CUDA 显存不足")
                     self._log("  尝试降低高斯上限并修剪...")
                     new_max = max(100000, trainer.adaptive_density.max_gaussians // 2)
                     trainer.adaptive_density.max_gaussians = new_max
-                    # 调整修剪阈值
+                    # 提高透明度阈值，优先剪掉低不透明度高斯
                     trainer.adaptive_density.min_opacity = 0.05
                     n_pruned = trainer.adaptive_density.prune()
                     self._log(f"  已修剪 {n_pruned} 个高斯，新上限 {new_max}")
                     trainer.save_training_state(pt_ckpt)
 
-                    # 重新执行当前 epoch（从头开始）
+                    # 重新执行当前轮次（从头开始）
                     self._log("  重新开始当前轮次训练...")
                     try:
                         avg_loss = trainer.train_epoch(
@@ -1032,13 +1042,13 @@ class PipelineWorker(QThread):
 
                 if avg_loss < best_loss:
                     best_loss = avg_loss
-                    trainer.save_training_state(str(workdir / "best_training_state.pt"))  # 2026-08: GUI 也写最佳检查点（对齐 CLI）
+                    # 同时写最佳检查点（与 CLI 行为一致）
+                    trainer.save_training_state(str(workdir / "best_training_state.pt"))
 
                 pct = 45 + int((epoch - start_epoch + 1) / max(1, c["num_epochs"] - start_epoch + 1) * 50)
                 self._set_progress(min(pct, 95), f"训练轮次 {epoch}/{c['num_epochs']}")
 
         except KeyboardInterrupt:
-            # 外层防护（理论上不会触发，但保留）
             self._log("\n  [STOP] 用户中断（外层），保存检查点...")
             trainer.save_training_state(pt_ckpt)
             self.finished_signal.emit(False, "已取消")
@@ -1052,7 +1062,7 @@ class PipelineWorker(QThread):
         self._log(f"\n  训练完成。最佳损失: {best_loss:.6f}")
         self._set_progress(95, "训练完成")
 
-        # ---------- Step 5: Export ----------
+        # ---------- 步骤 5：导出 ----------
         self._log("\n[5/5] 正在导出 PLY...")
         self._set_progress(98, "正在导出...")
 
@@ -1071,13 +1081,13 @@ class MainWindow(QMainWindow):
     def __init__(self):
         super().__init__()
         self.worker = None
-        self.setWindowTitle("3D 高斯溅射重建")
+        self.setWindowTitle("3D 高斯泼溅重建")
         self.resize(1300, 820)
         self._preview_paths = []          # 全部帧路径
         self._preview_page = 0            # 当前页码（从 0 开始）
         self._preview_per_page = 24       # 每页缩略图数量（自适应列数 × 自适应行数）
         self._preview_cols = 3            # 当前列数（随窗口宽度自适应）
-        self._preview_rows = 8            # 当前行数（随窗口高度自适应，默认 3×8=24）
+        self._preview_rows = 8            # 当前行数（随窗口高度自适应）
         self._resize_timer = None         # 延迟重排定时器
         self._build_ui()
         self._apply_theme()
@@ -1089,7 +1099,7 @@ class MainWindow(QMainWindow):
         main_layout.setSpacing(0)
         main_layout.setContentsMargins(0, 0, 0, 0)
 
-        # ---- Sidebar ----
+        # ---- 侧边栏 ----
         sidebar = RoundedCard()
         sidebar.setFixedWidth(410)
         sidebar.setStyleSheet(f"background-color: {C['bg_sidebar']}; border-right: 1px solid {C['border']}; border-radius: 0;")
@@ -1098,7 +1108,7 @@ class MainWindow(QMainWindow):
         sidebar_layout.setContentsMargins(0, 0, 0, 0)
         sidebar_layout.setSpacing(0)
 
-        # Header
+        # 顶部标题区
         header_widget = QWidget()
         header_layout = QVBoxLayout(header_widget)
         header_layout.setContentsMargins(20, 20, 20, 0)
@@ -1106,7 +1116,7 @@ class MainWindow(QMainWindow):
 
         self.title_label = StyledLabel("3D Gaussian Splatting", font_size=18, bold=True, color=C["title"])
         header_layout.addWidget(self.title_label)
-        header_layout.addWidget(StyledLabel("3D高斯溅射点云重建", font_size=11, color=C["text_secondary"]))
+        header_layout.addWidget(StyledLabel("3D高斯泼溅点云重建", font_size=11, color=C["text_secondary"]))
 
         sr = QHBoxLayout()
         self.status_dot = StatusDot("idle")
@@ -1122,7 +1132,7 @@ class MainWindow(QMainWindow):
         header_layout.addWidget(sep_top)
         sidebar_layout.addWidget(header_widget)
 
-        # Scrollable params
+        # 可滚动的参数区
         scroll = QScrollArea()
         scroll.setWidgetResizable(True)
         scroll.setFrameShape(QFrame.NoFrame)
@@ -1181,13 +1191,13 @@ class MainWindow(QMainWindow):
         sidebar_layout.addWidget(scroll)
         main_layout.addWidget(sidebar)
 
-        # ---- Right panel ----
+        # ---- 右侧面板 ----
         ma = QWidget()
         rl = QVBoxLayout(ma)
         rl.setContentsMargins(0, 0, 0, 0)
         rl.setSpacing(0)
 
-        # Tabs
+        # 标签栏
         tab_bar = QWidget()
         tbl = QHBoxLayout(tab_bar)
         tbl.setContentsMargins(20, 12, 20, 0)
@@ -1237,7 +1247,7 @@ class MainWindow(QMainWindow):
         self.stacked = QStackedWidget()
         self.stacked.setStyleSheet("background-color: transparent; border: none;")
 
-        # Preview tab
+        # 帧预览页
         preview_page = QWidget()
         ppl = QVBoxLayout(preview_page)
         ppl.setContentsMargins(20, 16, 20, 16)
@@ -1257,7 +1267,7 @@ class MainWindow(QMainWindow):
         self.thumb_scroll.setWidget(self.thumb_inner)
         ppl.addWidget(self.thumb_scroll)
 
-        # Pagination controls
+        # 分页控件
         pager = QHBoxLayout()
         pager.setSpacing(12)
         pager.setAlignment(Qt.AlignCenter)
@@ -1279,7 +1289,7 @@ class MainWindow(QMainWindow):
         ppl.addLayout(pager)
         self.stacked.addWidget(preview_page)
 
-        # Log tab
+        # 日志页
         log_page = QWidget()
         ll = QVBoxLayout(log_page)
         ll.setContentsMargins(20, 16, 20, 16)
@@ -1288,7 +1298,7 @@ class MainWindow(QMainWindow):
         ll.addWidget(self.log_viewer)
         self.stacked.addWidget(log_page)
 
-        # Loss curve tab
+        # 损失曲线页
         self.loss_curve_page = LossCurvePage()
         self.stacked.addWidget(self.loss_curve_page)
 
@@ -1342,7 +1352,7 @@ class MainWindow(QMainWindow):
         form.setFormAlignment(Qt.AlignLeft)
         form.setContentsMargins(0, 0, 0, 0)
 
-        # Sampling mode
+        # 采样模式
         self.sampling_combo = StyledComboBox()
         self.sampling_combo.addItems(["均匀采样", "智能采样", "两阶段采样"])
         self.sampling_combo.setCurrentIndex(0)
@@ -1379,7 +1389,7 @@ class MainWindow(QMainWindow):
         self.max_gaussians_spin.setValue(300000)
         self.max_gaussians_spin.setSingleStep(50000)
 
-        # SH
+        # SH 阶数
         self.sh_degree_combo = StyledComboBox()
         self.sh_degree_combo.addItems(["0 — 仅漫反射", "1 — 基础高光", "2 — 增强高光", "3 — 完整视角相关"])
         self.sh_degree_combo.setCurrentIndex(3)
@@ -1413,7 +1423,7 @@ class MainWindow(QMainWindow):
         self.amp_cb.setToolTip("混合精度 fp16（需 CUDA + fp16 显卡，Ampere+ 可用 Tensor Core）。"
                                "光栅化器内部保持 fp32；无 Tensor Core 的低端卡无收益，请保持关闭。")
 
-        # Device & estimator
+        # 设备与位姿估计后端
         self.device_combo = StyledComboBox()
         if torch.cuda.is_available():
             self.device_combo.addItems(["自动", "CPU", "CUDA张量加速"])
@@ -1428,8 +1438,8 @@ class MainWindow(QMainWindow):
         # 特征描述子仅 OpenCV 后端适用；切到 COLMAP 时整行隐藏
         self.feature_type_label = StyledLabel("特征描述子:", font_size=11, color=C["text_secondary"])
         self.feature_type_combo = StyledComboBox()
-        self.feature_type_combo.addItems(["ORB+EM+EM", "SIFT"])
-        self.feature_type_combo.setToolTip("特征描述子：ORB+EM（本质矩阵）+EM（期望最大化） 快速（二进制/Hamming）；SIFT 更稳健但较慢（浮点/L2）。")
+        self.feature_type_combo.addItems(["ORB+E+EM", "SIFT+EM"])
+        self.feature_type_combo.setToolTip("特征描述子：ORB+E（本质矩阵）+ EM（期望最大化算法）快速（二进制/Hamming）；SIFT+EM（期望最大化算法） 更稳健但较慢（浮点/L2）。")
         self.pose_estimator_combo.currentTextChanged.connect(self._on_pose_estimator_changed)
 
         form.addRow(StyledLabel("采样模式:", font_size=11, color=C["text_secondary"]), self.sampling_combo)
@@ -1448,7 +1458,7 @@ class MainWindow(QMainWindow):
         form.addRow(StyledLabel("焦距自校准:", font_size=11, color=C["text_secondary"]), self.train_focal_cb)
         form.addRow(StyledLabel("混合精度:", font_size=11, color=C["text_secondary"]), self.amp_cb)
         form.addRow(StyledLabel("计算设备:", font_size=11, color=C["text_secondary"]), self.device_combo)
-        form.addRow(StyledLabel("姿态估算:", font_size=11, color=C["text_secondary"]), self.pose_estimator_combo)
+        form.addRow(StyledLabel("位姿估算:", font_size=11, color=C["text_secondary"]), self.pose_estimator_combo)
         form.addRow(self.feature_type_label, self.feature_type_combo)
 
         cl.addLayout(form)
@@ -1518,20 +1528,20 @@ class MainWindow(QMainWindow):
             QMessageBox.warning(self, "提示", "请指定输出文件名。")
             return
 
-        # Map sampling mode
+        # 采样模式映射
         mode_map = {"均匀采样": "uniform", "智能采样": "smart", "两阶段采样": "two-stage"}
         sampling_mode = mode_map.get(self.sampling_combo.currentText(), "uniform")
 
-        # Map SH degree
+        # SH 阶数映射
         sh_text = self.sh_degree_combo.currentText()
         sh_degree = int(sh_text[0]) if sh_text else 0
 
-        # Map device
+        # 设备映射
         device = self._device_map.get(self.device_combo.currentText(), "auto")
         if device == "auto":
             device = "cuda" if torch.cuda.is_available() else "cpu"
 
-        # Map pose estimator
+        # 位姿估计后端映射
         pose_estimator = "colmap" if self.pose_estimator_combo.currentIndex() == 1 else "opencv"
         feature_type = "sift" if self.feature_type_combo.currentIndex() == 1 else "orb"
 
@@ -1570,7 +1580,7 @@ class MainWindow(QMainWindow):
         self.log_viewer.clear()
 
         self._log("━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━")
-        self._log("  3D 高斯溅射重建 启动")
+        self._log("  3D 高斯泼溅重建 启动")
         self._log("━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━")
         self._log(f"📹  视频:      {config['video']}")
         self._log(f"💾  输出:      {config['output']}")
@@ -1586,7 +1596,7 @@ class MainWindow(QMainWindow):
         self._log(f"📈 SSIM 升温: {config['ssim_warmup_steps']} 步")
         self._log(f"🎲 动态背景:  {'是' if config['random_background'] else '否'}")
         self._log(f"🔍 焦距自校准: {'是' if config['train_focal'] else '否'}")
-        self._log(f"🗺️  姿态估算:  {config['pose_estimator']}")
+        self._log(f"🗺️  位姿估算:  {config['pose_estimator']}")
 
         self.worker = PipelineWorker(config)
         self.worker.log_signal.connect(self._append_log)
@@ -1732,7 +1742,7 @@ class MainWindow(QMainWindow):
             except Exception:
                 pass
 
-        # Update pagination controls
+        # 更新分页控件
         self.prev_page_btn.setEnabled(self._preview_page > 0)
         self.next_page_btn.setEnabled(self._preview_page < total_pages - 1)
         if n > 0:
@@ -1780,10 +1790,11 @@ class MainWindow(QMainWindow):
 
 
 # ============================================================================
-# Entry point
+# 入口
 # ============================================================================
 
 def main():
+    setup_logging()
     set_affinity_to_all_cores()
     app = QApplication(sys.argv)
     app.setStyle("Fusion")

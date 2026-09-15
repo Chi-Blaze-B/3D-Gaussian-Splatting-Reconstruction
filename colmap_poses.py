@@ -1,19 +1,14 @@
 """
-COLMAP-based pose estimation for 3D Gaussian Splatting (optimized).
+基于 COLMAP 的位姿估计，用于 3D Gaussian Splatting（优化版）。
 
-Wraps COLMAP CLI to run feature extraction, matching, and mapping,
-then parses the results into the same format as the ORB+EM pipeline
-(CameraPose list + sparse_points).
-
-Changes:
-- Use symbolic links (or copy as fallback) to avoid duplicating frames.
-- Robust images.txt parsing (line-pair logic).
-- Expose SIFT/max_image_size parameters.
-- Graceful temporary dir cleanup.
+封装 COLMAP CLI，依次执行特征提取、匹配与稀疏重建，
+再把结果解析为与 ORB+EM 流程一致的格式
+（CameraPose 列表 + 稀疏点云）。
 """
 
 from __future__ import annotations
 
+import logging
 import os
 import shutil
 import sqlite3
@@ -23,29 +18,31 @@ from typing import Dict, List, Optional, Tuple
 
 import numpy as np
 
-# Local imports
+# 本地依赖
 try:
     from poses import CameraIntrinsics, CameraPose
 except ImportError:
     CameraIntrinsics = None
     CameraPose = None
 
+logger = logging.getLogger(__name__)
+
 
 def _run_colmap(cmd: List[str], label: str, colmap_bin: str) -> subprocess.CompletedProcess:
-    """Run a COLMAP command with proper Qt plugin path."""
-    print(f"  [COLMAP] {label}...")
+    """执行一条 COLMAP 命令，并正确设置 Qt 插件路径。"""
+    logger.info("[COLMAP] %s...", label)
     env = dict(os.environ)
 
-    # Clear Qt-related env vars set by parent process (PyQt5, etc.)
+    # 清掉父进程（PyQt5 等）注入的 Qt 相关环境变量
     for key in list(env.keys()):
         if key.startswith("QT_"):
             del env[key]
 
-    # Prepend COLMAP bin so it finds its own DLLs first
+    # 把 COLMAP bin 前置，保证优先加载它自带的 DLL
     existing = env.get("PATH", "")
     env["PATH"] = colmap_bin + os.pathsep + existing
 
-    # Set Qt plugin paths explicitly for COLMAP
+    # 显式为 COLMAP 指定 Qt 插件路径
     plugins_dir = os.path.join(colmap_bin, "..", "plugins")
     if os.path.isdir(plugins_dir):
         env["QT_PLUGIN_PATH"] = plugins_dir
@@ -59,7 +56,7 @@ def _run_colmap(cmd: List[str], label: str, colmap_bin: str) -> subprocess.Compl
                             errors="replace", env=env, creationflags=creationflags)
     if result.returncode != 0:
         err = result.stderr.strip() if result.stderr else ""
-        msg = f"COLMAP {label} failed with code {result.returncode}"
+        msg = f"COLMAP {label} 失败，返回码 {result.returncode}"
         if err:
             msg += f": {err[:300]}"
         raise RuntimeError(msg)
@@ -67,7 +64,7 @@ def _run_colmap(cmd: List[str], label: str, colmap_bin: str) -> subprocess.Compl
 
 
 def _create_symlink_or_copy(src: str, dst: str):
-    """Create symbolic link to src at dst; fallback to copy if symlink fails."""
+    """在 dst 处创建指向 src 的符号链接；失败时回退为复制。"""
     try:
         if os.path.islink(dst) or os.path.exists(dst):
             os.remove(dst)
@@ -90,35 +87,32 @@ def estimate_poses_with_colmap(
     matcher_overlap: int = 10,
     loop_detection: bool = False,
 ) -> Tuple[CameraIntrinsics, List[Optional[CameraPose]], np.ndarray]:
-    """Estimate camera poses using COLMAP.
+    """用 COLMAP 估计相机位姿。
 
-    Args:
-        frame_paths: list of absolute paths to input frames.
-        output_dir: directory to store intermediate COLMAP results.
-        colmap_exe: path to colmap executable (auto-detected if None).
-        max_image_size: max image dimension for feature extraction.
-            Default 2400 (from tuned optimum): high resolution retains small-scale
-            texture → more/better SIFT matches → denser triangulated point cloud.
-        sift_peak_threshold: SIFT peak threshold.
-        sift_edge_threshold: SIFT edge threshold.
-        sift_max_num_features: max number of SIFT features per image.
-            Default 12000 (from tuned optimum): more features → better matching
-            quality.  Note: raises runtime on long sequences, use
-            --pose-estimator opencv or reduce features for very long videos.
-        matcher: 'exhaustive' (match all pairs, robust for unordered image sets and
-            for unevenly-spaced two-stage frames; O(n²) pairs) or 'sequential'
-            (match only temporally adjacent frames, fastest for video).
-            Default 'exhaustive' (matches the tuned optimum).
-        matcher_overlap: sequential matcher overlap window (frames to either side).
-        loop_detection: enable sequential matcher loop closure detection
-            (matches far-away frames that revisit the same scene; requires a
-            vocabulary tree — leave off otherwise, sequential_matcher hangs).
+    参数：
+        frame_paths: 输入帧的绝对路径列表。
+        output_dir: 存放 COLMAP 中间结果的目录。
+        colmap_exe: colmap 可执行文件路径（None 时自动探测）。
+        max_image_size: 特征提取时的图像最大边长。默认 2400（调优最优值）：
+            高分辨率能保留小尺度纹理 → SIFT 匹配更多更好 → 三角化点云更稠密。
+        sift_peak_threshold: SIFT 峰值阈值。
+        sift_edge_threshold: SIFT 边缘阈值。
+        sift_max_num_features: 每张图 SIFT 特征数上限。默认 12000（调优最优值）：
+            特征更多 → 匹配质量更好。注意：长序列会拉长运行时间，
+            超长视频建议改用 --pose-estimator opencv 或降低特征数。
+        matcher: 'exhaustive'（全对匹配，对无序图像集、两阶段采样间距不均的帧更稳，
+            复杂度 O(n²)）或 'sequential'（仅匹配时间相邻帧，视频场景最快）。
+            默认 'exhaustive'（对应调优最优值）。
+        matcher_overlap: sequential 匹配器的重叠窗口（前后各取多少帧）。
+        loop_detection: 启用 sequential 匹配器的回环检测
+            （匹配重访同一场景的远距离帧；需要 vocabulary tree，
+            否则 sequential_matcher 会卡住，故默认关闭）。
 
-    Returns:
-        intrinsics: CameraIntrinsics object.
-        poses: list of CameraPose (or None for unregistered frames),
-               length equals len(frame_paths), order matches frame_paths.
-        sparse_points: (N,3) numpy array of 3D points.
+    返回：
+        intrinsics: CameraIntrinsics 对象。
+        poses: CameraPose 列表（未注册帧为 None），
+               长度等于 len(frame_paths)，顺序与 frame_paths 一致。
+        sparse_points: (N,3) numpy 数组，稀疏 3D 点。
     """
     if CameraIntrinsics is None or CameraPose is None:
         raise ImportError("CameraIntrinsics/CameraPose not found. Install poses module.")
@@ -126,7 +120,7 @@ def estimate_poses_with_colmap(
     script_dir = str(Path(__file__).resolve().parent)
 
     # ------------------------------------------------------------------
-    # Locate COLMAP executable
+    # 定位 COLMAP 可执行文件
     # ------------------------------------------------------------------
     colmap_exe_path = colmap_exe
     if colmap_exe_path is None:
@@ -134,7 +128,7 @@ def estimate_poses_with_colmap(
         bundled_exe = os.path.join(bundled_bin, "colmap.exe")
         if os.path.isfile(bundled_exe):
             colmap_exe_path = bundled_exe
-            print(f"  [COLMAP] Using bundled COLMAP from {bundled_bin}")
+            logger.info("[COLMAP] 使用内置 COLMAP: %s", bundled_bin)
         else:
             colmap_exe_path = shutil.which("colmap")
 
@@ -147,7 +141,7 @@ def estimate_poses_with_colmap(
     colmap_bin_dir = os.path.dirname(colmap_exe_path)
 
     # ------------------------------------------------------------------
-    # Setup directories
+    # 目录准备
     # ------------------------------------------------------------------
     workdir = Path(output_dir) / "colmap_work"
     workdir.mkdir(parents=True, exist_ok=True)
@@ -156,22 +150,22 @@ def estimate_poses_with_colmap(
     os.makedirs(sparse_dir, exist_ok=True)
 
     # ------------------------------------------------------------------
-    # Prepare sorted images directory using symlinks (or copies)
-    # This keeps disk usage minimal and ensures predictable order.
+    # 用符号链接（或复制）准备排序后的图像目录：
+    # 既最小化磁盘占用，又保证顺序可预测。
     # ------------------------------------------------------------------
     tmp_img_dir = str(workdir / "sorted_images")
     if os.path.isdir(tmp_img_dir):
         shutil.rmtree(tmp_img_dir, ignore_errors=True)
     os.makedirs(tmp_img_dir, exist_ok=True)
 
-    # Map original filename -> index in frame_paths
+    # 原始文件名 -> frame_paths 索引
     name_to_frame_idx: Dict[str, int] = {}
     for idx, p in enumerate(frame_paths):
         name_to_frame_idx[Path(p).name] = idx
 
-    # Sort by filename to guarantee mapping: 0000.png, 0001.png, ...
+    # 按文件名排序，保证映射关系：0000.png, 0001.png, ...
     sorted_names = sorted(Path(p).name for p in frame_paths)
-    src_dir = Path(frame_paths[0]).parent  # assume all frames in same dir
+    src_dir = Path(frame_paths[0]).parent  # 假定所有帧在同一目录
     for idx, name in enumerate(sorted_names):
         src = src_dir / name
         if not src.exists() and image_path:
@@ -181,7 +175,7 @@ def estimate_poses_with_colmap(
 
     try:
         # ------------------------------------------------------------------
-        # Step 1: Feature extraction
+        # 步骤 1：特征提取
         # ------------------------------------------------------------------
         if os.path.exists(db_path):
             os.remove(db_path)
@@ -196,10 +190,10 @@ def estimate_poses_with_colmap(
                "--FeatureExtraction.max_image_size", str(max_image_size),
                "--database_path", db_path,
                "--image_path", tmp_img_dir]
-        _run_colmap(cmd, "Feature extraction", colmap_bin_dir)
+        _run_colmap(cmd, "特征提取", colmap_bin_dir)
 
         # ------------------------------------------------------------------
-        # Read image_id -> filename mapping from database
+        # 从数据库读取 image_id -> 原始文件名映射
         # ------------------------------------------------------------------
         conn = sqlite3.connect(db_path)
         try:
@@ -210,7 +204,7 @@ def estimate_poses_with_colmap(
             for image_id, seq_name in rows:
                 try:
                     seq_idx = int(Path(seq_name).stem)      # "0000" -> 0
-                    orig_name = sorted_names[seq_idx]        # original filename
+                    orig_name = sorted_names[seq_idx]        # 还原原始文件名
                     id_to_orig_name[image_id] = orig_name
                 except (ValueError, IndexError):
                     continue
@@ -221,12 +215,11 @@ def estimate_poses_with_colmap(
             raise RuntimeError("No valid images found in COLMAP database.")
 
         # ------------------------------------------------------------------
-        # Step 2: Matching
+        # 步骤 2：匹配
         # ------------------------------------------------------------------
         if matcher == "sequential":
-            # Best for video sequences: only match temporally adjacent frames.
-            # O(n·overlap) pairs instead of O(n²), and avoids feeding
-            # weak-baseline far-apart pairs to the mapper.
+            # 视频序列首选：只匹配时间相邻帧。
+            # 复杂度 O(n·overlap) 而非 O(n²)，且避免把弱基线远距离帧对喂给 mapper。
             matching_cmd = [
                 colmap_exe_path, "sequential_matcher",
                 "--database_path", db_path,
@@ -237,10 +230,10 @@ def estimate_poses_with_colmap(
         else:
             matching_cmd = [colmap_exe_path, "exhaustive_matcher",
                             "--database_path", db_path]
-        _run_colmap(matching_cmd, "Matching", colmap_bin_dir)
+        _run_colmap(matching_cmd, "匹配", colmap_bin_dir)
 
         # ------------------------------------------------------------------
-        # Verify matching quality (detect COLMAP 4.x bug)
+        # 校验匹配质量（检测 COLMAP 4.x 的 bug）
         # ------------------------------------------------------------------
         conn = sqlite3.connect(db_path)
         try:
@@ -272,27 +265,25 @@ def estimate_poses_with_colmap(
                     "same image_id (known COLMAP 4.x bug). "
                     "Please check your input quality or use --pose-estimator opencv."
                 )
-            print(f"  [COLMAP] Matching OK: {total_pairs} pairs, "
-                  f"{n_distinct_imgs} distinct images")
+            logger.info("[COLMAP] 匹配正常：%d 对，覆盖 %d 张不同图像",
+                        total_pairs, n_distinct_imgs)
         finally:
             conn.close()
 
         # ------------------------------------------------------------------
-        # Step 3: Mapper (SfM)
+        # 步骤 3：Mapper（SfM 重建）
         # ------------------------------------------------------------------
         cmd = [colmap_exe_path, "mapper",
                "--database_path", db_path,
                "--image_path", tmp_img_dir,
                "--output_path", sparse_dir]
-        _run_colmap(cmd, "Mapper (SfM reconstruction)", colmap_bin_dir)
+        _run_colmap(cmd, "Mapper（SfM 重建）", colmap_bin_dir)
 
         # ------------------------------------------------------------------
-        # Step 4: Select best reconstruction among all mapper output models.
-        # The mapper may split the scene into multiple disconnected sub-models
-        # (sparse/0, sparse/1, ...). Model 0 is NOT guaranteed to be the largest —
-        # it can be a failed seed reconstruction with almost no images/points.
-        # Convert every model to TXT and pick the one with the most registered
-        # images (tie-break: most 3D points).
+        # 步骤 4：在 mapper 产出的所有模型中挑最好的。
+        # mapper 可能把场景拆成多个互不连通的子模型（sparse/0, sparse/1, ...）。
+        # model 0 未必最大 —— 可能只是一个几乎无图像/无点的失败种子。
+        # 把每个模型都转成 TXT，选注册图像最多的（并列时比 3D 点数）。
         # ------------------------------------------------------------------
         model_ids = sorted(
             int(d.name) for d in Path(sparse_dir).iterdir()
@@ -315,9 +306,9 @@ def estimate_poses_with_colmap(
                    "--input_path", str(recon_path),
                    "--output_path", txt_dir,
                    "--output_type", "TXT"]
-            _run_colmap(cmd, f"Model conversion (model {mid} -> TXT)", colmap_bin_dir)
+            _run_colmap(cmd, f"模型转换（model {mid} -> TXT）", colmap_bin_dir)
 
-            # Score = registered images, tie-broken by 3D point count.
+            # 评分 = 注册图像数，并列时以 3D 点数打破平局
             n_images = 0
             n_points = 0
             img_txt = os.path.join(txt_dir, "images.txt")
@@ -326,7 +317,7 @@ def estimate_poses_with_colmap(
                 with open(img_txt, "r", encoding="utf-8", errors="ignore") as f:
                     for line in f:
                         s = line.strip()
-                        # Registered image: 9+ tokens and not a 2D-observation line.
+                        # 已注册图像行：9+ 个字段且不是 2D 观测行
                         if s and not s.startswith("#") and len(s.split()) >= 9 \
                                 and not s.split()[0].startswith("-"):
                             n_images += 1
@@ -338,7 +329,7 @@ def estimate_poses_with_colmap(
                             n_points += 1
 
             score = n_images * 10000 + n_points
-            print(f"  [COLMAP] Model {mid}: {n_images} images, {n_points} points")
+            logger.info("[COLMAP] 模型 %d：%d 张图像，%d 个点", mid, n_images, n_points)
             if score > best_score:
                 best_score = score
                 best_txt_dir = txt_dir
@@ -351,7 +342,7 @@ def estimate_poses_with_colmap(
             )
 
         # ------------------------------------------------------------------
-        # Step 5: Parse the best model's TXT and map poses back to original
+        # 步骤 5：解析最优模型的 TXT，并把位姿映射回原始帧索引
         # ------------------------------------------------------------------
         intrinsics, poses_dict, sparse_points = _parse_colmap_txt(
             best_txt_dir, id_to_orig_name, name_to_frame_idx, len(frame_paths)
@@ -361,20 +352,18 @@ def estimate_poses_with_colmap(
         for frame_idx, pose in poses_dict.items():
             ordered_poses[frame_idx] = pose
 
-        # 2026-08: 移除重复写 workdir/*.npy —— cli.py/gui.py 的顶层保存（定长 NaN 掩码）才是
-        #   续训源；这里再写一份既无人读取，又会在 #3 修复后与顶层格式不一致。
+        # 不再重复写 workdir/*.npy：顶层保存（定长 NaN 掩码）才是续训源，
+        # 这里再写一份既无人读取，格式也可能与顶层不一致。
         valid_poses = [p for p in ordered_poses if p is not None]
 
         best_mid = best_meta[0] if best_meta is not None else -1
 
-        print(f"  [COLMAP] Estimated {len(valid_poses)} poses "
-              f"(total frames: {len(frame_paths)}), "
-              f"{len(sparse_points)} sparse 3D points "
-              f"(selected model {best_mid})")
+        logger.info("[COLMAP] 估计 %d 个位姿（总帧数 %d），%d 个稀疏 3D 点（选用模型 %d）",
+                    len(valid_poses), len(frame_paths), len(sparse_points), best_mid)
         return intrinsics, ordered_poses, sparse_points
 
     finally:
-        # Cleanup temporary sorted images
+        # 清理临时排序图像目录
         try:
             if os.path.isdir(tmp_img_dir):
                 shutil.rmtree(tmp_img_dir, ignore_errors=True)
@@ -383,7 +372,7 @@ def estimate_poses_with_colmap(
 
 
 # ------------------------------------------------------------------
-# TXT parsers (line-pair logic for images.txt)
+# TXT 解析（images.txt 采用行对逻辑）
 # ------------------------------------------------------------------
 
 def _parse_colmap_txt(
@@ -392,7 +381,7 @@ def _parse_colmap_txt(
     name_to_frame_idx: Dict[str, int],
     num_frames: int,
 ) -> Tuple[CameraIntrinsics, Dict[int, CameraPose], np.ndarray]:
-    """Parse COLMAP TXT files and map poses back to original frame indices."""
+    """解析 COLMAP TXT 文件，并把位姿映射回原始帧索引。"""
     cameras = _parse_cameras_txt(os.path.join(recon_txt_path, "cameras.txt"))
     if not cameras:
         raise RuntimeError("No camera model found in cameras.txt")
@@ -403,7 +392,7 @@ def _parse_colmap_txt(
     )
     points = _parse_points_txt(os.path.join(recon_txt_path, "points3D.txt"))
 
-    # Use first camera model (single_camera=1)
+    # 使用第一个相机模型（single_camera=1）
     cam = cameras[0]
     intrinsics = CameraIntrinsics(fx=cam["fx"], fy=cam["fy"],
                                   cx=cam["cx"], cy=cam["cy"])
@@ -411,7 +400,7 @@ def _parse_colmap_txt(
 
 
 def _parse_cameras_txt(path: str) -> list:
-    """Parse cameras.txt, supports multiple camera models."""
+    """解析 cameras.txt，支持多种相机模型。"""
     MODEL_PARAMS = {
         "SIMPLE_RADIAL": lambda w, h, p: {"fx": p[0], "fy": p[0], "cx": p[1], "cy": p[2]},
         "SIMPLE_PINHOLE": lambda w, h, p: {"fx": p[0], "fy": p[0], "cx": p[1], "cy": p[2]},
@@ -438,7 +427,7 @@ def _parse_cameras_txt(path: str) -> list:
             if mapper:
                 intr = mapper(width, height, params)
             else:
-                # Fallback: assume first four params are fx, fy, cx, cy
+                # 回退：假定前四个参数为 fx, fy, cx, cy
                 intr = {"fx": params[0], "fy": params[1] if len(params) > 1 else params[0],
                         "cx": params[2] if len(params) > 2 else 0.0,
                         "cy": params[3] if len(params) > 3 else 0.0}
@@ -456,7 +445,7 @@ def _parse_images_txt(
     id_to_orig_name: Dict[int, str],
     name_to_frame_idx: Dict[str, int],
 ) -> Dict[int, CameraPose]:
-    """Parse images.txt using line-pair pattern."""
+    """按行对（line-pair）解析 images.txt。"""
     poses_map: Dict[int, CameraPose] = {}
     with open(path, "r") as f:
         lines = f.readlines()
@@ -467,7 +456,7 @@ def _parse_images_txt(
         i += 1
         if not line or line.startswith("#"):
             continue
-        # First line of a pair: IMAGE_ID QW QX QY QZ TX TY TZ CAMERA_ID NAME
+        # 行对的第一行：IMAGE_ID QW QX QY QZ TX TY TZ CAMERA_ID NAME
         parts = line.split(maxsplit=9)
         if len(parts) < 9:
             continue
@@ -475,12 +464,12 @@ def _parse_images_txt(
             image_id = int(parts[0])
             qw, qx, qy, qz = float(parts[1]), float(parts[2]), float(parts[3]), float(parts[4])
             tx, ty, tz = float(parts[5]), float(parts[6]), float(parts[7])
-            # camera_id = int(parts[8])  # not needed
+            # camera_id = int(parts[8])  # 未使用
             name = parts[9] if len(parts) > 9 else ""
 
             orig_name = id_to_orig_name.get(image_id)
             if orig_name is None:
-                # Skip second line (points2D) and continue
+                # 跳过第二行（points2D）
                 if i < len(lines):
                     i += 1
                 continue
@@ -494,18 +483,18 @@ def _parse_images_txt(
             t_cam = np.array([tx, ty, tz])
             poses_map[frame_idx] = CameraPose(R=R_cam.copy(), t=t_cam.copy())
 
-            # Skip the next line (points2D for this image)
+            # 跳过下一行（该图像的 points2D）
             if i < len(lines):
                 i += 1
         except (ValueError, IndexError):
-            # Malformed line, try to continue
+            # 行格式异常，尝试继续
             continue
 
     return poses_map
 
 
 def _parse_points_txt(path: str) -> np.ndarray:
-    """Parse points3D.txt, each point line: POINT3D_ID X Y Z ..."""
+    """解析 points3D.txt，每行格式：POINT3D_ID X Y Z ..."""
     points = []
     with open(path, "r") as f:
         for line in f:
@@ -523,7 +512,7 @@ def _parse_points_txt(path: str) -> np.ndarray:
 
 
 def _quat_to_rot(qw: float, qx: float, qy: float, qz: float) -> np.ndarray:
-    """Convert quaternion (w,x,y,z) to 3x3 rotation matrix."""
+    """四元数 (w,x,y,z) → 3×3 旋转矩阵。"""
     return np.array([
         [1-2*(qy**2+qz**2), 2*(qx*qy-qw*qz), 2*(qx*qz+qw*qy)],
         [2*(qx*qy+qw*qz), 1-2*(qx**2+qz**2), 2*(qy*qz-qw*qx)],

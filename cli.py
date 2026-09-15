@@ -1,44 +1,44 @@
 """
-Command-line interface for the video-to-3DGS pipeline.
-
-Usage examples:
-    # Basic uniform sampling, ORB-based poses, train with SH0
-    python cli.py --video input.mp4 --output out.ply
-
-    # Smart sampling + SH3 + learnable focal
-    python cli.py --video input.mp4 --output out.ply --sampling-mode smart --sh-degree 3 --train-focal
-
-    # Two‑stage sampling + COLMAP + full features
-    python cli.py --video input.mp4 --output out.ply --sampling-mode two-stage --pose-estimator colmap \
-        --sh-degree 3 --random-background --train-focal --max-gaussians 500000
+视频转 3D 高斯泼溅 CLI端。
 """
 
 import argparse
+import logging
 import os
 import sys
 import time
 from pathlib import Path
 
 import numpy as np
+import psutil
 import torch
 
 from frames import extract_frames
-from poses import estimate_poses, CameraPose, CameraIntrinsics
-from point_cloud import initialize_gaussians, sample_point_colors, migrate_legacy_scales
+from poses import estimate_poses, CameraPose
+from point_cloud import initialize_gaussians, sample_point_colors
 from gaussian import Gaussian3D, DifferentiableRasterizer, Trainer, LazyFrames, LossDivergenceError
 from exporter import export_training_checkpoint
 
-import psutil
+logger = logging.getLogger(__name__)
 
-def set_affinity_to_all_cores():
-    """将当前进程绑定到所有逻辑核心"""
+
+def setup_logging() -> None:
+    logging.basicConfig(
+        level=logging.INFO,
+        format="%(asctime)s [%(levelname)s] %(message)s",
+        datefmt="%H:%M:%S",
+    )
+
+
+def set_affinity_to_all_cores() -> None:
+    """将当前进程绑定到所有逻辑核心。"""
     try:
         p = psutil.Process(os.getpid())
         all_cpus = list(range(psutil.cpu_count()))
         p.cpu_affinity(all_cpus)
-        print(f"[INFO] CPU 亲和性设置为 {len(all_cpus)} 个核心")
+        logger.info("CPU 亲和性设置为 %d 个核心", len(all_cpus))
     except Exception as e:
-        print(f"[WARN] 无法设置 CPU 亲和性: {e}")
+        logger.warning("无法设置 CPU 亲和性: %s", e)
 
 
 def build_parser() -> argparse.ArgumentParser:
@@ -47,111 +47,127 @@ def build_parser() -> argparse.ArgumentParser:
         formatter_class=argparse.ArgumentDefaultsHelpFormatter,
     )
 
-    # ---------- Input / Output ----------
-    parser.add_argument("--video", type=str, required=True, help="Path to input video file")
-    parser.add_argument("--output", type=str, default="output.ply", help="Output PLY file path")
-    parser.add_argument("--workdir", type=str, default="./workdir", help="Working directory for intermediate files")
+    # 输入 / 输出
+    parser.add_argument("--video", type=str, required=True, help="输入视频文件路径")
+    parser.add_argument("--output", type=str, default="output.ply", help="输出 PLY 文件路径")
+    parser.add_argument("--workdir", type=str, default="./workdir", help="中间文件工作目录")
 
-    # ---------- Frame Extraction ----------
-    parser.add_argument("--fps", type=float, default=15.0, help="Target frame rate (for uniform mode)")
-    parser.add_argument("--scale", type=float, default=0.5, help="Resize scale factor (0<scale<=1)")
-    parser.add_argument("--min-frames", type=int, default=30, help="Minimum number of frames to extract")
-    parser.add_argument("--max-frames", type=int, default=200, help="Maximum number of frames to extract")
+    # 帧提取
+    parser.add_argument("--fps", type=float, default=15.0, help="目标帧率（均匀采样模式）")
+    parser.add_argument("--scale", type=float, default=0.5, help="缩放系数 (0<scale<=1)")
+    parser.add_argument("--min-frames", type=int, default=30, help="最少提取帧数")
+    parser.add_argument("--max-frames", type=int, default=200, help="最多提取帧数")
     parser.add_argument(
         "--sampling-mode",
         type=str,
         choices=["uniform", "smart", "two-stage"],
         default="uniform",
-        help="Frame sampling strategy: uniform, smart (flow-based), two-stage (parallax+flow+texture)"
+        help="帧采样策略：uniform / smart（光流）/ two-stage（视差+光流+纹理）",
     )
 
-    # ---------- Training ----------
-    parser.add_argument("--num-epochs", type=int, default=3000, help="Number of training epochs")
-    parser.add_argument("--device", type=str, default="auto", choices=["auto", "cpu", "cuda"], help="Device to use")
-    parser.add_argument("--eval-every", type=int, default=500, help="Print loss every N epochs")
-    parser.add_argument("--max-gaussians", type=int, default=300000, help="Maximum number of Gaussians")
+    # 训练
+    parser.add_argument("--num-epochs", type=int, default=3000, help="训练轮数")
+    parser.add_argument("--device", type=str, default="auto", choices=["auto", "cpu", "cuda"], help="运行设备")
+    parser.add_argument("--eval-every", type=int, default=500, help="每 N 轮打印一次损失")
+    parser.add_argument("--max-gaussians", type=int, default=300000, help="高斯数量上限")
 
-    # ---------- Advanced Features ----------
+    # 高级特性
     parser.add_argument("--sh-degree", type=int, default=0, choices=[0, 1, 2, 3],
-                        help="Spherical Harmonics degree (0=diffuse only, 3=full view-dependent)")
+                        help="球谐阶数（0=仅漫反射，3=完整视角相关）")
     parser.add_argument("--sh-warmup-steps", type=int, default=1000,
-                        help="Steps over which to gradually increase SH degree")
+                        help="球谐阶数渐进提升的步数")
     parser.add_argument("--ssim-warmup-steps", type=int, default=500,
-                        help="Steps over which to linearly increase SSIM weight (0→0.2)")
+                        help="SSIM 权重线性提升的步数（0→0.2）")
     parser.add_argument("--ssim-weight-max", type=float, default=0.2,
-                        help="Maximum SSIM weight after warmup")
+                        help="预热后 SSIM 权重上限")
     parser.add_argument("--random-background", action="store_true",
-                        help="Randomly sample black/white background during training")
+                        help="训练时随机使用黑/白背景")
     parser.add_argument("--train-focal", action="store_true",
-                        help="Learn focal length during training (self‑calibration)")
+                        help="训练时学习焦距（自标定）")
     parser.add_argument("--amp", action="store_true",
-                        help="Mixed precision (AMP / fp16) — requires CUDA GPU with fp16; "
-                             "uses Tensor Cores on Ampere+. Rasterizer stays fp32. No effect on CPU.")
+                        help="混合精度训练（fp16，需 CUDA + 安培以上 GPU，光栅化器保持 fp32；CPU 无效）")
 
-    # ---------- Pose Estimation ----------
+    # 位姿估计
     parser.add_argument(
         "--pose-estimator",
         type=str,
         choices=["opencv", "colmap"],
         default="opencv",
-        help="Backend for camera pose estimation (opencv=ORB+EM, colmap=external COLMAP)"
+        help="相机位姿估计后端（opencv=ORB+EM，colmap=外部 COLMAP）",
     )
     parser.add_argument(
         "--feature-type",
         type=str,
         choices=["orb", "sift"],
         default="orb",
-        help="Feature descriptor for OpenCV pose estimation (orb=fast binary, sift=robust float, slower)"
+        help="OpenCV 位姿估计的特征描述子（orb=快速二进制，sift=鲁棒浮点，较慢）",
     )
-    parser.add_argument("--focal-guess", type=float, default=None, help="Initial focal length guess (optional)")
+    parser.add_argument("--focal-guess", type=float, default=None, help="初始焦距估计值（可选）")
 
-    # ---------- Resume ----------
+    # 断点续训
     parser.add_argument("--resume-dir", type=str, default=None,
-                        help="Resume from a previous run's workdir (must contain training_state.pt)")
+                        help="从上次运行的 workdir 续训（需包含 training_state.pt）")
 
     return parser
+
+
+def load_poses(poses_data: np.ndarray) -> list:
+    """从定长 [n,4,4] 数组还原位姿列表，NaN 行表示该帧位姿缺失。"""
+    poses = []
+    for p in poses_data:
+        if np.isnan(p).any():
+            poses.append(None)
+        else:
+            poses.append(CameraPose(R=p[:3, :3].copy(), t=p[:3, 3].copy()))
+    return poses
+
+
+def save_poses(poses: list, path: Path) -> None:
+    """将位姿列表保存为定长 [n,4,4] 数组，缺失位姿填 NaN。"""
+    poses_arr = np.full((len(poses), 4, 4), np.nan, dtype=np.float32)
+    for i, p in enumerate(poses):
+        if p is not None:
+            poses_arr[i] = p.RT
+    np.save(path, poses_arr)
 
 
 def run_pipeline(args: argparse.Namespace) -> None:
     overall_start = time.time()
 
-    # ===== 修复: resume-dir 覆盖 workdir =====
+    # 指定 resume-dir 时，workdir 强制指向该目录
     workdir = Path(args.workdir)
     if args.resume_dir is not None:
-        # 如果用户显式指定了 resume-dir，则 workdir 强制指向该目录
-        resume_path = Path(args.resume_dir)
-        if not resume_path.exists():
-            print(f"[ERROR] Resume directory not found: {args.resume_dir}")
+        workdir = Path(args.resume_dir)
+        if not workdir.exists():
+            logger.error("续训目录不存在: %s", args.resume_dir)
             sys.exit(1)
-        workdir = resume_path
-        print(f"[INFO] Resuming from workdir: {workdir}")
+        logger.info("从以下工作目录续训: %s", workdir)
     else:
         workdir.mkdir(parents=True, exist_ok=True)
 
-    # Determine device
+    # 设备选择
     if args.device == "auto":
         device = "cuda" if torch.cuda.is_available() else "cpu"
     else:
         device = args.device
-    print(f"Using device: {device}")
+    logger.info("使用设备: %s", device)
 
     frame_dir = workdir / "frames"
     poses_dir = workdir / "poses"
     poses_dir.mkdir(exist_ok=True)
 
-    print("=" * 60)
-    print("  Video → 3D Gaussian Splatting")
-    print("=" * 60)
+    logger.info("=" * 60)
+    logger.info("  视频 → 3D 高斯泼溅")
+    logger.info("=" * 60)
 
-    # ---------- Step 1: Extract Frames ----------
-    print("\n[1/5] Extracting frames...")
+    # ---------- 步骤 1：提取帧 ----------
+    logger.info("[1/5] 正在提取帧...")
     t0 = time.time()
 
-    # 优先从 resume-dir 加载，若不存在则提取
     frame_paths_file = workdir / "frame_paths.txt"
     if frame_paths_file.exists():
         frame_paths = [p.strip() for p in frame_paths_file.read_text().splitlines()]
-        print(f"  Loaded {len(frame_paths)} frames from {workdir}")
+        logger.info("已从 %s 加载 %d 帧", workdir, len(frame_paths))
     else:
         smart_sampling = args.sampling_mode != "uniform"
         two_stage = args.sampling_mode == "two-stage"
@@ -170,18 +186,18 @@ def run_pipeline(args: argparse.Namespace) -> None:
             feature_type=args.feature_type,
         )
         frame_paths_file.write_text("\n".join(frame_paths))
-        print(f"  Extracted {len(frame_paths)} frames ({time.time()-t0:.1f}s)")
+        logger.info("已提取 %d 帧（耗时 %.1fs）", len(frame_paths), time.time() - t0)
 
     if len(frame_paths) < 2:
-        print("Error: need at least 2 frames.")
+        logger.error("至少需要 2 帧。")
         sys.exit(1)
 
     frames = LazyFrames(frame_paths)
     h, w = frames[0].shape[:2]
-    print(f"  Frame resolution: {w}x{h}")
+    logger.info("帧分辨率: %dx%d", w, h)
 
-    # ---------- Step 2: Estimate Camera Poses ----------
-    print("\n[2/5] Estimating camera poses...")
+    # ---------- 步骤 2：估计相机位姿 ----------
+    logger.info("[2/5] 正在估计相机位姿...")
     t0 = time.time()
 
     intrinsics_file = workdir / "intrinsics.npy"
@@ -190,23 +206,9 @@ def run_pipeline(args: argparse.Namespace) -> None:
 
     if intrinsics_file.exists() and poses_file.exists() and sparse_file.exists():
         K = np.load(intrinsics_file)
-        poses_data = np.load(poses_file)
         sparse_points = np.load(sparse_file)
-        poses = []
-        if poses_data.shape[0] == len(frame_paths):
-            # 新格式（2026-08 修复）：定长 [n,4,4]，NaN 行 = 该帧位姿缺失 → 帧↔位姿按索引对齐
-            for p in poses_data:
-                if np.isnan(p).any():
-                    poses.append(None)
-                else:
-                    poses.append(CameraPose(R=p[:3, :3].copy(), t=p[:3, 3].copy()))
-        else:
-            # 旧格式（gap 压缩）：顺序读 + 末尾补 None —— 中段缺失帧的对齐不可恢复
-            for p in poses_data:
-                poses.append(CameraPose(R=p[:3, :3].copy(), t=p[:3, 3].copy()))
-            while len(poses) < len(frame_paths):
-                poses.append(None)
-        print(f"  Loaded poses from {workdir}")
+        poses = load_poses(np.load(poses_file))
+        logger.info("已从 %s 加载位姿", workdir)
     else:
         if args.pose_estimator == "colmap":
             try:
@@ -216,7 +218,7 @@ def run_pipeline(args: argparse.Namespace) -> None:
                 )
                 K = intrinsics.K
             except (ImportError, RuntimeError) as e:
-                print(f"  [ERROR] COLMAP failed: {e}. Please install COLMAP or use --pose-estimator opencv.")
+                logger.error("COLMAP 失败: %s。请安装 COLMAP 或改用 --pose-estimator opencv。", e)
                 sys.exit(1)
         else:  # opencv
             intrinsics, poses, sparse_points = estimate_poses(
@@ -228,37 +230,31 @@ def run_pipeline(args: argparse.Namespace) -> None:
             )
             K = intrinsics.K
 
-        # Save for potential resume —— 定长数组 + NaN 掩码（修复 2026-08：旧 gap 压缩丢失帧↔位姿对齐）
         np.save(intrinsics_file, K)
-        poses_arr = np.full((len(poses), 4, 4), np.nan, dtype=np.float32)
-        for i, p in enumerate(poses):
-            if p is not None:
-                poses_arr[i] = p.RT
-        np.save(poses_file, poses_arr)
+        save_poses(poses, poses_file)
         if sparse_points is not None and sparse_points.size > 0:
             np.save(sparse_file, sparse_points)
 
-    # Ensure poses list length matches frames
+    # 保证 poses 与 frames 数量一致
     while len(poses) < len(frame_paths):
         poses.append(None)
     valid_count = sum(1 for p in poses if p is not None)
-    print(f"  Estimated {valid_count} valid poses out of {len(frame_paths)} frames ({time.time()-t0:.1f}s)")
+    logger.info("共 %d 帧，其中 %d 帧位姿有效（耗时 %.1fs）",
+                len(frame_paths), valid_count, time.time() - t0)
 
     if valid_count < 3:
-        print("Error: too few valid poses. Check video quality or try --pose-estimator colmap.")
+        logger.error("有效位姿过少。请检查视频质量，或改用 --pose-estimator colmap。")
         sys.exit(1)
 
-    # ---------- Step 3: Initialize Gaussians ----------
-    print("\n[3/5] Initializing 3D Gaussians...")
+    # ---------- 步骤 3：初始化高斯 ----------
+    logger.info("[3/5] 正在初始化 3D 高斯...")
     t0 = time.time()
 
     gauss_init_file = workdir / "gaussian_params.npz"
     if gauss_init_file.exists():
         params = dict(np.load(gauss_init_file))
-        # 2026-08: 旧缓存把 log 尺度存在 "scales"（双重取 log bug），迁移为线性供 initialize 正确取 log
-        gauss_init = migrate_legacy_scales(params)
-        gauss_init = {k: gauss_init[k] for k in ["positions", "scales", "opacities", "sh_coeffs", "rotations"]}
-        print(f"  Loaded initialized Gaussians from {workdir}")
+        gauss_init = {k: params[k] for k in ["positions", "scales", "opacities", "sh_coeffs", "rotations"]}
+        logger.info("已从 %s 加载初始化高斯", workdir)
     else:
         class _Intrinsics:
             pass
@@ -268,19 +264,22 @@ def run_pipeline(args: argparse.Namespace) -> None:
         gauss_init = initialize_gaussians(sparse_points, colors, counts)
         np.savez(gauss_init_file, **gauss_init)
 
-    print(f"  Initialized {gauss_init['positions'].shape[0]} Gaussians ({time.time()-t0:.1f}s)")
+    logger.info("已初始化 %d 个高斯（耗时 %.1fs）",
+                gauss_init["positions"].shape[0], time.time() - t0)
 
-    # ---------- Step 4: Train ----------
-    print(f"\n[4/5] Training 3D Gaussians...")
-    print(f"  Device: {device}, Epochs: {args.num_epochs}, Max Gaussians: {args.max_gaussians}")
+    # ---------- 步骤 4：训练 ----------
+    logger.info("[4/5] 正在训练 3D 高斯...")
+    logger.info("设备: %s，轮数: %d，高斯上限: %d",
+                device, args.num_epochs, args.max_gaussians)
     if args.sh_degree > 0:
-        print(f"  SH Degree: {args.sh_degree}, Warmup: {args.sh_warmup_steps} steps")
+        logger.info("SH 阶数: %d，升温步数: %d", args.sh_degree, args.sh_warmup_steps)
     if args.ssim_warmup_steps > 0:
-        print(f"  SSIM Warmup: {args.ssim_warmup_steps} steps, max weight: {args.ssim_weight_max}")
+        logger.info("SSIM 升温步数: %d，最大权重: %s",
+                    args.ssim_warmup_steps, args.ssim_weight_max)
     if args.random_background:
-        print(f"  Random background: enabled")
+        logger.info("随机背景: 已启用")
     if args.train_focal:
-        print(f"  Train focal: enabled")
+        logger.info("焦距自校准: 已启用")
 
     gaussians = Gaussian3D()
     gaussians.initialize_from_dict(gauss_init, device=device)
@@ -310,83 +309,77 @@ def run_pipeline(args: argparse.Namespace) -> None:
     best_loss = float("inf")
     training_start = time.time()
 
-    # Resume if checkpoint exists
+    # 若存在检查点则续训
     if pt_ckpt.exists():
         try:
             trainer.load_training_state(str(pt_ckpt), device=device)
             saved = trainer.current_step
             n_valid = sum(1 for p in poses if p is not None)
-            # 帧级断点（2026-08 修复）：current_step 只统计"有效位姿帧" → 用有效帧数算 epoch，
-            #   用检查点里的 last_frame_index 精确续帧（不再重跑半轮、不再按帧总数取模漂移）。
+            # current_step 仅统计有效位姿帧，故 epoch 由有效帧数推算，帧级续训用 last_frame_index
             start_epoch = max(1, saved // max(n_valid, 1) + 1)
             start_frame = (trainer.last_frame_index + 1) if (n_valid > 0 and saved % n_valid != 0) else 0
-            print(f"  Resumed from epoch {start_epoch} (step {saved})"
-                  + (f", continuing at frame {start_frame}" if start_frame > 0 else ""))
+            if start_frame > 0:
+                logger.info("已恢复：从第 %d 轮（步 %d）继续，接续帧 %d",
+                            start_epoch, saved, start_frame)
+            else:
+                logger.info("已恢复：从第 %d 轮（步 %d）继续", start_epoch, saved)
         except Exception as e:
-            print(f"  [WARN] Failed to load training state: {e}. Starting from scratch.")
+            logger.warning("加载训练状态失败: %s。将从头开始训练。", e)
 
-    # ===== 修复: 捕获 KeyboardInterrupt 并保存检查点 =====
-    try:
-        for epoch in range(start_epoch, args.num_epochs + 1):
-            try:
-                avg_loss = trainer.train_epoch(
-                    frames_iter=frames,   # 传 LazyFrames 对象（内存缓存帧），避免每帧读盘
-                    camera_poses=train_poses,
-                    stop_event=None,   # CLI 无停止事件
-                    progress_callback=None,
-                    loss_threshold=1.0,
-                    checkpoint_path=str(pt_ckpt),
-                    start_frame=start_frame,   # 2026-08: 恢复时从中断帧续（之后各轮跑全量）
-                )
-                start_frame = 0
-            except LossDivergenceError as e:
-                print(f"\n  [LOSS DIVERGENCE] {e}")
-                trainer.save_training_state(str(pt_ckpt))
-                break
-            except KeyboardInterrupt:
-                # ===== 新增: Ctrl+C 时保存检查点 =====
-                print("\n  [STOP] Interrupted by user, saving checkpoint...")
-                trainer.save_training_state(str(pt_ckpt))
-                print("  Checkpoint saved. To resume, use --resume-dir", workdir)
-                sys.exit(0)
+    for epoch in range(start_epoch, args.num_epochs + 1):
+        try:
+            avg_loss = trainer.train_epoch(
+                frames_iter=frames,   # 传 LazyFrames 对象以复用内存缓存
+                camera_poses=train_poses,
+                stop_event=None,
+                progress_callback=None,
+                loss_threshold=1.0,
+                checkpoint_path=str(pt_ckpt),
+                start_frame=start_frame,   # 续训时从中断帧开始，之后各轮全量
+            )
+            start_frame = 0
+        except LossDivergenceError as e:
+            logger.warning("损失发散: %s", e)
+            trainer.save_training_state(str(pt_ckpt))
+            break
+        except KeyboardInterrupt:
+            logger.info("用户中断，正在保存检查点...")
+            trainer.save_training_state(str(pt_ckpt))
+            logger.info("检查点已保存。可用 --resume-dir %s 续训", workdir)
+            sys.exit(0)
 
-            if epoch % max(1, args.eval_every) == 0 or epoch == start_epoch:
-                elapsed = time.time() - training_start
-                print(f"  Epoch {epoch:>5d}/{args.num_epochs} | Loss: {avg_loss:.6f} | "
-                      f"Time: {elapsed:.1f}s | Gaussians: {trainer.gaussians.num_gaussians}")
+        if epoch % max(1, args.eval_every) == 0 or epoch == start_epoch:
+            elapsed = time.time() - training_start
+            logger.info("轮次 %5d/%d | 损失: %.6f | 耗时: %.1fs | 高斯数: %d",
+                        epoch, args.num_epochs, avg_loss, elapsed,
+                        trainer.gaussians.num_gaussians)
 
-            if avg_loss < best_loss:
-                best_loss = avg_loss
-                trainer.save_training_state(str(workdir / "best_training_state.pt"))
-
-    except KeyboardInterrupt:
-        # 外层防护（理论上不会触发）
-        print("\n  [STOP] Interrupted, saving checkpoint...")
-        trainer.save_training_state(str(pt_ckpt))
-        print("  Checkpoint saved. To resume, use --resume-dir", workdir)
-        sys.exit(0)
+        if avg_loss < best_loss:
+            best_loss = avg_loss
+            trainer.save_training_state(str(workdir / "best_training_state.pt"))
 
     total_train = time.time() - training_start
-    print(f"\n  Training complete. Best loss: {best_loss:.6f} ({total_train:.1f}s)")
+    logger.info("训练完成。最佳损失: %.6f（耗时 %.1fs）", best_loss, total_train)
 
-    # ---------- Step 5: Export ----------
-    print("\n[5/5] Exporting PLY...")
+    # ---------- 步骤 5：导出 ----------
+    logger.info("[5/5] 正在导出 PLY...")
     export_training_checkpoint(trainer, args.output, sh_degree=args.sh_degree)
 
     total = time.time() - overall_start
-    print(f"\n{'='*60}")
-    print(f"  Done! Output: {os.path.abspath(args.output)}")
-    print(f"  Total time: {total:.1f}s")
-    print(f"{'='*60}")
+    logger.info("=" * 60)
+    logger.info("完成！输出文件: %s", os.path.abspath(args.output))
+    logger.info("总耗时: %.1fs", total)
+    logger.info("=" * 60)
 
 
 def cli(argv: list[str] = None) -> None:
+    setup_logging()
     set_affinity_to_all_cores()
     parser = build_parser()
     args = parser.parse_args(argv)
 
     if not os.path.isfile(args.video):
-        print(f"Error: video file not found: {args.video}")
+        logger.error("视频文件不存在: %s", args.video)
         sys.exit(1)
 
     run_pipeline(args)

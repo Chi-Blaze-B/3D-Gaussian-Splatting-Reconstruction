@@ -1,9 +1,10 @@
 """
-3D Gaussian Splatting — core representation, rasterizer, and training.
-Pure PyTorch implementation (no CUDA extension required).
-Supports SH up to degree 3.
+3D Gaussian Splatting — 核心模块、光栅化器与训练。
+纯 PyTorch 实现（无需 CUDA 扩展）。
+球谐函数阶数最高支持 3。
 """
 
+import logging
 import threading
 import numpy as np
 import torch
@@ -13,7 +14,9 @@ from collections import OrderedDict
 from dataclasses import dataclass, field
 from typing import Optional, List, Dict, Callable, Union
 
-# ---------- Hyperparameters ----------
+logger = logging.getLogger(__name__)
+
+# ---------- 超参数 ----------
 LR_POSITIONS = 1.6e-4
 LR_LOG_SCALES = 5.0e-3
 LR_OPACITIES = 5.0e-2
@@ -41,7 +44,7 @@ MAX_SPAN = 33
 RASTER_CHUNK = 512
 
 
-# ---------- Frame loader ----------
+# ---------- 帧加载 ----------
 def _load_frame_from_path(path: str) -> np.ndarray:
     import cv2
     img = cv2.imread(path, cv2.IMREAD_COLOR)
@@ -140,7 +143,7 @@ class LazyFrames:
         return self._raw is not None
 
 
-# ---------- Quaternion utilities ----------
+# ---------- 四元数工具 ----------
 def quat_to_rot(q: torch.Tensor) -> torch.Tensor:
     q = F.normalize(q, dim=-1, p=2)
     w, x, y, z = q.unbind(dim=-1)
@@ -164,7 +167,7 @@ def build_covariance(log_scales: torch.Tensor, rotations: torch.Tensor) -> torch
     return M @ M.transpose(1, 2)
 
 
-# ---------- Spherical Harmonics evaluation (up to degree 3) ----------
+# ---------- 球谐求值（最高 3 阶） ----------
 def eval_sh(deg: int, sh_coeffs: torch.Tensor, dirs: torch.Tensor) -> torch.Tensor:
     """求值球谐，返回 [N, 3] 颜色。
 
@@ -209,7 +212,7 @@ def eval_sh(deg: int, sh_coeffs: torch.Tensor, dirs: torch.Tensor) -> torch.Tens
     return torch.clamp(color + 0.5, min=0.0)
 
 
-# ---------- Gaussian3D ----------
+# ---------- 高斯表示 ----------
 @dataclass
 class Gaussian3D:
     positions: torch.Tensor = field(default_factory=lambda: torch.empty(0, 3))
@@ -297,7 +300,7 @@ def densify_initial_gaussians(gaussians: Gaussian3D, expansion_factor: int = 8, 
         param.requires_grad_(True)
 
 
-# ---------- Differentiable Rasterizer (Pure PyTorch) ----------
+# ---------- 可微光栅化器（纯 PyTorch） ----------
 class DifferentiableRasterizer(nn.Module):
     """排序式逐像素 splat 光栅化器。
 
@@ -339,7 +342,7 @@ class DifferentiableRasterizer(nn.Module):
         t_cam = view_matrix[:3, 3]
         cam_positions = positions @ R_cam.T + t_cam
         cam_cov = R_cam @ cov3d @ R_cam.T
-        # SH 方向约定：世界系下 高斯中心 - 相机中心
+        # 球谐方向约定：世界系下 高斯中心 - 相机中心
         center_world = -R_cam.T @ t_cam
 
         # ---- 投影 ----
@@ -520,7 +523,7 @@ class DifferentiableRasterizer(nn.Module):
         return out_color, out_alpha
 
 
-# ---------- Loss functions ----------
+# ---------- 损失函数 ----------
 def compute_ssim_loss(img1: torch.Tensor, img2: torch.Tensor, window_size: int = 11,
                       kernel: Optional[torch.Tensor] = None) -> torch.Tensor:
     C1, C2 = 0.01 ** 2, 0.03 ** 2
@@ -546,7 +549,7 @@ class LossDivergenceError(Exception):
     pass
 
 
-# ---------- Trainer ----------
+# ---------- 训练器 ----------
 class Trainer:
     def __init__(self, gaussians: Gaussian3D, rasterizer: Optional[DifferentiableRasterizer],
                  K: np.ndarray, image_width: int, image_height: int, device: str = "cpu",
@@ -565,7 +568,7 @@ class Trainer:
         self.image_width = image_width
 
         self.use_cuda_rasterizer = False
-        print("[INFO] Using PyTorch rasterizer (supports SH up to 3).")
+        logger.info("使用 PyTorch 光栅化器（支持球谐函数阶数最高 3 阶）。")
 
         self.gaussians = gaussians
         self.K = torch.from_numpy(K.astype(np.float32)).to(device)
@@ -621,7 +624,7 @@ class Trainer:
         # 初始 8× 稠密化必须先于 _setup_optimizers：优化器包裹的是最终张量
         if self.gaussians.num_gaussians < 2000:
             densify_initial_gaussians(self.gaussians, expansion_factor=8, noise_scale=0.02)
-            print(f"  [INIT] Densified to {self.gaussians.num_gaussians} Gaussians")
+            logger.info("[INIT] 已稠密化到 %d 个高斯", self.gaussians.num_gaussians)
         self._setup_optimizers()
 
     def _setup_optimizers(self):
@@ -984,7 +987,7 @@ class Trainer:
         self._update_tanfov()
 
 
-# ---------- Adaptive Density Controller ----------
+# ---------- 密度自适应控制器 ----------
 class AdaptiveDensityController:
     """密度自适应控制器。
 
@@ -1039,13 +1042,13 @@ class AdaptiveDensityController:
 
         if self.should_densify():
             stats = self.densify()
-            print(f"[稠密化] 分裂了{stats['split']}个高斯, 复制{stats['duplicate']}了个高斯")
+            logger.info("[稠密化] 分裂 %d 个高斯, 复制 %d 个高斯", stats["split"], stats["duplicate"])
             # 低显存用户依赖此清理把缓存归还驱动，避免溢出到共享显存
             torch.cuda.empty_cache()
         if self.should_prune():
             n_pruned = self.prune()
             if n_pruned > 0:
-                print(f"[修剪] 移除了 {n_pruned} 个高斯")
+                logger.info("[修剪] 移除 %d 个高斯", n_pruned)
             torch.cuda.empty_cache()
 
     def should_densify(self) -> bool:

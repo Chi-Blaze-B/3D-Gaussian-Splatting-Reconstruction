@@ -7,6 +7,7 @@
 
 """
 
+import logging
 import os
 import tempfile
 import shutil
@@ -14,6 +15,8 @@ from typing import List, Optional, Tuple
 
 import cv2
 import numpy as np
+
+logger = logging.getLogger(__name__)
 
 
 # ---------- 配置 ----------
@@ -250,7 +253,7 @@ def _two_stage_extract(
         coarse_raw = np.linspace(0, total - 1, min(COARSE_FRAMES, total), dtype=int)
         coarse_paths, coarse_indices = _extract_indices(cap, coarse_raw, coarse_dir, w, h)
         if len(coarse_paths) < 2:
-            print("  [警告] 粗提取帧数不足，回退到单阶段智能采样。")
+            logger.warning("粗提取帧数不足，回退到单阶段智能采样。")
             return _smart_extract_from_cap(
                 cap, output_dir, total, orig_fps, fps,
                 min_frames, max_frames, w, h, flow_method,
@@ -261,7 +264,7 @@ def _two_stage_extract(
                 coarse_paths, min_inliers=10, feature_type=feature_type,
             )
         except Exception as e:
-            print(f"  [警告] 粗位姿估计失败: {e}。回退到单阶段智能采样。")
+            logger.warning("粗位姿估计失败: %s。回退到单阶段智能采样。", e)
             return _smart_extract_from_cap(
                 cap, output_dir, total, orig_fps, fps,
                 min_frames, max_frames, w, h, flow_method,

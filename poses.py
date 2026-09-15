@@ -87,7 +87,6 @@ SCALE_CLAMP = (0.5, 2.0)             # 尺度修正裁剪区间
 SCALE_DEADBAND = 0.05                # 尺度修正死区（避免抖动）
 
 logger = logging.getLogger(__name__)
-logging.basicConfig(level=logging.INFO, format="[Pose] %(message)s")
 
 
 # =========================================================================
