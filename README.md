@@ -23,24 +23,24 @@
   <img src="https://img.shields.io/github/issues/Chi-Blaze-B/3D-Gaussian-Splatting-Reconstruction?style=flat-square&color=red&logo=github" alt="Issues">
   <img src="https://img.shields.io/github/last-commit/Chi-Blaze-B/3D-Gaussian-Splatting-Reconstruction?style=flat-square&color=green&logo=github" alt="Last Commit">
 </p>
+基于 Python 的视频转 3D 高斯泼溅（3DGS）工作流。输入一段视频，输出一个 `.ply` 文件，可用官方 3DGS 查看器（https://github.com/graphdeco-inria/gaussian-splatting ）浏览重建的三维场景。
 
-纯 Python + PyTorch 实现的视频转 3D 高斯溅射（3DGS）完整工作流。输入一段视频，输出一个 `.ply` 文件，可用官方 3DGS 查看器（https://github.com/graphdeco-inria/gaussian-splatting ）浏览重建的三维场景。
+**核心光栅化器完全基于 PyTorch 实现**，无需编译 CUDA 扩展，支持 SH 0–3 阶球谐函数，排序式逐像素 splat 向量化。整体流程还依赖 OpenCV、SciPy、PySide6、psutil 等库。
 
-- **纯 PyTorch 光栅化器**：完全基于 PyTorch 实现，无需编译 CUDA 扩展，支持 SH 0–3 阶球谐函数，排序式逐像素 splat 向量化（大幅加速），开箱即用。
+- **纯 PyTorch 光栅化器**：核心光栅化器无需编译 CUDA 扩展，支持 SH 0–3 阶球谐函数，排序式逐像素 splat 向量化（大幅加速），开箱即用。
 - **鲁棒姿态估计**：内置 ORB/SIFT 增量式 SfM（无 COLMAP 依赖），BA 带自适应鲁棒加权与多重保护；也可选用 COLMAP 作为后端。
-- **智能采样**：均匀、光流驱动、两阶段（视差+光流+纹理）三种帧采样策略。
+- **智能采样**：均匀、光流驱动（smart）、两阶段（视差+光流+清晰度）三种帧采样策略。
 - **自适应密度控制**：训练中自动分裂/复制/修剪高斯，支持显存预算控制。
-- **暗色主题 GUI**：基于 PySide6，实时损失曲线、帧预览、日志输出，可配置所有高级参数。
-- **断点续训**：保存完整训练状态（参数、优化器、密度控制器、焦距、最佳损失等），随时恢复。
+- **暗色主题 GUI**：基于 PySide6，实时损失曲线、帧预览、日志输出，可配置常用参数。
+- **断点续训**：保存完整训练状态（参数、优化器、密度控制器、焦距、最佳损失等），恢复时从上次中断帧继续。
 
 ---
-
 ## 📦 安装
 
 ### 环境要求（示例）
 
 - Python 3.11（推荐）
-- CUDA 12.1（可选，CPU 也可运行，如使用建议选择显卡最适合的 CUDA）
+- CUDA 11.8+（可选，CPU 也可运行；安装示例使用 CUDA 12.1，建议根据显卡选择最适合的 CUDA 版本）
 
 ### 步骤
 
@@ -51,7 +51,7 @@
    ```
 2. **安装 PyTorch**
 
-   GPU 版本（此处示例使用 CUDA 12.1，建议根据情况选择显卡最适合的 CUDA 版本）：
+   GPU 版本（示例使用 CUDA 12.1）：
    ```bash
    pip install torch --index-url https://download.pytorch.org/whl/cu121
    ```
@@ -67,7 +67,7 @@
    必须使用 headless 版本，避免与 PySide6 的 Qt 库冲突。
 4. **安装其他依赖**
    ```bash
-   pip install numpy scipy PySide6 matplotlib psutil>=5.9.0
+   pip install numpy scipy PySide6 matplotlib "psutil>=5.9.0"
    ```
 5. **（可选）COLMAP 后端**
 
@@ -78,7 +78,6 @@
    ```
 
 ## 🚀 使用方式
-
 ### 1. 命令行接口（CLI）
 
 基本用法：
@@ -112,7 +111,6 @@ python cli.py --video input.mp4 --output output.ply
 | `--focal-guess` | 初始焦距猜测（像素） | `None` |
 | `--resume-dir` | 从该工作目录恢复训练 | `None` |
 | `--eval-every` | 每 N 轮打印一次日志 | `500` |
-
 #### 示例
 
 ```bash
@@ -129,7 +127,6 @@ python cli.py --video input.mp4 --output out.ply --sampling-mode two-stage --pos
 # 短序列 + SIFT 特征
 python cli.py --video input.mp4 --output out.ply --feature-type sift --sh-degree 3
 ```
-
 ### 2. 图形界面（GUI）
 
 启动 GUI：
@@ -137,7 +134,7 @@ python cli.py --video input.mp4 --output out.ply --feature-type sift --sh-degree
 python gui.py
 ```
 
-图形界面提供完整的参数配置面板，操作直观：
+图形界面提供常用参数配置面板：
 
 - 选择视频、输出路径、工作目录
 - 调整采样策略、训练轮次、高斯预算等
@@ -146,6 +143,8 @@ python gui.py
 - 帧预览分页浏览：每页容量随窗口宽高自适应（列数 × 行数，默认约 24 帧），可翻页查看全部提取帧
 - 日志输出窗口详细记录每步进度
 - 支持中断训练并自动保存检查点
+
+**注意**：GUI 暂未提供 `--focal-guess`、`--resume-dir` 等部分 CLI 参数；`评估间隔`控件当前未生效，训练日志每轮都会输出。
 
 ## 🧩 核心模块说明
 
@@ -161,8 +160,7 @@ python gui.py
 | `cli.py` | 命令行入口，集成完整流程 |
 
 ## 🎯 姿态估计后端选择
-
-三种后端，按你的场景选择：
+三种后端，按场景选择：
 
 | 后端 | 命令 | 适用场景 |
 |------|------|----------|
@@ -177,14 +175,12 @@ python gui.py
 - **想要零依赖、纯 Python**：OpenCV 后端。ORB 覆盖大部分场景，SIFT 作为备选。
 - **不确定用哪个**：先用默认（OpenCV + ORB）跑一遍，结果不满意再换后端对比。
 
-**OpenCV 后端的内部机制**（了解即可）：前端用 ORB/SIFT 特征 + 本质矩阵恢复运动，后端 BA 用自适应鲁棒加权（自动识别并降权异常观测），并有多重保护机制处理视频质量波动、初值异常、过拟合等情况。这些都在内部自动完成，无需手动配置。
+**OpenCV 后端的内部机制**：前端用 ORB/SIFT 特征 + 本质矩阵恢复运动，后端 BA 用自适应鲁棒加权（自动识别并降权异常观测），并有多重保护机制处理视频质量波动、初值异常、过拟合等情况。这些都在内部自动完成，无需手动配置。
 
 ## 📈 训练细节
-
 **损失函数**：`(1 - w_ssim) * L1 + w_ssim * SSIM`，SSIM 权重线性升温。
 
-**密度控制**：每 `densify_every` 步根据梯度累积和尺度分裂/复制高斯，每 `prune_every` 步修剪低不透明度高斯，并自动限制总数量。分裂/复制阈值用**梯度分布的 p60 分位数自适应**（不依赖绝对量级，适配 loss 的 mean reduction；无绝对硬底，避免小梯度量级下永不触发）；复制时**保留原高斯 + 新增带微扰副本**（总数 = n + n_dup，与官方 densify_and_clone 一致）；修剪时保护梯度高于中位数的高斯；对需梯度的参数先 `.detach()` 再转 numpy，修剪后用 `.detach().clone()` 重建叶子张量。**优化器动量按行保留**：密度控制时新增高斯动量补零、幸存者按 mask 保留（官方语义），不再重建 Adam 清空全部动量，避免训练震荡。
-
+**密度控制**：每 `densify_every` 步根据梯度累积和尺度分裂/复制高斯，每 `prune_every` 步修剪低不透明度高斯，并自动限制总数量。分裂/复制阈值用**梯度分布的 p60 分位数自适应**（不依赖绝对量级，适配 loss 的 mean reduction；无绝对硬底，避免小梯度量级下永不触发）；复制时**保留原高斯 + 新增带微扰副本**（总数 = n + n_dup，与官方 densify_and_clone 一致）；修剪时保护梯度高于中位数的高斯；对需梯度的参数先 `.detach()` 再操作，并用 `.detach()` 重建修剪后的叶子张量。**优化器动量按行保留**：密度控制时新增高斯动量补零、幸存者按 mask 保留（官方语义），不再重建 Adam 清空全部动量，避免训练震荡。
 **初始高斯稠密化**：若初始化后高斯数量少于 2000 个，自动对每个高斯做 8 倍扩增（加噪声），确保训练有足够的起始高斯数。
 
 **学习率衰减**：指数衰减，每 `lr_decay_steps` 步乘以 `lr_decay_gamma`。
@@ -193,24 +189,20 @@ python gui.py
 
 **梯度裁剪**：全局梯度范数限制为 10.0，防止训练发散。
 
-**光栅化器向量化**：像素级合成采用**排序式逐像素 splat**——把逐高斯 Python 内层循环重写为「展平覆盖像素对 → stable sort → 分段透射率 → scatter_add 归约」的纯张量算子，消除每颗高斯的 kernel launch 与 GPU→CPU 同步。实测 180x320+4000 高斯 forward 加速 **14.5x**、forward+backward **37.7x**；2160x3840+38665 高斯单帧约 1.7s（原为分钟级）。输出与旧实现逐元素一致（误差 < 1e-6）。
-
+**光栅化器向量化**：像素级合成采用**排序式逐像素 splat**——把逐高斯 Python 内层循环重写为「展平覆盖像素对 → stable sort → 分段透射率 → scatter_add 归约」的纯张量算子，消除每颗高斯的 kernel launch 与 GPU→CPU 同步。在作者测试环境下（180x320+4000 高斯）forward 加速约 14.5x、forward+backward 约 37.7x；2160x3840+38665 高斯单帧约 1.7s（原为分钟级）。输出与旧实现逐元素一致（误差 < 1e-6）。具体加速比因硬件和场景而异。
 **光栅化器显存上界（分块）**：逐像素合成按深度有序高斯**分块**（每块至多 512 颗），块内覆盖网格只按块内最大包围盒物化——单颗大高斯（半径已 clamp 到 16）只撑大自己所在块，不再让全体陪跑。跨块透射率用**逐像素 log-transmittance 进位**（carry）累计，与整表算法在精确算术下等价（fp64 验证一致到 ~5e-13）。实测 256²、n=2000→4000 时峰值显存 **361→369MB 基本持平**（旧实现 1049→2099MB 翻倍）。附带收益：深堆叠像素上分块版比整表全局 cumsum 更准（整表大负数相减存在灾难性抵消，分块块内 cumsum 短）。
-
 **混合精度（AMP）**：`--amp` 开启 fp16 混合精度，**仅 CUDA 生效**。cov3d 组合矩阵乘与 SSIM 卷积走 fp16（Ampere+ 可命中 Tensor Core），光栅化器内部保持 fp32（其 cumsum/scatter 不使用 Tensor Core，硬上 fp16 反而伤数值），配 GradScaler 动态损失缩放避免梯度下溢。无 Tensor Core 的显卡（如 GTX 10 系）开启无收益甚至略慢，**默认关闭**。
 
-**帧内存预加载**：训练每 epoch 遍历全部帧，读盘 + PNG 解码是主要开销且伤硬盘。帧在训练开始前全部预解码为 **uint8 RGB** 缓存到内存（200 帧约 5GB，仅为 float32 的 1/4），训练期间**零磁盘读取**，访问时按需转 float32。实测 2 epoch × 200 帧从 57.3s（全读盘）降到 21.9s（内存缓存），**2.6x 加速且消除磁盘 IO**。
-
+**帧内存预加载**：训练每 epoch 遍历全部帧，读盘 + PNG 解码是主要开销且伤硬盘。帧在训练开始前全部预解码为 **uint8 RGB** 缓存到内存（200 帧约 5GB，具体取决于分辨率，仅为 float32 的 1/4），训练期间**零磁盘读取**，访问时按需转 float32。实测 2 epoch × 200 帧从 57.3s（全读盘）降到 21.9s（内存缓存），**2.6x 加速且消除磁盘 IO**。
 **梯度图连接保护**：光栅化器在边缘情况（高斯数为 0、全部高斯在相机后方或投影到画面外）下返回与计算图保持连接的零张量，避免 `loss.backward()` 因缺少 `grad_fn` 而崩溃。
 
-**密度控制梯度处理**：密度控制（densify/prune）对需梯度的参数先 `.detach()` 再转 numpy，并用 `.detach().clone()` 重建修剪后的叶子张量，避免 `numpy()` 误用崩溃和修剪后参数被优化器静默跳过。
+**密度控制梯度处理**：密度控制（densify/prune）对需梯度的参数先 `.detach()` 再操作，并用 `.detach()` 重建修剪后的叶子张量，避免 `numpy()` 误用崩溃和修剪后参数被优化器静默跳过。
 
 **Loss 发散保护**：若单步 loss 超过阈值（默认 1.0），自动保存检查点并中断训练，避免无限发散。
 
 **焦距自校准**：若启用 `--train-focal`，在训练中优化焦距参数（fx, fy），适应实际内参。
 
 ## 💾 断点续训
-
 所有中间结果和训练状态保存在 `--workdir` 指定目录下：
 
 | 文件 | 内容 |
@@ -219,9 +211,7 @@ python gui.py
 | `intrinsics.npy`、`poses.npy`、`sparse_points.npy` | 姿态和稀疏点云 |
 | `gaussian_params.npz` | 初始化后的高斯参数 |
 | `training_state.pt` | 完整训练状态（参数、优化器、密度控制器、焦距、SH 阶数等） |
-| `best_training_state.pt` | 历史最优（最低 loss）训练状态，始终保留不覆盖 |
-
-**最佳检查点保护**：`best_training_state.pt` 始终保留训练过程中的最优模型，与常规检查点分开保存，不会因后续训练震荡而被覆盖。
+| `best_training_state.pt` | 历史最优（最低 loss）训练状态，训练过程中会保存 |
 
 **恢复训练**：
 ```bash
@@ -229,12 +219,11 @@ python cli.py --video input.mp4 --resume-dir ./workdir --output restored.ply
 ```
 或通过 GUI 直接选择相同的工作目录，程序自动检测并恢复。恢复时，训练会**从上次中断的帧位置继续**（检查点记录 `last_frame_index`，配合有效位姿帧数计算），而非从头开始该轮次。检查点保存的**高斯基数与当前初始化数量不同也可恢复**（密度自适应会改变数量，恢复时直接采用检查点参数重建高斯与优化器）。
 
-**位姿保存约定**：`poses.npy` 保存为**定长数组**（长度 = 帧数），缺失位姿的帧记为 `NaN` 行，恢复时按索引还原——中段存在未注册帧（COLMAP 常见）也不会错位。旧版 gap 压缩缓存无法还原中段对齐（自动退化为末尾补 None，不崩溃）。
+**位姿保存约定**：`poses.npy` 保存为**定长数组**（长度 = 帧数），缺失位姿的帧记为 `NaN` 行，恢复时按索引还原——中段存在未注册帧（COLMAP 常见）也不会错位。
 
-**尺度缓存迁移**：`gaussian_params.npz` 带 `scale_domain` 标记；旧缓存（曾把 log 尺度存入 `scales` 键，导致初始化双重取 log、全部高斯塌缩为 1e-6）加载时自动迁移为线性尺度。
+**SH 颜色约定**：已对齐官方 3DGS——DC 系数存 `(RGB-0.5)/C0`、求值补 `+0.5`、视角方向用世界系；导出的 `.ply` 可直接被官方查看器 / SuperSplat 加载。
 
-**SH 颜色约定**：已对齐官方 3DGS——DC 系数存 `(RGB-0.5)/C0`、求值补 `+0.5`、视角方向用世界系；导出的 `.ply` 可直接被官方查看器 / SuperSplat 加载。旧检查点的 SH 系数与新约定不兼容（预发布，加载处有注释）。
-
+**注意**：续训时 `best_loss` 从 `inf` 重新开始，不会从 `best_training_state.pt` 恢复历史最优值。如需保留最优模型，请勿覆盖 `best_training_state.pt`。
 ## ⚙️ 高级参数调优建议
 
 **采样模式**
@@ -255,16 +244,20 @@ python cli.py --video input.mp4 --resume-dir ./workdir --output restored.ply
 - `--pose-estimator colmap`：长序列推荐。
 
 ## 📝 注意事项
-
 - **帧采样数量**：通常 100~200 帧效果较好，过少会导致欠约束，过多增加训练时间。
 - **姿态估计后端**：
   - 长序列（≥60 帧）优先用 `--pose-estimator colmap`。COLMAP 对视频长序列的注册率低是其 mapper 的固有行为（只注册可稳定三角化的帧），但注册帧点云质量高，足以初始化高斯。mapper 可能把场景拆成多个子模型，程序会自动选择注册图像数最多的模型。
   - 短序列（<60 帧）用 OpenCV 后端即可。默认 ORB 覆盖大部分场景；纹理不足或想更稳健可换 `--feature-type sift`。
   - 自研 OpenCV 后端已处理常见的 BA 深度异常、尺度漂移、焦距漂移、少观测过拟合等问题，无需手动干预。
-- **显存管理**：如果训练中显存溢出，程序会自动修剪高斯并降低上限，并保存检查点。
+- **显存管理**：GUI 在检测到 CUDA OOM 时会尝试降低高斯上限并修剪；CLI 无此自动处理，若显存溢出需手动降低 `--max-gaussians`。
 - **CPU 亲和性**：启动时会自动绑定所有逻辑核心，提升多核利用效率（通过 psutil）。
 - **光栅化器**：本项目使用纯 PyTorch 实现的光栅化器（排序式逐像素 splat 向量化，分块显存上界），无需编译任何 CUDA 扩展，开箱即用。
 - **GPU 精度**：`--amp` 混合精度仅对 Ampere+（RTX 30 系及以上）有 Tensor Core 收益；无 Tensor Core 的显卡（GTX 10 系等）请保持默认纯 FP32。
+
+## ⚠️ 已知限制
+
+- GUI 未暴露 `--focal-guess`、`--resume-dir` 等参数；评估间隔控件未生效。
+- 性能数字为作者测试环境结果，不同硬件、分辨率、场景下会有所差异。
 
 ## 📄 许可证
 
