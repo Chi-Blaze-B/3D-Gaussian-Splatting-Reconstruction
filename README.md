@@ -31,6 +31,7 @@
 - **鲁棒姿态估计**：内置 ORB/SIFT 增量式 SfM（无 COLMAP 依赖），BA 带自适应鲁棒加权与多重保护；也可选用 COLMAP 作为后端。
 - **智能采样**：均匀、光流驱动（smart）、两阶段（视差+光流+清晰度）三种帧采样策略。
 - **自适应密度控制**：训练中自动分裂/复制/修剪高斯，支持显存预算控制。
+- **硬件自适应配置**：按实际训练设备（显存或系统内存）自动推导光栅化分块、半径上限与高斯数量上限，避免 CPU 训练被显存分档误伤。
 - **暗色主题 GUI**：基于 PySide6，实时损失曲线、帧预览、日志输出，可配置常用参数。
 - **断点续训**：保存完整训练状态（参数、优化器、密度控制器、焦距、最佳损失等），恢复时从上次中断帧继续。
 
@@ -98,7 +99,7 @@ python cli.py --video input.mp4 --output output.ply
 | `--sampling-mode` | 采样模式：uniform / smart / two-stage | `uniform` |
 | `--num-epochs` | 训练轮数 | `3000` |
 | `--device` | 计算设备：auto / cpu / cuda | `auto` |
-| `--max-gaussians` | 最大高斯数量 | `300000` |
+| `--max-gaussians` | 最大高斯数量；不指定则按实际训练设备自动选择 | `None`（自动） |
 | `--sh-degree` | 球谐阶数（0~3） | `0` |
 | `--sh-warmup-steps` | SH 阶数升温步数 | `1000` |
 | `--ssim-warmup-steps` | SSIM 权重升温步数 | `500` |
@@ -111,6 +112,8 @@ python cli.py --video input.mp4 --output output.ply
 | `--focal-guess` | 初始焦距猜测（像素） | `None` |
 | `--resume-dir` | 从该工作目录恢复训练 | `None` |
 | `--eval-every` | 每 N 轮打印一次日志 | `500` |
+| `--show-config` | 按 `--device` 打印硬件自适应渲染配置后退出 | `False` |
+
 #### 示例
 
 ```bash
@@ -126,7 +129,11 @@ python cli.py --video input.mp4 --output out.ply --sampling-mode two-stage --pos
 
 # 短序列 + SIFT 特征
 python cli.py --video input.mp4 --output out.ply --feature-type sift --sh-degree 3
+
+# 查看当前设备下的自适应渲染配置
+python cli.py --video input.mp4 --device cuda --show-config
 ```
+
 ### 2. 图形界面（GUI）
 
 启动 GUI：
@@ -137,7 +144,7 @@ python gui.py
 图形界面提供常用参数配置面板：
 
 - 选择视频、输出路径、工作目录
-- 调整采样策略、训练轮次、高斯预算等
+- 调整采样策略、训练轮次、高斯预算等；**高斯上限自动按当前设备（CPU/CUDA）刷新范围与默认值**，切换设备下拉框即更新
 - 实时预览帧缩略图
 - 训练过程中显示损失曲线（帧级和轮次级）
 - 帧预览分页浏览：每页容量随窗口宽高自适应（列数 × 行数，默认约 24 帧），可翻页查看全部提取帧
@@ -154,7 +161,7 @@ python gui.py
 | `poses.py` | 纯 OpenCV 增量式 SfM（ORB/SIFT），带自适应鲁棒 BA 与多重防护，点云过滤 |
 | `colmap_poses.py` | COLMAP 封装，作为备选姿态估计后端 |
 | `point_cloud.py` | 从稀疏点云初始化高斯参数（SH 0–3），自适应离群点剔除；颜色采样与高斯构造分离，复用帧内存缓存 |
-| `gaussian.py` | 3DGS 核心：纯 PyTorch 光栅化器（排序式逐像素 splat 向量化，含梯度图连接保护）、LazyFrames 帧内存预加载、Trainer、密度控制、学习率调度 |
+| `gaussian.py` | 3DGS 核心：纯 PyTorch 光栅化器（排序式逐像素 splat 向量化，含梯度图连接保护）、LazyFrames 帧内存预加载、Trainer、密度控制、学习率调度、硬件自适应配置（`RenderConfig` / `auto_tune_config`） |
 | `exporter.py` | 导出标准 PLY 格式，兼容官方查看器 |
 | `gui.py` | PySide6 暗色主题图形界面，帧预览分页浏览（列数×行数随窗口宽高自适应，可查看全部帧） |
 | `cli.py` | 命令行入口，集成完整流程 |
@@ -177,6 +184,18 @@ python gui.py
 
 **OpenCV 后端的内部机制**：前端用 ORB/SIFT 特征 + 本质矩阵恢复运动，后端 BA 用自适应鲁棒加权（自动识别并降权异常观测），并有多重保护机制处理视频质量波动、初值异常、过拟合等情况。这些都在内部自动完成，无需手动配置。
 
+## 🧠 硬件自适应渲染配置
+
+光栅化分块大小、半径上限与高斯数量上限由实际训练设备决定，避免「有显卡但用 CPU 训练」时按显存分档导致 RAM 被打爆。
+
+- **device 决定分档依据**：`cuda` → GPU 显存；`cpu` → 系统内存；`auto/None` → 按 `torch.cuda.is_available()` 自动判断。
+- **探测顺序**：显存走 `torch.cuda.get_device_properties`；内存走 psutil → `os.sysconf` → Windows `GlobalMemoryStatusEx`。
+- **结果**：写入 `RenderConfig`（`raster_chunk` / `radius_max` / `max_gaussians` / `source` / `hardware_gb`），CLI 与 GUI 都从这里取。
+- **可手动下调**：`--max-gaussians` 只覆盖 `max_gaussians`，其余渲染参数不变；GUI 中切换设备下拉框会自动刷新高斯上限控件的范围与默认值。
+- **查看方式**：`python cli.py --video input.mp4 --device cuda --show-config`。
+
+`render_config` 会随训练检查点一起保存；`load_training_state` 会同步恢复光栅化器的 `raster_chunk` / `radius_max` / `max_span`，保证续训时的渲染行为与保存时一致。
+
 ## 📈 训练细节
 **损失函数**：`(1 - w_ssim) * L1 + w_ssim * SSIM`，SSIM 权重线性升温。
 
@@ -190,7 +209,7 @@ python gui.py
 **梯度裁剪**：全局梯度范数限制为 10.0，防止训练发散。
 
 **光栅化器向量化**：像素级合成采用**排序式逐像素 splat**——把逐高斯 Python 内层循环重写为「展平覆盖像素对 → stable sort → 分段透射率 → scatter_add 归约」的纯张量算子，消除每颗高斯的 kernel launch 与 GPU→CPU 同步。在作者测试环境下（180x320+4000 高斯）forward 加速约 14.5x、forward+backward 约 37.7x；2160x3840+38665 高斯单帧约 1.7s（原为分钟级）。输出与旧实现逐元素一致（误差 < 1e-6）。具体加速比因硬件和场景而异。
-**光栅化器显存上界（分块）**：逐像素合成按深度有序高斯**分块**（每块至多 512 颗），块内覆盖网格只按块内最大包围盒物化——单颗大高斯（半径已 clamp 到 16）只撑大自己所在块，不再让全体陪跑。跨块透射率用**逐像素 log-transmittance 进位**（carry）累计，与整表算法在精确算术下等价（fp64 验证一致到 ~5e-13）。实测 256²、n=2000→4000 时峰值显存 **361→369MB 基本持平**（旧实现 1049→2099MB 翻倍）。附带收益：深堆叠像素上分块版比整表全局 cumsum 更准（整表大负数相减存在灾难性抵消，分块块内 cumsum 短）。
+**光栅化器显存上界（分块）**：逐像素合成按深度有序高斯**分块**（每块大小由 `raster_chunk` 决定，随硬件分档变化），块内覆盖网格只按块内最大包围盒物化——单颗大高斯（半径已 clamp 到 `radius_max`）只撑大自己所在块，不再让全体陪跑。跨块透射率用**逐像素 log-transmittance 进位**（carry）累计，与整表算法在精确算术下等价（fp64 验证一致到 ~5e-13）。附带收益：深堆叠像素上分块版比整表全局 cumsum 更准（整表大负数相减存在灾难性抵消，分块块内 cumsum 短）。
 **混合精度（AMP）**：`--amp` 开启 fp16 混合精度，**仅 CUDA 生效**。cov3d 组合矩阵乘与 SSIM 卷积走 fp16（Ampere+ 可命中 Tensor Core），光栅化器内部保持 fp32（其 cumsum/scatter 不使用 Tensor Core，硬上 fp16 反而伤数值），配 GradScaler 动态损失缩放避免梯度下溢。无 Tensor Core 的显卡（如 GTX 10 系）开启无收益甚至略慢，**默认关闭**。
 
 **帧内存预加载**：训练每 epoch 遍历全部帧，读盘 + PNG 解码是主要开销且伤硬盘。帧在训练开始前全部预解码为 **uint8 RGB** 缓存到内存（200 帧约 5GB，具体取决于分辨率，仅为 float32 的 1/4），训练期间**零磁盘读取**，访问时按需转 float32。实测 2 epoch × 200 帧从 57.3s（全读盘）降到 21.9s（内存缓存），**2.6x 加速且消除磁盘 IO**。
@@ -210,20 +229,21 @@ python gui.py
 | `frame_paths.txt` | 帧路径列表 |
 | `intrinsics.npy`、`poses.npy`、`sparse_points.npy` | 姿态和稀疏点云 |
 | `gaussian_params.npz` | 初始化后的高斯参数 |
-| `training_state.pt` | 完整训练状态（参数、优化器、密度控制器、焦距、SH 阶数等） |
+| `training_state.pt` | 完整训练状态（参数、优化器、密度控制器、焦距、SH 阶数、渲染配置等） |
 | `best_training_state.pt` | 历史最优（最低 loss）训练状态，训练过程中会保存 |
 
 **恢复训练**：
 ```bash
 python cli.py --video input.mp4 --resume-dir ./workdir --output restored.ply
 ```
-或通过 GUI 直接选择相同的工作目录，程序自动检测并恢复。恢复时，训练会**从上次中断的帧位置继续**（检查点记录 `last_frame_index`，配合有效位姿帧数计算），而非从头开始该轮次。检查点保存的**高斯基数与当前初始化数量不同也可恢复**（密度自适应会改变数量，恢复时直接采用检查点参数重建高斯与优化器）。
+或通过 GUI 直接选择相同的工作目录，程序自动检测并恢复。恢复时，训练会**从上次中断的帧位置继续**（检查点记录 `last_frame_index`，配合有效位姿帧数计算），而非从头开始该轮次。检查点保存的**高斯基数与当前初始化数量不同也可恢复**（密度自适应会改变数量，恢复时直接采用检查点参数重建高斯与优化器）。**渲染配置（`raster_chunk` / `radius_max` / `max_span`）也会随检查点恢复**，保证续训时渲染行为一致。
 
 **位姿保存约定**：`poses.npy` 保存为**定长数组**（长度 = 帧数），缺失位姿的帧记为 `NaN` 行，恢复时按索引还原——中段存在未注册帧（COLMAP 常见）也不会错位。
 
 **SH 颜色约定**：已对齐官方 3DGS——DC 系数存 `(RGB-0.5)/C0`、求值补 `+0.5`、视角方向用世界系；导出的 `.ply` 可直接被官方查看器 / SuperSplat 加载。
 
 **注意**：续训时 `best_loss` 从 `inf` 重新开始，不会从 `best_training_state.pt` 恢复历史最优值。如需保留最优模型，请勿覆盖 `best_training_state.pt`。
+
 ## ⚙️ 高级参数调优建议
 
 **采样模式**
@@ -233,7 +253,7 @@ python cli.py --video input.mp4 --resume-dir ./workdir --output restored.ply
 **训练**
 
 - `--sh-degree 3`：获得最强的视角相关效果，但训练时间略增。
-- `--max-gaussians`：根据显存设置，推荐 300k~500k（8GB 显存可尝试 300k，24GB 可到 1M）。
+- `--max-gaussians`：不指定时按实际设备自动选择上限（`--show-config` 可查看）；手动设定时根据显存/内存设置，推荐 GPU 300k~500k（8GB 显存可尝试 300k，24GB 可到 1M），CPU 训练保持保守（≤200k）。
 - `--train-focal`：若视频本身运动估计不准，开启此选项可改善几何一致性。
 - `--random-background`：能提升前景物体重建质量，但背景透明区域可能受干扰。
 
@@ -249,7 +269,8 @@ python cli.py --video input.mp4 --resume-dir ./workdir --output restored.ply
   - 长序列（≥60 帧）优先用 `--pose-estimator colmap`。COLMAP 对视频长序列的注册率低是其 mapper 的固有行为（只注册可稳定三角化的帧），但注册帧点云质量高，足以初始化高斯。mapper 可能把场景拆成多个子模型，程序会自动选择注册图像数最多的模型。
   - 短序列（<60 帧）用 OpenCV 后端即可。默认 ORB 覆盖大部分场景；纹理不足或想更稳健可换 `--feature-type sift`。
   - 自研 OpenCV 后端已处理常见的 BA 深度异常、尺度漂移、焦距漂移、少观测过拟合等问题，无需手动干预。
-- **显存管理**：GUI 在检测到 CUDA OOM 时会尝试降低高斯上限并修剪；CLI 无此自动处理，若显存溢出需手动降低 `--max-gaussians`。
+- **显存/内存管理**：GUI 在检测到 CUDA OOM 时会尝试降低高斯上限并修剪；CLI 无此自动处理，若显存溢出需手动降低 `--max-gaussians`，或改用 `--device cpu` 走内存分档。
+- **设备选择与分档**：`--device` 决定按显存还是系统内存分档。有显卡但想用 CPU 训练时务必显式传 `--device cpu`，否则默认按显存分档会使 `max_gaussians` 远超 RAM 承受能力。
 - **CPU 亲和性**：启动时会自动绑定所有逻辑核心，提升多核利用效率（通过 psutil）。
 - **光栅化器**：本项目使用纯 PyTorch 实现的光栅化器（排序式逐像素 splat 向量化，分块显存上界），无需编译任何 CUDA 扩展，开箱即用。
 - **GPU 精度**：`--amp` 混合精度仅对 Ampere+（RTX 30 系及以上）有 Tensor Core 收益；无 Tensor Core 的显卡（GTX 10 系等）请保持默认纯 FP32。

@@ -1,22 +1,25 @@
 """
-3D Gaussian Splatting — 核心模块、光栅化器与训练。
-纯 PyTorch 实现（无需 CUDA 扩展）。
-球谐函数阶数最高支持 3。
+3D 高斯泼溅：核心模块、光栅化器与训练器。纯 PyTorch 实现，无 CUDA 扩展。
+球谐最高 3 阶。
 """
 
+import gc
 import logging
+import os
+import sys
 import threading
+from dataclasses import dataclass, field, replace
+from typing import Optional, List, Dict, Callable, Union
+from collections import OrderedDict
+
 import numpy as np
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
-from collections import OrderedDict
-from dataclasses import dataclass, field
-from typing import Optional, List, Dict, Callable, Union
 
 logger = logging.getLogger(__name__)
 
-# ---------- 超参数 ----------
+# ---------- 训练超参数 ----------
 LR_POSITIONS = 1.6e-4
 LR_LOG_SCALES = 5.0e-3
 LR_OPACITIES = 5.0e-2
@@ -29,7 +32,6 @@ PRUNE_EVERY = 1000
 GRAD_THRESH_BASE = 0.0002
 SCALE_THRESH = 0.01
 MIN_OPACITY = 0.005
-MAX_GAUSSIANS = 1_000_000
 SH_WARMUP_STEPS = 1000
 SSIM_WARMUP_STEPS = 500
 SSIM_WEIGHT_MAX = 0.2
@@ -39,9 +41,165 @@ CHECKPOINT_INTERVAL_STEPS = 500
 LR_DECAY_STEPS = 1000
 LR_DECAY_GAMMA = 0.998
 USE_LR_SCHEDULE = True
-MAX_SPAN = 33
-# 光栅化器分块尺寸：按深度有序高斯切块，单块显存上界 = RASTER_CHUNK × MAX_SPAN²
-RASTER_CHUNK = 512
+
+
+# ---------- 硬件探测 ----------
+def _detect_gpu_total_memory_gb(device_index: int = 0) -> float:
+    """探测 GPU 总显存（GB）。无 CUDA 或失败返回 0。"""
+    if not torch.cuda.is_available():
+        return 0.0
+    try:
+        return float(torch.cuda.get_device_properties(device_index).total_memory) / (1024 ** 3)
+    except Exception as e:
+        logger.warning("探测 GPU 显存失败：%s", e)
+        return 0.0
+
+
+def _detect_system_memory_gb() -> float:
+    """探测系统内存（GB）。psutil → sysconf → Windows ctypes。"""
+    try:
+        import psutil  # type: ignore
+        return float(psutil.virtual_memory().total) / (1024 ** 3)
+    except ImportError:
+        pass
+    except Exception:
+        pass
+
+    if hasattr(os, "sysconf"):
+        try:
+            pages = os.sysconf("SC_PHYS_PAGES")
+            page_size = os.sysconf("SC_PAGE_SIZE")
+            if pages > 0 and page_size > 0:
+                return float(pages * page_size) / (1024 ** 3)
+        except (ValueError, OSError, AttributeError):
+            pass
+
+    if sys.platform == "win32":
+        try:
+            import ctypes
+
+            class _MEMORYSTATUSEX(ctypes.Structure):
+                _fields_ = [
+                    ("dwLength", ctypes.c_uint32),
+                    ("dwMemoryLoad", ctypes.c_uint32),
+                    ("ullTotalPhys", ctypes.c_uint64),
+                    ("ullAvailPhys", ctypes.c_uint64),
+                    ("ullTotalPageFile", ctypes.c_uint64),
+                    ("ullAvailPageFile", ctypes.c_uint64),
+                    ("ullTotalVirtual", ctypes.c_uint64),
+                    ("ullAvailVirtual", ctypes.c_uint64),
+                    ("ullAvailExtendedVirtual", ctypes.c_uint64),
+                ]
+
+            stat = _MEMORYSTATUSEX()
+            stat.dwLength = ctypes.sizeof(_MEMORYSTATUSEX)
+            if ctypes.windll.kernel32.GlobalMemoryStatusEx(ctypes.byref(stat)):
+                return float(stat.ullTotalPhys) / (1024 ** 3)
+        except Exception:
+            pass
+
+    return 0.0
+
+
+# ---------- 渲染配置 ----------
+@dataclass(frozen=True)
+class RenderConfig:
+    """光栅化器 + 密度上限的硬件相关配置。
+
+    raster_chunk: 光栅化分块的高斯数。
+    radius_max:   3σ 半径上限；max_span = 2*radius_max + 1。
+    max_gaussians: 高斯数量硬上限。
+    source/hardware_gb: 配置来源与触发档位的硬件容量。
+    """
+    raster_chunk: int
+    radius_max: int
+    max_gaussians: int
+    source: str
+    hardware_gb: float
+
+    @property
+    def max_span(self) -> int:
+        return 2 * self.radius_max + 1
+
+
+def _tune_for_gpu(vram_gb: float) -> RenderConfig:
+    if vram_gb < 4:
+        return RenderConfig(64, 6, 100_000, "cuda", vram_gb)
+    if vram_gb < 6:
+        return RenderConfig(96, 7, 200_000, "cuda", vram_gb)
+    if vram_gb < 8:
+        return RenderConfig(128, 8, 300_000, "cuda", vram_gb)
+    if vram_gb < 12:
+        return RenderConfig(192, 10, 500_000, "cuda", vram_gb)
+    if vram_gb < 16:
+        return RenderConfig(256, 12, 700_000, "cuda", vram_gb)
+    if vram_gb < 24:
+        return RenderConfig(384, 14, 1_000_000, "cuda", vram_gb)
+    return RenderConfig(512, 16, 1_500_000, "cuda", vram_gb)
+
+
+def _tune_for_cpu(ram_gb: float) -> RenderConfig:
+    """CPU 分档：max_gaussians 保持保守，避免 RAM 打爆。"""
+    if ram_gb < 8:
+        return RenderConfig(32, 6, 50_000, "cpu", ram_gb)
+    if ram_gb < 16:
+        return RenderConfig(48, 7, 100_000, "cpu", ram_gb)
+    if ram_gb < 32:
+        return RenderConfig(64, 8, 200_000, "cpu", ram_gb)
+    if ram_gb < 64:
+        return RenderConfig(96, 9, 300_000, "cpu", ram_gb)
+    if ram_gb < 128:
+        return RenderConfig(128, 10, 400_000, "cpu", ram_gb)
+    return RenderConfig(192, 12, 600_000, "cpu", ram_gb)
+
+
+def auto_tune_config(device: Optional[str] = None,
+                     vram_gb: Optional[float] = None,
+                     ram_gb: Optional[float] = None,
+                     device_index: int = 0) -> RenderConfig:
+    """按实际训练设备推导渲染配置。
+
+    device 决定分档依据：cuda → 显存；cpu → 系统内存；None/auto → 自动判断。
+    显式传 device 是关键：用 CPU 训练时不能按显存分档，否则内存会爆。
+    """
+    if device is None or device == "auto":
+        use_cuda = torch.cuda.is_available()
+    else:
+        use_cuda = str(device).startswith("cuda") and torch.cuda.is_available()
+
+    if use_cuda:
+        if vram_gb is None:
+            vram_gb = _detect_gpu_total_memory_gb(device_index)
+        if vram_gb > 0:
+            cfg = _tune_for_gpu(vram_gb)
+            logger.info(
+                "[AutoTune] 设备=%s，GPU 显存 %.1fGB → raster_chunk=%d radius_max=%d "
+                "max_span=%d max_gaussians=%d",
+                device or "cuda", cfg.hardware_gb, cfg.raster_chunk, cfg.radius_max,
+                cfg.max_span, cfg.max_gaussians,
+            )
+            return cfg
+        logger.warning("[AutoTune] 指定 CUDA 但探测不到显存，回落到系统内存分档。")
+
+    if ram_gb is None:
+        ram_gb = _detect_system_memory_gb()
+    if ram_gb > 0:
+        cfg = _tune_for_cpu(ram_gb)
+        logger.info(
+            "[AutoTune] 设备=%s，系统内存 %.1fGB → raster_chunk=%d radius_max=%d "
+            "max_span=%d max_gaussians=%d",
+            device or "cpu", cfg.hardware_gb, cfg.raster_chunk, cfg.radius_max,
+            cfg.max_span, cfg.max_gaussians,
+        )
+        return cfg
+
+    cfg = RenderConfig(32, 6, 50_000, "fallback", 0.0)
+    logger.warning(
+        "[AutoTune] 无法探测系统内存，使用保守默认 → "
+        "raster_chunk=%d radius_max=%d max_span=%d max_gaussians=%d",
+        cfg.raster_chunk, cfg.radius_max, cfg.max_span, cfg.max_gaussians,
+    )
+    return cfg
 
 
 # ---------- 帧加载 ----------
@@ -54,7 +212,7 @@ def _load_frame_from_path(path: str) -> np.ndarray:
 
 
 def _load_frame_raw(path: str) -> np.ndarray:
-    """读取为 uint8 RGB，内存占用为 float32 的 1/4，供预加载缓存使用。"""
+    """读取为 uint8 RGB（内存为 float32 的 1/4）。"""
     import cv2
     img = cv2.imread(path, cv2.IMREAD_COLOR)
     if img is None:
@@ -63,18 +221,13 @@ def _load_frame_raw(path: str) -> np.ndarray:
 
 
 class LazyFrames:
-    """帧容器：内存缓存 uint8 + 按需转 float32。
-
-    训练每 epoch 顺序遍历全部帧，读盘 + 解码是主要开销。本容器在构造时把
-    全部帧解码为 uint8 RGB（内存约为 float32 的 1/4），访问时按需转 float32，
-    避免全量 float32 的内存压力。preload=False 时回退为惰性加载。
-    """
+    """帧容器：预载 uint8，按需转 float32。"""
 
     def __init__(self, sources: List[Union[str, np.ndarray]], preload: bool = True,
                  cache_size: int = 0):
         self._sources = sources
         self._cache_size = max(0, cache_size)
-        self._cache: OrderedDict = OrderedDict()  # 路径 -> float32 ndarray
+        self._cache: OrderedDict = OrderedDict()
         self._raw: Optional[List[Optional[np.ndarray]]] = None
         self._hits = 0
         self._misses = 0
@@ -123,7 +276,6 @@ class LazyFrames:
         return _load_frame_from_path(src)
 
     def preload(self) -> None:
-        """手动触发预加载（幂等）。"""
         if self._raw is None:
             self._raw = [None] * len(self._sources)
         for i, src in enumerate(self._sources):
@@ -167,13 +319,12 @@ def build_covariance(log_scales: torch.Tensor, rotations: torch.Tensor) -> torch
     return M @ M.transpose(1, 2)
 
 
-# ---------- 球谐求值（最高 3 阶） ----------
+# ---------- 球谐求值 ----------
 def eval_sh(deg: int, sh_coeffs: torch.Tensor, dirs: torch.Tensor) -> torch.Tensor:
     """求值球谐，返回 [N, 3] 颜色。
 
-    sh_coeffs: [N, (deg+1)^2, 3]，DC 通道已存 (RGB-0.5)/C0；
+    sh_coeffs: [N, (deg+1)^2, 3]，DC 通道已存 (RGB-0.5)/C0。
     dirs: [N, 3] 单位方向（世界系：高斯中心 - 相机中心）。
-    求值后补回 +0.5，deg0 时 color == RGB；clamp_min(0) 与官方光栅化器一致。
     """
     N = sh_coeffs.shape[0]
     device = sh_coeffs.device
@@ -205,9 +356,7 @@ def eval_sh(deg: int, sh_coeffs: torch.Tensor, dirs: torch.Tensor) -> torch.Tens
         0.5900435899266435 * x * (x * x - 3 * y * y)
     ], dim=1)
 
-    basis_list = [sh0, sh1, sh2, sh3]
-    basis = torch.cat(basis_list[:deg + 1], dim=1)
-
+    basis = torch.cat([sh0, sh1, sh2, sh3][:deg + 1], dim=1)
     color = torch.einsum('nc, ncd -> nd', basis, sh_coeffs[:, :basis.shape[1], :])
     return torch.clamp(color + 0.5, min=0.0)
 
@@ -234,11 +383,6 @@ class Gaussian3D:
         return build_covariance(self.log_scales, self.rotations)
 
     def export_ply_dict(self) -> Dict[str, np.ndarray]:
-        """导出官方 3DGS PLY 所需的原始参数（不做激活转换）。
-
-        scale 存 log σ、opacity 存 logit、sh_coeffs 通道 0 已是 (RGB-0.5)/C0、
-        rot 存 (w,x,y,z)。
-        """
         return {
             "positions": self.positions.detach().cpu().numpy(),
             "scales": self.log_scales.detach().cpu().numpy(),
@@ -272,7 +416,7 @@ class Gaussian3D:
 
 
 def densify_initial_gaussians(gaussians: Gaussian3D, expansion_factor: int = 8, noise_scale: float = 0.02):
-    """对初始稀疏高斯做 8× 稠密化：每颗高斯复制 expansion_factor 份并加微扰。"""
+    """对初始稀疏高斯做复制加噪。"""
     n = gaussians.num_gaussians
     if n == 0:
         return
@@ -304,26 +448,33 @@ def densify_initial_gaussians(gaussians: Gaussian3D, expansion_factor: int = 8, 
 class DifferentiableRasterizer(nn.Module):
     """排序式逐像素 splat 光栅化器。
 
-    流程：
-    1. 世界系 → 相机系（位置、协方差）。
-    2. 投影到像素系，构建 2D 协方差与包围半径。
-    3. 按深度 near→far 排序。
-    4. 按深度有序高斯分块，块内展平覆盖像素对，按像素分组做
-       stable 深度序的 over-blend；跨块用 log 空间 carry 保持透射率连续。
+    流程：世界→相机 → 投影+2D 协方差+包围半径 → 深度排序 →
+    分块展开覆盖像素对 → 按像素 stable 深度序 over-blend；
+    跨块用 log 空间 carry 保持透射率连续。
     """
 
-    def __init__(self, image_width: int, image_height: int, max_radius: int = 16):
+    def __init__(self, image_width: int, image_height: int,
+                 raster_chunk: int, radius_max: int):
         super().__init__()
         self.image_width = image_width
         self.image_height = image_height
-        self.max_radius = max_radius
+        self.raster_chunk = int(raster_chunk)
+        self.radius_max = int(radius_max)
+        self.max_span = 2 * self.radius_max + 1
         self._arange_cache: Optional[tuple] = None
+
+    @classmethod
+    def from_config(cls, image_width: int, image_height: int,
+                    config: RenderConfig) -> "DifferentiableRasterizer":
+        return cls(image_width, image_height,
+                   raster_chunk=config.raster_chunk,
+                   radius_max=config.radius_max)
 
     def _get_aranges(self, device, dtype):
         cache = self._arange_cache
         if cache is None or cache[0].device != device or cache[0].dtype != dtype:
-            cache = (torch.arange(MAX_SPAN, device=device, dtype=dtype),
-                     torch.arange(MAX_SPAN, device=device, dtype=dtype))
+            cache = (torch.arange(self.max_span, device=device, dtype=dtype),
+                     torch.arange(self.max_span, device=device, dtype=dtype))
             self._arange_cache = cache
         return cache
 
@@ -331,41 +482,39 @@ class DifferentiableRasterizer(nn.Module):
                 background, sh_degree=3):
         N = positions.shape[0]
         H, W = self.image_height, self.image_width
+        max_span = self.max_span
+        chunk = self.raster_chunk
+        radius_max = self.radius_max
 
         if N == 0:
             connected_zero = (positions.sum() if positions.numel() > 0 else opacities.sum()) * 0.0
             zero = connected_zero.view(1).expand(H * W * 3).view(H, W, 3).contiguous()
             return zero, connected_zero.view(1).expand(H * W).view(H, W).contiguous()
 
-        # ---- 相机系变换 ----
         R_cam = view_matrix[:3, :3]
         t_cam = view_matrix[:3, 3]
         cam_positions = positions @ R_cam.T + t_cam
         cam_cov = R_cam @ cov3d @ R_cam.T
-        # 球谐方向约定：世界系下 高斯中心 - 相机中心
         center_world = -R_cam.T @ t_cam
 
-        # ---- 投影 ----
         fx = K[0, 0]; fy = K[1, 1]; cx = K[0, 2]; cy = K[1, 2]
         z = cam_positions[:, 2].clamp(min=0.01)
         x_c = cam_positions[:, 0]; y_c = cam_positions[:, 1]
         u = fx * (x_c / z) + cx
         v = fy * (y_c / z) + cy
 
-        # ---- 2D 协方差 ----
         B = torch.zeros(N, 2, 3, dtype=cov3d.dtype, device=cov3d.device)
         B[:, 0, 0] = fx / z; B[:, 0, 2] = -fx * x_c / (z * z)
         B[:, 1, 1] = fy / z; B[:, 1, 2] = -fy * y_c / (z * z)
         cov2d = (B @ cam_cov) @ B.transpose(1, 2)
 
-        # ---- 半径（3σ，clamp 到 16 与 MAX_SPAN 匹配） ----
         a = cov2d[:, 0, 0]; c = cov2d[:, 1, 1]; b = cov2d[:, 0, 1]
         det = a * c - b * b
         trace = a + c
         disc = torch.clamp(trace ** 2 - 4 * det, min=1e-8)
         half = 0.5 * (trace + torch.sqrt(disc))
         sigma = torch.sqrt(half + 1e-6)
-        radius = (sigma * 3.0).ceil().int().clamp(max=16)
+        radius = (sigma * 3.0).ceil().int().clamp(max=radius_max)
 
         valid = (z > 0.01) & (radius > 0) & (radius < 1000)
         N_valid = int(valid.sum())
@@ -378,7 +527,6 @@ class DifferentiableRasterizer(nn.Module):
         cov2d_v = cov2d[valid]
         op_v = opacities[valid]
 
-        # ---- 深度排序（near → far） ----
         depth_sorted = cam_positions[valid][:, 2]
         order = torch.argsort(depth_sorted)
         u_s = u_v[order]; v_s = v_v[order]; r_s = r_v[order]
@@ -414,26 +562,24 @@ class DifferentiableRasterizer(nn.Module):
 
         HpW = H * W
         device = colors.device
-        # 单一 [HpW, 4] 缓冲：前 3 列 color，第 4 列 log(1-α) 累加，一次 index_add_ 完成
         acc = torch.zeros(HpW, 4, dtype=torch.float32, device=device)
 
         arange_h, arange_w = self._get_aranges(device, torch.float32)
 
-        # 预计算所有 chunk 的 max_h/max_w，一次 GPU→CPU 同步替代 2×n_chunks 次
-        n_chunks = (batch_n + RASTER_CHUNK - 1) // RASTER_CHUNK
+        n_chunks = (batch_n + chunk - 1) // chunk
         h_pad = torch.empty(n_chunks, device=device, dtype=torch.int32)
         w_pad = torch.empty(n_chunks, device=device, dtype=torch.int32)
         sizes_h = y_max_b - y_min_b
         sizes_w = x_max_b - x_min_b
-        for k, start in enumerate(range(0, batch_n, RASTER_CHUNK)):
-            end = min(start + RASTER_CHUNK, batch_n)
+        for k, start in enumerate(range(0, batch_n, chunk)):
+            end = min(start + chunk, batch_n)
             h_pad[k] = sizes_h[start:end].max()
             w_pad[k] = sizes_w[start:end].max()
-        h_list = h_pad.clamp(max=MAX_SPAN).tolist()
-        w_list = w_pad.clamp(max=MAX_SPAN).tolist()
+        h_list = h_pad.clamp(max=max_span).tolist()
+        w_list = w_pad.clamp(max=max_span).tolist()
 
-        for k, start in enumerate(range(0, batch_n, RASTER_CHUNK)):
-            end = min(start + RASTER_CHUNK, batch_n)
+        for k, start in enumerate(range(0, batch_n, chunk)):
+            end = min(start + chunk, batch_n)
             n_chunk = end - start
             max_h = h_list[k]
             max_w = w_list[k]
@@ -464,7 +610,6 @@ class DifferentiableRasterizer(nn.Module):
             alpha = exponent.exp() * opa_c.view(-1, 1, 1)
             alpha = alpha.masked_fill(~valid_mask, 0.0)
 
-            # 一次 nonzero 得到局部 (g, y, x)，替代三次 expand + 三次布尔索引
             g_idx, y_idx, x_idx = torch.nonzero(valid_mask, as_tuple=True)
             if g_idx.shape[0] == 0:
                 continue
@@ -475,7 +620,6 @@ class DifferentiableRasterizer(nn.Module):
             pix = y_coord * W + x_coord
             flat_color = col_c[gauss_ids]
 
-            # 复合键排序：pix 主键 + gauss_ids（深度序）次键 → 非 stable sort 即保持深度序
             pix_key = pix * (n_chunk + 1) + gauss_ids
             pix_key_sorted, sort_idx = torch.sort(pix_key)
             pix_sorted = pix_key_sorted // (n_chunk + 1)
@@ -483,7 +627,6 @@ class DifferentiableRasterizer(nn.Module):
             a_sorted = flat_alpha[sort_idx]
             c_sorted = flat_color[sort_idx]
 
-            # alpha 理论 ≤ 1，浮点误差可能达 1.0；clamp 防 log1p(-1) 产生 -inf 污染 cumsum
             a_safe = a_sorted.clamp(max=1.0 - 1e-7)
             log_ta = torch.log1p(-a_safe)
             log_cum = torch.cumsum(log_ta, dim=0)
@@ -492,7 +635,6 @@ class DifferentiableRasterizer(nn.Module):
                 log_cum[:-1]
             ])
 
-            # 分段透射率：把 cumsum 前缀平移到每段段首
             new_group = pix_sorted[1:] != pix_sorted[:-1]
             group_starts = torch.cat([torch.tensor([True], device=pix_sorted.device), new_group])
             arange = torch.arange(group_starts.shape[0], device=pix_sorted.device)
@@ -501,13 +643,11 @@ class DifferentiableRasterizer(nn.Module):
             seg_offset = log_cum_shift[group_start_pos]
             log_T_before_chunk = log_cum_shift - seg_offset
 
-            # 跨块 carry：块内 exclusive 前缀 + 前序块对该像素的累计 log(1-α)
             carry = acc[pix_sorted, 3]
             log_T_before = carry + log_T_before_chunk
             T_before = torch.exp(log_T_before.clamp(min=-50.0))
             weight = a_sorted * T_before
 
-            # 一次 index_add_ 同时散射 color 与 log_ta
             payload = torch.cat([
                 weight.unsqueeze(-1) * c_sorted,
                 log_ta.unsqueeze(-1),
@@ -551,31 +691,42 @@ class LossDivergenceError(Exception):
 
 # ---------- 训练器 ----------
 class Trainer:
-    def __init__(self, gaussians: Gaussian3D, rasterizer: Optional[DifferentiableRasterizer],
-                 K: np.ndarray, image_width: int, image_height: int, device: str = "cpu",
+    def __init__(self, gaussians: Gaussian3D, K: np.ndarray,
+                 image_width: int, image_height: int, device: str = "cpu",
+                 rasterizer: Optional[DifferentiableRasterizer] = None,
                  sh_degree: int = 3,
                  random_background: bool = True, train_focal: bool = True,
-                 max_gaussians: int = MAX_GAUSSIANS, sh_warmup_steps: int = SH_WARMUP_STEPS,
-                 ssim_warmup_steps: int = SSIM_WARMUP_STEPS, ssim_weight_max: float = SSIM_WEIGHT_MAX, 
+                 render_config: Optional[RenderConfig] = None,
+                 max_gaussians: Optional[int] = None,
+                 sh_warmup_steps: int = SH_WARMUP_STEPS,
+                 ssim_warmup_steps: int = SSIM_WARMUP_STEPS, ssim_weight_max: float = SSIM_WEIGHT_MAX,
                  use_amp: bool = False,
                  use_lr_schedule: bool = USE_LR_SCHEDULE,
                  lr_decay_steps: int = LR_DECAY_STEPS, lr_decay_gamma: float = LR_DECAY_GAMMA,
                  grad_thresh_base: float = GRAD_THRESH_BASE, scale_thresh: float = SCALE_THRESH,
                  min_opacity: float = MIN_OPACITY, densify_every: int = DENSIFY_EVERY,
                  prune_every: int = PRUNE_EVERY):
+        """构造训练器。
+
+        render_config 是光栅化器与密度上限的唯一来源；未传时按实际 device 自动探测。
+        max_gaussians 仅覆盖密度上限，其余渲染参数不变。
+        """
         self.device = device
         self.image_height = image_height
         self.image_width = image_width
 
-        self.use_cuda_rasterizer = False
-        logger.info("使用 PyTorch 光栅化器（支持球谐函数阶数最高 3 阶）。")
+        logger.info("使用 PyTorch 光栅化器（SH 最高 3 阶）。")
+
+        cfg = render_config if render_config is not None else auto_tune_config(device=device)
+        if max_gaussians is not None and max_gaussians != cfg.max_gaussians:
+            cfg = replace(cfg, max_gaussians=int(max_gaussians))
+        self.render_config = cfg
 
         self.gaussians = gaussians
         self.K = torch.from_numpy(K.astype(np.float32)).to(device)
         self.view_matrix = torch.eye(4, dtype=torch.float32, device=device)
         self.random_background = random_background
         self.train_focal = train_focal
-        # AMP 仅 CUDA 生效
         self.use_amp = use_amp and torch.cuda.is_available() and str(device).startswith("cuda")
         if self.use_amp:
             try:
@@ -610,22 +761,24 @@ class Trainer:
         self.last_frame_index = -1
         self.best_loss = float("inf")
         self.background = torch.rand(3, dtype=torch.float32, device=device)
-        channels = 3
-        self._ssim_kernel = torch.ones((channels, 1, 11, 11),
+        self._ssim_kernel = torch.ones((3, 1, 11, 11),
                                        dtype=torch.float32, device=device) / 121.0
         self.adaptive_density = AdaptiveDensityController(
-            self, densify_every, prune_every, max_gaussians,
+            self, densify_every, prune_every, cfg.max_gaussians,
             grad_thresh_base, scale_thresh, min_opacity)
+
         if rasterizer is None:
-            self.rasterizer = DifferentiableRasterizer(image_width, image_height)
+            self.rasterizer = DifferentiableRasterizer.from_config(
+                image_width, image_height, cfg)
         else:
             self.rasterizer = rasterizer
+
         self._update_tanfov()
-        # 初始 8× 稠密化必须先于 _setup_optimizers：优化器包裹的是最终张量
         if self.gaussians.num_gaussians < 2000:
             densify_initial_gaussians(self.gaussians, expansion_factor=8, noise_scale=0.02)
             logger.info("[INIT] 已稠密化到 %d 个高斯", self.gaussians.num_gaussians)
         self._setup_optimizers()
+        self._pre_train_cache_cleared = False
 
     def _setup_optimizers(self):
         self.optimizers = {}
@@ -638,17 +791,12 @@ class Trainer:
         if focal_params:
             self.optimizers["focal"] = torch.optim.Adam(focal_params, lr=self.lr_focal)
 
-    # ---------- 密度控制：Adam 动量原地保留 ----------
-    # densify/prune 后不重建优化器，只在尾部补零动量 / 按 mask 裁剪动量。
-    # 关键：cat 活参会产生非叶子张量 → .grad 为 None → Adam 静默跳过。
-    # 必须从 .detach() 的片段构造真叶子。
     _GAUSS_ATTR = {
         "positions": "positions", "log_scales": "log_scales",
         "opacities": "opacities_raw", "rotations": "rotations", "sh": "sh_coeffs",
     }
 
     def _cat_tensors_to_optimizer(self, new_tensors: Dict[str, torch.Tensor]) -> None:
-        """尾部追加新高斯：存量动量按行保留，新增行补零。"""
         g = self.gaussians
         for name, opt in self.optimizers.items():
             if name not in new_tensors or name not in self._GAUSS_ATTR:
@@ -666,13 +814,11 @@ class Trainer:
                 opt.state[cat_p] = stored
 
     def _prune_optimizer(self, mask: torch.Tensor) -> None:
-        """按 bool mask 裁剪参数：幸存者 Adam 动量按 mask 保留。"""
         g = self.gaussians
         for name, opt in self.optimizers.items():
             if name not in self._GAUSS_ATTR:
                 continue
             p = opt.param_groups[0]["params"][0]
-            # p[mask] 已是新存储，detach 后即叶子；无需 clone
             new_p = p[mask].detach().requires_grad_(True)
             setattr(g, self._GAUSS_ATTR[name], new_p)
             opt.param_groups[0]["params"][0] = new_p
@@ -686,7 +832,6 @@ class Trainer:
     def _update_lr(self):
         if not self.use_lr_schedule or self.lr_decay_steps <= 0:
             return
-        # lr 只在 lr_decay_steps 整数倍处变化，非整步直接跳过
         if self.current_step % self.lr_decay_steps != 0:
             return
         decay = self.lr_decay_gamma ** (self.current_step // self.lr_decay_steps)
@@ -706,7 +851,6 @@ class Trainer:
         self.tanfovx = self.image_width / (2.0 * fx)
         self.tanfovy = self.image_height / (2.0 * fy)
 
-
     def effective_sh_degree(self) -> int:
         if self.sh_warmup_steps <= 0:
             return self.sh_degree
@@ -725,7 +869,6 @@ class Trainer:
             self.view_matrix = torch.from_numpy(camera_pose.astype(np.float32)).to(self.device)
 
         if self.random_background:
-            # 随机黑白背景：三通道同值
             self.background = torch.randint(0, 2, (1,), device=self.device,
                                             dtype=torch.float32).expand(3)
         else:
@@ -749,7 +892,6 @@ class Trainer:
 
         viewmat = self.view_matrix
         K = torch.zeros(3, 3, dtype=torch.float32, device=self.device)
-        # 焦距以 nn.Parameter 直接写入 K，保留计算图（.item() 会切断梯度）
         K[0, 0] = self.fx if isinstance(self.fx, nn.Parameter) else float(self.fx)
         K[1, 1] = self.fy if isinstance(self.fy, nn.Parameter) else float(self.fy)
         K[0, 2] = self.cx
@@ -767,8 +909,6 @@ class Trainer:
         amp_on = self.use_amp and self._scaler is not None
         if amp_on:
             assert self._scaler is not None
-            # AMP 仅覆盖 cov3d 构建与损失侧；光栅化器内部保持 fp32
-            # （cumsum/scatter 不吃 Tensor Core，硬上 fp16 伤数值）。
             with torch.autocast(device_type="cuda", dtype=torch.float16):
                 cov3d = self.gaussians.cov3d
                 with torch.autocast(device_type="cuda", enabled=False):
@@ -786,8 +926,6 @@ class Trainer:
             for opt in self.optimizers.values():
                 opt.zero_grad()
             self._scaler.scale(loss).backward()
-            # 逐优化器守卫：无梯度的优化器跳过 scaler.step，否则抛
-            # "No inf checks were recorded for this optimizer"
             has_grad = [
                 any(p.grad is not None for grp in opt.param_groups for p in grp["params"])
                 for opt in self.optimizers.values()
@@ -838,38 +976,48 @@ class Trainer:
         processed_count = 0
         n = len(frames_iter) if hasattr(frames_iter, '__len__') else 0
 
-        for i, frame in enumerate(frames_iter):
-            if i < start_frame:
-                continue
+        try:
+            if not self._pre_train_cache_cleared:
+                if torch.cuda.is_available():
+                    torch.cuda.empty_cache()
+                self._pre_train_cache_cleared = True
 
-            if stop_event and stop_event.is_set():
-                raise KeyboardInterrupt("Stopped by user")
-            if isinstance(frame, str):
-                frame = _load_frame_from_path(frame)
-            pose = camera_poses[i] if i < len(camera_poses) else None
-            if pose is None:
-                if progress_callback:
-                    progress_callback(i + 1, n if n > 0 else i + 1, 0.0)
-                continue
-            loss = self.step(frame, pose)
-            self.last_frame_index = i
-            total_loss += loss
-            processed_count += 1
+            for i, frame in enumerate(frames_iter):
+                if i < start_frame:
+                    continue
 
-            if checkpoint_path and self.current_step % CHECKPOINT_INTERVAL_STEPS == 0:
-                self.save_training_state(checkpoint_path)
-            if loss_threshold and loss > loss_threshold:
-                if checkpoint_path:
+                if stop_event and stop_event.is_set():
+                    raise KeyboardInterrupt("Stopped by user")
+                if isinstance(frame, str):
+                    frame = _load_frame_from_path(frame)
+                pose = camera_poses[i] if i < len(camera_poses) else None
+                if pose is None:
+                    if progress_callback:
+                        progress_callback(i + 1, n if n > 0 else i + 1, 0.0)
+                    continue
+                loss = self.step(frame, pose)
+                self.last_frame_index = i
+                total_loss += loss
+                processed_count += 1
+
+                if checkpoint_path and self.current_step % CHECKPOINT_INTERVAL_STEPS == 0:
                     self.save_training_state(checkpoint_path)
-                raise LossDivergenceError(
-                    f"Loss {loss:.4f} > threshold {loss_threshold} at frame {i+1}")
-            if progress_callback:
-                progress_callback(i + 1, n if n > 0 else i + 1, loss)
+                if loss_threshold and loss > loss_threshold:
+                    if checkpoint_path:
+                        self.save_training_state(checkpoint_path)
+                    raise LossDivergenceError(
+                        f"Loss {loss:.4f} > threshold {loss_threshold} at frame {i+1}")
+                if progress_callback:
+                    progress_callback(i + 1, n if n > 0 else i + 1, loss)
 
-        avg_loss = total_loss / max(processed_count, 1)
-        if checkpoint_path:
-            self.save_training_state(checkpoint_path)
-        return avg_loss
+            avg_loss = total_loss / max(processed_count, 1)
+            if checkpoint_path:
+                self.save_training_state(checkpoint_path)
+            return avg_loss
+        finally:
+            gc.collect()
+            if torch.cuda.is_available():
+                torch.cuda.empty_cache()
 
     def save_training_state(self, path: str) -> None:
         if self.train_focal:
@@ -916,24 +1064,47 @@ class Trainer:
             "min_opacity": self.adaptive_density.min_opacity,
             "densify_every": self.adaptive_density.densify_every,
             "prune_every": self.adaptive_density.prune_every,
+            "render_config": {
+                "raster_chunk": self.render_config.raster_chunk,
+                "radius_max": self.render_config.radius_max,
+                "max_gaussians": self.render_config.max_gaussians,
+                "source": self.render_config.source,
+                "hardware_gb": self.render_config.hardware_gb,
+            },
         }
         torch.save(state, path)
 
-    def load_training_state(self, path: str, device: str = "cpu") -> None:
-        """从检查点恢复。
-
-        直接以检查点张量重建高斯参数（而非 copy_），以支持高斯基数变化：
-        密度自适应会让训练过程中的 N 与初始 N 不同，copy_ 会因形状不匹配失败。
-        """
-        state = torch.load(path, map_location=device, weights_only=False)
-        device = torch.device(device)
+    def _release_training_state(self) -> None:
         g = self.gaussians
-        params = state["gaussian_params"]
-        g.positions = params["positions"].to(device).requires_grad_(True)
-        g.log_scales = params["log_scales"].to(device).requires_grad_(True)
-        g.opacities_raw = params["opacities_raw"].to(device).requires_grad_(True)
-        g.rotations = params["rotations"].to(device).requires_grad_(True)
-        g.sh_coeffs = params["sh_coeffs"].to(device).requires_grad_(True)
+        dev = g.positions.device
+        g.positions = torch.empty(0, 3, device=dev)
+        g.log_scales = torch.empty(0, 3, device=dev)
+        g.opacities_raw = torch.empty(0, device=dev)
+        g.rotations = torch.empty(0, 4, device=dev)
+        g.sh_coeffs = torch.empty(0, 16, 3, device=dev)
+        if hasattr(self, "optimizers"):
+            self.optimizers.clear()
+        ad = self.adaptive_density
+        ad._opacity_accum = None
+        ad._grad_accum = None
+        gc.collect()
+        if dev.type == "cuda":
+            torch.cuda.empty_cache()
+
+    def load_training_state(self, path: str, device: str = "cpu") -> None:
+        device = torch.device(device)
+
+        self._release_training_state()
+        state = torch.load(path, map_location="cpu", weights_only=False)
+
+        g = self.gaussians
+
+        gp = state.pop("gaussian_params")
+        for attr in ("positions", "log_scales", "opacities_raw", "rotations", "sh_coeffs"):
+            t_cpu = gp.pop(attr)
+            setattr(g, attr, t_cpu.to(device).requires_grad_(True))
+            del t_cpu
+        del gp
 
         self.current_step = state["step_count"]
         self.last_frame_index = state["last_frame_index"]
@@ -941,14 +1112,12 @@ class Trainer:
         self.sh_degree = state["sh_degree"]
         self.train_focal = state["train_focal"]
 
-        fx_val = state["fx"]
-        fy_val = state["fy"]
+        fx_val = state["fx"]; fy_val = state["fy"]
         if isinstance(fx_val, torch.Tensor):
             fx_val = fx_val.item()
         if isinstance(fy_val, torch.Tensor):
             fy_val = fy_val.item()
-        fx_val = float(fx_val)
-        fy_val = float(fy_val)
+        fx_val = float(fx_val); fy_val = float(fy_val)
 
         if self.train_focal:
             self.fx = nn.Parameter(torch.tensor(fx_val, dtype=torch.float32, device=device))
@@ -966,40 +1135,71 @@ class Trainer:
         self.background = state["background"].to(device).float()
 
         self._setup_optimizers()
+        opt_states = state.pop("optimizer_states", {})
         for name, opt in self.optimizers.items():
-            if name in state["optimizer_states"]:
-                opt.load_state_dict(state["optimizer_states"][name])
+            if name not in opt_states:
+                continue
+            sd_cpu = opt_states.pop(name)
+            opt.load_state_dict(sd_cpu)
+            del sd_cpu
+        del opt_states
 
         ad = self.adaptive_density
-        ad._step_count = state["adaptive_density"]["step_count"]
-        ad._cadence = state["adaptive_density"]["cadence"]
-        ad._opacity_accum = state["adaptive_density"]["opacity_accum"].to(device) \
-            if state["adaptive_density"]["opacity_accum"] is not None else None
-        ad._grad_accum = state["adaptive_density"]["grad_accum"].to(device) \
-            if state["adaptive_density"]["grad_accum"] is not None else None
-        ad.max_gaussians = state["adaptive_density"]["max_gaussians"]
+        ad_state = state.pop("adaptive_density")
+        ad._step_count = ad_state["step_count"]
+        ad._cadence = ad_state["cadence"]
+        oa = ad_state["opacity_accum"]
+        ga = ad_state["grad_accum"]
+        ad._opacity_accum = oa.to(device) if oa is not None else None
+        ad._grad_accum = ga.to(device) if ga is not None else None
+        ad.max_gaussians = ad_state["max_gaussians"]
         ad.grad_thresh_base = state["grad_thresh_base"]
         ad.scale_thresh = state["scale_thresh"]
         ad.min_opacity = state["min_opacity"]
         ad.densify_every = state["densify_every"]
         ad.prune_every = state["prune_every"]
+        del ad_state
+
+        rcfg = state.pop("render_config", None)
+        if rcfg is not None and isinstance(self.rasterizer, DifferentiableRasterizer):
+            new_cfg = RenderConfig(
+                raster_chunk=int(rcfg["raster_chunk"]),
+                radius_max=int(rcfg["radius_max"]),
+                max_gaussians=int(rcfg["max_gaussians"]),
+                source=rcfg.get("source", "?"),
+                hardware_gb=float(rcfg.get("hardware_gb", 0.0)),
+            )
+            self.render_config = new_cfg
+            self.rasterizer.raster_chunk = new_cfg.raster_chunk
+            self.rasterizer.radius_max = new_cfg.radius_max
+            self.rasterizer.max_span = new_cfg.max_span
+            self.rasterizer._arange_cache = None
+            logger.info(
+                "[load] 恢复渲染配置：raster_chunk=%d radius_max=%d max_span=%d "
+                "max_gaussians=%d (来源=%s, %.1fGB)",
+                new_cfg.raster_chunk, new_cfg.radius_max, new_cfg.max_span,
+                new_cfg.max_gaussians, new_cfg.source, new_cfg.hardware_gb,
+            )
+
+        del state
+        gc.collect()
+        if device.type == "cuda":
+            torch.cuda.empty_cache()
 
         self._update_tanfov()
+        self._pre_train_cache_cleared = False
 
 
 # ---------- 密度自适应控制器 ----------
 class AdaptiveDensityController:
-    """密度自适应控制器。
+    """梯度驱动的密度自适应。
 
-    - 每 densify_every 步：按梯度分位数分裂/复制高斯（grad_thresh 完全自适应，
-      不依赖绝对量级，兼容不同 loss reduction 与场景尺度）。
-    - 每 prune_every 步：移除低透明度高斯，同时保护高梯度高斯。
-    - _step_count 是窗口内步数（用于累积器平均），_cadence 单调计数用于触发节奏，
-      避免 densify 重置 _step_count 后 prune 永不触发。
+    每 densify_every 步按梯度分位数分裂/复制高斯；
+    每 prune_every 步移除低透明度高斯，并保护高梯度高斯。
     """
 
     def __init__(self, trainer: Trainer, densify_every: int = DENSIFY_EVERY,
-                 prune_every: int = PRUNE_EVERY, max_gaussians: int = MAX_GAUSSIANS,
+                 prune_every: int = PRUNE_EVERY, max_gaussians: int = 300_000,
                  grad_thresh_base: float = GRAD_THRESH_BASE, scale_thresh: float = SCALE_THRESH,
                  min_opacity: float = MIN_OPACITY):
         self.trainer = trainer
@@ -1042,14 +1242,16 @@ class AdaptiveDensityController:
 
         if self.should_densify():
             stats = self.densify()
-            logger.info("[稠密化] 分裂 %d 个高斯, 复制 %d 个高斯", stats["split"], stats["duplicate"])
-            # 低显存用户依赖此清理把缓存归还驱动，避免溢出到共享显存
-            torch.cuda.empty_cache()
+            logger.info("[密度自适应][稠密化] 分裂 %d 个高斯, 复制 %d 个高斯",
+                        stats["split"], stats["duplicate"])
+            if torch.cuda.is_available():
+                torch.cuda.empty_cache()
         if self.should_prune():
             n_pruned = self.prune()
             if n_pruned > 0:
-                logger.info("[修剪] 移除 %d 个高斯", n_pruned)
-            torch.cuda.empty_cache()
+                logger.info("[密度自适应][修剪] 移除 %d 个高斯", n_pruned)
+            if torch.cuda.is_available():
+                torch.cuda.empty_cache()
 
     def should_densify(self) -> bool:
         return self._cadence > 0 and self._cadence % self.densify_every == 0
@@ -1058,7 +1260,6 @@ class AdaptiveDensityController:
         return self._cadence > 0 and self._cadence % self.prune_every == 0
 
     def reset_accumulators(self) -> None:
-        # 只重置窗口计数与累积器，不碰 _cadence
         self._step_count = 0
         self._opacity_accum = None
         self._grad_accum = None
@@ -1073,8 +1274,6 @@ class AdaptiveDensityController:
         avg_grad = self._grad_accum / max(1, self._step_count)
         avg_opacity = self._opacity_accum / max(1, self._step_count)
 
-        # grad_thresh 完全自适应：用非零梯度的 p60 分位做阈值，
-        # 不依赖绝对量级，兼容 loss mean reduction 与任意场景尺度。
         nz_grad = avg_grad[avg_grad > 0]
         if nz_grad.numel() == 0:
             return stats
@@ -1098,7 +1297,6 @@ class AdaptiveDensityController:
         device = g.positions.device
         dtype = g.positions.dtype
 
-        # 先捕获分裂/复制候选的原始张量（_prune_optimizer 改参后旧索引失效）
         if n_split > 0:
             base_pos = g.positions[split_idx].detach()
             base_log_scales = g.log_scales[split_idx].detach()
@@ -1112,11 +1310,9 @@ class AdaptiveDensityController:
             dup_rot = g.rotations[dup_idx].detach()
             dup_sh = g.sh_coeffs[dup_idx].detach()
 
-        # 1. 删除 split 原体：keep ∪ dup 连同动量保留
         if n_split > 0:
             self.trainer._prune_optimizer(~split_mask)
 
-        # 2. split 孩子：每颗 split 高斯 2 个孩子（尺度 0.8 / 0.6）
         if n_split > 0:
             pos_parts: List[torch.Tensor] = []
             ls_parts: List[torch.Tensor] = []
@@ -1140,7 +1336,6 @@ class AdaptiveDensityController:
             })
             stats["split"] = n_split * 2
 
-        # 3. dup clone：追加带微扰副本（dup 原体已在步骤 1 幸存，动量保留）
         if n_dup > 0:
             self.trainer._cat_tensors_to_optimizer({
                 "positions": dup_pos + torch.randn(n_dup, 3, device=device, dtype=dtype) * 0.001,
@@ -1180,7 +1375,6 @@ class AdaptiveDensityController:
             prune_mask = avg_opacity < self.min_opacity
             if self._grad_accum is not None and n > 0:
                 avg_grad = self._grad_accum / max(1, self._step_count)
-                # 保护阈值自适应：用非零梯度中位数保护"高梯度"低透明度高斯
                 nz_grad = avg_grad[avg_grad > 0]
                 if nz_grad.numel() > 0:
                     protect_thresh = torch.quantile(nz_grad, 0.5)

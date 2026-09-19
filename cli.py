@@ -1,12 +1,11 @@
-"""
-视频转 3D 高斯泼溅 CLI端。
-"""
+"""视频转 3D 高斯泼溅 CLI 端。"""
 
 import argparse
 import logging
 import os
 import sys
 import time
+from dataclasses import replace
 from pathlib import Path
 
 import numpy as np
@@ -16,7 +15,10 @@ import torch
 from frames import extract_frames
 from poses import estimate_poses, CameraPose
 from point_cloud import initialize_gaussians, sample_point_colors
-from gaussian import Gaussian3D, DifferentiableRasterizer, Trainer, LazyFrames, LossDivergenceError
+from gaussian import (
+    Gaussian3D, Trainer, LazyFrames, LossDivergenceError,
+    auto_tune_config,
+)
 from exporter import export_training_checkpoint
 
 logger = logging.getLogger(__name__)
@@ -69,7 +71,8 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--num-epochs", type=int, default=3000, help="训练轮数")
     parser.add_argument("--device", type=str, default="auto", choices=["auto", "cpu", "cuda"], help="运行设备")
     parser.add_argument("--eval-every", type=int, default=500, help="每 N 轮打印一次损失")
-    parser.add_argument("--max-gaussians", type=int, default=300000, help="高斯数量上限")
+    parser.add_argument("--max-gaussians", type=int, default=None,
+                        help="高斯数量上限；不指定则按实际训练设备自动选择（可用 --show-config 查看）")
 
     # 高级特性
     parser.add_argument("--sh-degree", type=int, default=0, choices=[0, 1, 2, 3],
@@ -108,6 +111,10 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--resume-dir", type=str, default=None,
                         help="从上次运行的 workdir 续训（需包含 training_state.pt）")
 
+    # 信息输出
+    parser.add_argument("--show-config", action="store_true",
+                        help="按 --device 打印硬件自适应渲染配置后退出")
+
     return parser
 
 
@@ -131,6 +138,26 @@ def save_poses(poses: list, path: Path) -> None:
     np.save(path, poses_arr)
 
 
+def resolve_device(device_arg: str) -> str:
+    """把 "auto" 解析为实际设备字符串。"""
+    if device_arg == "auto":
+        return "cuda" if torch.cuda.is_available() else "cpu"
+    return device_arg
+
+
+def print_render_config(device: str) -> None:
+    """按指定设备打印硬件自适应渲染配置。"""
+    cfg = auto_tune_config(device=device)
+    print("硬件自适应渲染配置：")
+    print(f"  设备:          {device}")
+    print(f"  分档来源:      {cfg.source}")
+    print(f"  硬件容量:      {cfg.hardware_gb:.1f} GB")
+    print(f"  raster_chunk:  {cfg.raster_chunk}")
+    print(f"  radius_max:    {cfg.radius_max}")
+    print(f"  max_span:      {cfg.max_span}")
+    print(f"  max_gaussians: {cfg.max_gaussians}")
+
+
 def run_pipeline(args: argparse.Namespace) -> None:
     overall_start = time.time()
 
@@ -145,11 +172,7 @@ def run_pipeline(args: argparse.Namespace) -> None:
     else:
         workdir.mkdir(parents=True, exist_ok=True)
 
-    # 设备选择
-    if args.device == "auto":
-        device = "cuda" if torch.cuda.is_available() else "cpu"
-    else:
-        device = args.device
+    device = resolve_device(args.device)
     logger.info("使用设备: %s", device)
 
     frame_dir = workdir / "frames"
@@ -235,7 +258,6 @@ def run_pipeline(args: argparse.Namespace) -> None:
         if sparse_points is not None and sparse_points.size > 0:
             np.save(sparse_file, sparse_points)
 
-    # 保证 poses 与 frames 数量一致
     while len(poses) < len(frame_paths):
         poses.append(None)
     valid_count = sum(1 for p in poses if p is not None)
@@ -269,8 +291,6 @@ def run_pipeline(args: argparse.Namespace) -> None:
 
     # ---------- 步骤 4：训练 ----------
     logger.info("[4/5] 正在训练 3D 高斯...")
-    logger.info("设备: %s，轮数: %d，高斯上限: %d",
-                device, args.num_epochs, args.max_gaussians)
     if args.sh_degree > 0:
         logger.info("SH 阶数: %d，升温步数: %d", args.sh_degree, args.sh_warmup_steps)
     if args.ssim_warmup_steps > 0:
@@ -283,19 +303,31 @@ def run_pipeline(args: argparse.Namespace) -> None:
 
     gaussians = Gaussian3D()
     gaussians.initialize_from_dict(gauss_init, device=device)
-    rasterizer = DifferentiableRasterizer(image_width=w, image_height=h)
+
+    # 按实际训练设备分档；--max-gaussians 只覆盖密度上限，光栅化器参数不变。
+    render_config = auto_tune_config(device=device)
+    if args.max_gaussians is not None and args.max_gaussians != render_config.max_gaussians:
+        old_max = render_config.max_gaussians
+        render_config = replace(render_config, max_gaussians=int(args.max_gaussians))
+        logger.info("max_gaussians 覆盖：%d → %d", old_max, render_config.max_gaussians)
+
+    logger.info("渲染配置（设备=%s）：raster_chunk=%d radius_max=%d max_span=%d "
+                "max_gaussians=%d (来源=%s, 硬件 %.1fGB)",
+                device, render_config.raster_chunk, render_config.radius_max,
+                render_config.max_span, render_config.max_gaussians,
+                render_config.source, render_config.hardware_gb)
 
     trainer = Trainer(
         gaussians=gaussians,
-        rasterizer=rasterizer,
         K=K,
         image_width=w,
         image_height=h,
         device=device,
+        rasterizer=None,
         sh_degree=args.sh_degree,
         random_background=args.random_background,
         train_focal=args.train_focal,
-        max_gaussians=args.max_gaussians,
+        render_config=render_config,
         sh_warmup_steps=args.sh_warmup_steps,
         ssim_warmup_steps=args.ssim_warmup_steps,
         ssim_weight_max=args.ssim_weight_max,
@@ -309,13 +341,12 @@ def run_pipeline(args: argparse.Namespace) -> None:
     best_loss = float("inf")
     training_start = time.time()
 
-    # 若存在检查点则续训
     if pt_ckpt.exists():
         try:
             trainer.load_training_state(str(pt_ckpt), device=device)
+            best_loss = trainer.best_loss
             saved = trainer.current_step
             n_valid = sum(1 for p in poses if p is not None)
-            # current_step 仅统计有效位姿帧，故 epoch 由有效帧数推算，帧级续训用 last_frame_index
             start_epoch = max(1, saved // max(n_valid, 1) + 1)
             start_frame = (trainer.last_frame_index + 1) if (n_valid > 0 and saved % n_valid != 0) else 0
             if start_frame > 0:
@@ -329,13 +360,13 @@ def run_pipeline(args: argparse.Namespace) -> None:
     for epoch in range(start_epoch, args.num_epochs + 1):
         try:
             avg_loss = trainer.train_epoch(
-                frames_iter=frames,   # 传 LazyFrames 对象以复用内存缓存
+                frames_iter=frames,
                 camera_poses=train_poses,
                 stop_event=None,
                 progress_callback=None,
                 loss_threshold=1.0,
                 checkpoint_path=str(pt_ckpt),
-                start_frame=start_frame,   # 续训时从中断帧开始，之后各轮全量
+                start_frame=start_frame,
             )
             start_frame = 0
         except LossDivergenceError as e:
@@ -361,7 +392,6 @@ def run_pipeline(args: argparse.Namespace) -> None:
     total_train = time.time() - training_start
     logger.info("训练完成。最佳损失: %.6f（耗时 %.1fs）", best_loss, total_train)
 
-    # ---------- 步骤 5：导出 ----------
     logger.info("[5/5] 正在导出 PLY...")
     export_training_checkpoint(trainer, args.output, sh_degree=args.sh_degree)
 
@@ -377,6 +407,11 @@ def cli(argv: list[str] = None) -> None:
     set_affinity_to_all_cores()
     parser = build_parser()
     args = parser.parse_args(argv)
+
+    # --show-config 只打印配置，不跑流程，也不要求 --video
+    if args.show_config:
+        print_render_config(resolve_device(args.device))
+        sys.exit(0)
 
     if not os.path.isfile(args.video):
         logger.error("视频文件不存在: %s", args.video)
