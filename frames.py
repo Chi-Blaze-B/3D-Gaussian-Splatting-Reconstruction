@@ -93,18 +93,36 @@ def extract_frames(
     返回：
         保存的帧图像绝对路径列表。
     """
+    strategy = "two_stage" if two_stage else ("smart" if smart_sampling else "uniform")
+    logger.info(
+        "extract_frames 开始: strategy=%s, video=%s, output_dir=%s, "
+        "fps=%.2f, scale=%.2f, frames=[%d, %d], flow=%s, feature=%s",
+        strategy, video_path, output_dir,
+        fps, scale, min_frames, max_frames,
+        optical_flow_method, feature_type,
+    )
+
     if two_stage:
-        return _two_stage_extract(
+        result = _two_stage_extract(
             video_path, output_dir, fps, scale,
             min_frames, max_frames,
             optical_flow_method, feature_type,
         )
-    if smart_sampling:
-        return _smart_extract(
+    elif smart_sampling:
+        result = _smart_extract(
             video_path, output_dir, fps, scale,
             min_frames, max_frames, optical_flow_method,
         )
-    return _uniform_extract(video_path, output_dir, fps, scale, min_frames, max_frames)
+    else:
+        result = _uniform_extract(
+            video_path, output_dir, fps, scale, min_frames, max_frames,
+        )
+
+    logger.info(
+        "extract_frames 完成: strategy=%s, 保存 %d 帧 -> %s",
+        strategy, len(result), output_dir,
+    )
+    return result
 
 
 # ---------- 均匀采样 ----------
@@ -119,6 +137,7 @@ def _uniform_extract(
     """均匀采样：在时间轴上等间隔抽取目标数量的帧。"""
     cap = cv2.VideoCapture(video_path)
     if not cap.isOpened():
+        logger.error("无法打开视频: %s", video_path)
         raise FileNotFoundError(f"无法打开视频: {video_path}")
     try:
         total = int(cap.get(cv2.CAP_PROP_FRAME_COUNT)) or 1
@@ -130,8 +149,19 @@ def _uniform_extract(
         )
         num_frames = _target_frame_count(total, orig_fps, fps, min_frames, max_frames)
         indices = np.linspace(0, total - 1, num_frames, dtype=int)
+
+        logger.info(
+            "均匀采样: 总帧数=%d, 原始FPS=%.2f, 目标FPS=%.2f, 输出尺寸=%dx%d, 目标帧数=%d",
+            total, orig_fps, fps, w, h, num_frames,
+        )
+        logger.debug(
+            "均匀采样索引范围: 首=%d, 末=%d, 去重后=%d",
+            int(indices[0]), int(indices[-1]), int(np.unique(indices).size),
+        )
+
         os.makedirs(output_dir, exist_ok=True)
         paths, _ = _extract_indices(cap, indices, output_dir, w, h)
+        logger.info("均匀采样完成: 计划 %d 帧, 实际保存 %d 帧", num_frames, len(paths))
         return paths
     finally:
         cap.release()
@@ -150,6 +180,7 @@ def _smart_extract(
     """单阶段智能采样：清晰度 + 光流门控，通过门控的帧按时间分层选择。"""
     cap = cv2.VideoCapture(video_path)
     if not cap.isOpened():
+        logger.error("无法打开视频: %s", video_path)
         raise FileNotFoundError(f"无法打开视频: {video_path}")
     try:
         total = int(cap.get(cv2.CAP_PROP_FRAME_COUNT)) or 1
@@ -158,6 +189,10 @@ def _smart_extract(
             int(cap.get(cv2.CAP_PROP_FRAME_WIDTH)),
             int(cap.get(cv2.CAP_PROP_FRAME_HEIGHT)),
             scale,
+        )
+        logger.info(
+            "单阶段智能采样: 总帧数=%d, 原始FPS=%.2f, 目标FPS=%.2f, 输出尺寸=%dx%d, flow=%s",
+            total, orig_fps, fps, w, h, flow_method,
         )
         return _smart_extract_from_cap(
             cap, output_dir, total, orig_fps, fps,
@@ -190,28 +225,46 @@ def _smart_extract_from_cap(
     6. 若通过帧数低于 min_frames，回退到均匀采样。
     """
     sample_indices = _make_sample_indices(total)
-    sharpness, flow = _compute_gating_scores(
-        cap, sample_indices, flow_method,
-    )
+    logger.debug("打分采样点: %d 个（上限 %d），首=%d, 末=%d",
+                 len(sample_indices), MAX_SCORE_SAMPLES,
+                 int(sample_indices[0]) if len(sample_indices) else -1,
+                 int(sample_indices[-1]) if len(sample_indices) else -1)
+
+    sharpness, flow = _compute_gating_scores(cap, sample_indices, flow_method)
     sharp_full = _interp_to_full(sample_indices, sharpness, total)
     flow_full = _interp_to_full(sample_indices, flow, total)
 
     num_frames = _target_frame_count(total, orig_fps, fps, min_frames, max_frames)
     valid = _gating_mask(sharp_full, flow_full)
+    n_gated = int(valid.sum())
     valid = _enforce_time_coverage(valid, sharp_full, flow_full, total)
     n_valid = int(valid.sum())
 
+    logger.info(
+        "门控结果: 通过=%d/%d (%.1f%%), 时间覆盖兜底后=%d (%.1f%%), 目标帧数=%d",
+        n_gated, total, 100.0 * n_gated / max(1, total),
+        n_valid, 100.0 * n_valid / max(1, total),
+        num_frames,
+    )
+
     if n_valid < min_frames:
         # 门控过严：视频整体质量差，回退到均匀采样保证帧数
+        logger.warning(
+            "通过门控的有效帧 %d < min_frames %d，回退到均匀采样。",
+            n_valid, min_frames,
+        )
         indices = np.linspace(0, total - 1, num_frames, dtype=int)
     else:
         target = min(num_frames, n_valid)
         weights = valid.astype(np.float64)
         # 单阶段没有视差，权重全为 1，但依然走时间分层，保证时间均匀
         indices = _stratified_select(weights, valid, target, n_bins=SELECT_BINS)
+        logger.debug("时间分层选择: n_bins=%d, 目标=%d, 实际选中=%d",
+                     SELECT_BINS, target, len(indices))
 
     os.makedirs(output_dir, exist_ok=True)
     paths, _ = _extract_indices(cap, indices, output_dir, w, h)
+    logger.info("单阶段智能采样完成: 计划 %d 帧, 实际保存 %d 帧", len(indices), len(paths))
     return paths
 
 
@@ -234,8 +287,12 @@ def _two_stage_extract(
     """
     from poses import estimate_poses  # 延迟导入，避免无两阶段需求时的依赖
 
+    logger.info("两阶段智能采样: 开始, video=%s, feature=%s, flow=%s",
+                video_path, feature_type, flow_method)
+
     cap = cv2.VideoCapture(video_path)
     if not cap.isOpened():
+        logger.error("无法打开视频: %s", video_path)
         raise FileNotFoundError(f"无法打开视频: {video_path}")
 
     total = int(cap.get(cv2.CAP_PROP_FRAME_COUNT)) or 1
@@ -246,14 +303,24 @@ def _two_stage_extract(
         scale,
     )
 
+    logger.info(
+        "两阶段: 总帧数=%d, 原始FPS=%.2f, 目标FPS=%.2f, 输出尺寸=%dx%d",
+        total, orig_fps, fps, w, h,
+    )
+
     coarse_dir = tempfile.mkdtemp(prefix="coarse_")
+    logger.debug("粗提取临时目录: %s", coarse_dir)
 
     try:
         # ---------- 阶段 1：粗提取 + 粗位姿 ----------
         coarse_raw = np.linspace(0, total - 1, min(COARSE_FRAMES, total), dtype=int)
         coarse_paths, coarse_indices = _extract_indices(cap, coarse_raw, coarse_dir, w, h)
+        logger.info("阶段 1: 粗提取 %d 帧（计划 %d 帧）",
+                    len(coarse_paths), len(coarse_raw))
+
         if len(coarse_paths) < 2:
-            logger.warning("粗提取帧数不足，回退到单阶段智能采样。")
+            logger.warning("粗提取帧数不足（%d < 2），回退到单阶段智能采样。",
+                           len(coarse_paths))
             return _smart_extract_from_cap(
                 cap, output_dir, total, orig_fps, fps,
                 min_frames, max_frames, w, h, flow_method,
@@ -270,37 +337,59 @@ def _two_stage_extract(
                 min_frames, max_frames, w, h, flow_method,
             )
 
+        n_pose_ok = sum(1 for p in coarse_poses if p is not None)
+        logger.info("阶段 1: 粗位姿估计成功 %d/%d 帧",
+                    n_pose_ok, len(coarse_poses))
+
         # ---------- 阶段 2：打分 + 门控 + 视差加权 + 分层选择 ----------
         sample_indices = _make_sample_indices(total)
-        sharpness, flow = _compute_gating_scores(
-            cap, sample_indices, flow_method,
-        )
+        logger.debug("阶段 2: 打分采样点 %d 个", len(sample_indices))
+
+        sharpness, flow = _compute_gating_scores(cap, sample_indices, flow_method)
         sharp_full = _interp_to_full(sample_indices, sharpness, total)
         flow_full = _interp_to_full(sample_indices, flow, total)
         parallax_full = _compute_parallax_scores(total, coarse_indices, coarse_poses)
 
         num_frames = _target_frame_count(total, orig_fps, fps, min_frames, max_frames)
         valid = _gating_mask(sharp_full, flow_full)
+        n_gated = int(valid.sum())
         valid = _enforce_time_coverage(valid, sharp_full, flow_full, total)
         n_valid = int(valid.sum())
 
+        logger.info(
+            "阶段 2: 门控通过=%d/%d (%.1f%%), 时间覆盖兜底后=%d (%.1f%%), 目标帧数=%d",
+            n_gated, total, 100.0 * n_gated / max(1, total),
+            n_valid, 100.0 * n_valid / max(1, total),
+            num_frames,
+        )
+
         if n_valid < min_frames:
+            logger.warning(
+                "通过门控的有效帧 %d < min_frames %d，回退到均匀采样。",
+                n_valid, min_frames,
+            )
             indices = np.linspace(0, total - 1, num_frames, dtype=int)
         else:
             # 视差加权：白墙等低视差帧保留基础权重，占比低但不会被完全跳过。
             # 时间分层选择再保证每段都有名额。
             weights = (0.3 + 0.7 * parallax_full) * valid
             if weights.sum() <= 1e-9:
+                logger.warning("视差权重全为 0，退化为均匀权重。")
                 weights = valid.astype(np.float64)
             target = min(num_frames, n_valid)
             indices = _stratified_select(weights, valid, target, n_bins=SELECT_BINS)
+            logger.debug("阶段 2: 分层选择 n_bins=%d, 目标=%d, 实际选中=%d",
+                         SELECT_BINS, target, len(indices))
 
         os.makedirs(output_dir, exist_ok=True)
         paths, _ = _extract_indices(cap, indices, output_dir, w, h)
+        logger.info("两阶段智能采样完成: 计划 %d 帧, 实际保存 %d 帧",
+                    len(indices), len(paths))
         return paths
     finally:
         cap.release()
         shutil.rmtree(coarse_dir, ignore_errors=True)
+        logger.debug("已清理粗提取临时目录: %s", coarse_dir)
 
 
 # ---------- 时间分层选择 ----------
@@ -328,9 +417,11 @@ def _stratified_select(
     """
     n = len(weights)
     if n == 0 or num_frames <= 0:
+        logger.debug("分层选择跳过: n=%d, num_frames=%d", n, num_frames)
         return np.array([], dtype=int)
     num_frames = min(num_frames, int(valid.sum()))
     if num_frames <= 0:
+        logger.debug("分层选择跳过: 有效帧为 0")
         return np.array([], dtype=int)
 
     # 段数不能超过目标帧数，否则每段名额不足，会有大量空段
@@ -341,6 +432,8 @@ def _stratified_select(
     extra = num_frames % n_bins
 
     selected: List[int] = []
+    empty_bins = 0
+    zero_weight_bins = 0
     for b in range(n_bins):
         lo, hi = int(edges[b]), int(edges[b + 1])
         if hi <= lo:
@@ -353,6 +446,7 @@ def _stratified_select(
         seg_valid = valid[lo:hi]
         if not seg_valid.any():
             # 该段没有有效帧，跳过（真的没有可用素材）
+            empty_bins += 1
             continue
 
         seg_w = weights[lo:hi].copy()
@@ -360,6 +454,7 @@ def _stratified_select(
 
         if seg_w.sum() <= 1e-9:
             # 段内权重全 0 但存在有效帧：段内均匀取 k 个
+            zero_weight_bins += 1
             valid_local = np.where(seg_valid)[0]
             take = min(k, len(valid_local))
             idx_local = np.linspace(0, len(valid_local) - 1, take).astype(int)
@@ -369,7 +464,12 @@ def _stratified_select(
 
         selected.extend((seg_indices + lo).tolist())
 
-    return np.asarray(sorted(set(selected)), dtype=int)
+    result = np.asarray(sorted(set(selected)), dtype=int)
+    logger.debug(
+        "分层选择: n_bins=%d, 目标=%d, 选中=%d, 空段=%d, 零权重段=%d",
+        n_bins, num_frames, len(result), empty_bins, zero_weight_bins,
+    )
+    return result
 
 
 # ---------- 打分：清晰度 + 光流 ----------
@@ -397,16 +497,20 @@ def _compute_gating_scores(
     sharpness = np.zeros(n, dtype=np.float64)
     flow = np.zeros(n, dtype=np.float64)
     if n == 0:
+        logger.debug("打分跳过: 采样点为空")
         return sharpness, flow
 
     method = flow_method.lower()
     prev_gray = None
     prev_idx = None
+    read_fail = 0
 
     for i, idx in enumerate(indices):
         cap.set(cv2.CAP_PROP_POS_FRAMES, int(idx))
         ok, bgr = cap.read()
         if not ok:
+            read_fail += 1
+            logger.debug("打分读取失败: 帧索引=%d", int(idx))
             prev_gray = None
             prev_idx = None
             continue
@@ -443,6 +547,14 @@ def _compute_gating_scores(
     # 第一帧无前驱：用第二帧填充，避免固定门控误杀
     if n >= 2 and flow[0] == 0.0 and flow[1] > 0.0:
         flow[0] = flow[1]
+
+    logger.debug(
+        "打分完成: 采样=%d, 读取失败=%d, 清晰度[中位=%.3f, 最大=%.3f], "
+        "光流[中位=%.4f, 最大=%.4f]",
+        n, read_fail,
+        float(np.median(sharpness)), float(sharpness.max()) if n else 0.0,
+        float(np.median(flow)), float(flow.max()) if n else 0.0,
+    )
     return sharpness, flow
 
 
@@ -462,7 +574,15 @@ def _gating_mask(sharp_full: np.ndarray, flow_full: np.ndarray) -> np.ndarray:
 
     sharp_thresh = max(sharp_q, SHARPNESS_MEDIAN_RATIO * sharp_med)
     flow_thresh = max(flow_q, FLOW_MEDIAN_RATIO * flow_med)
-    return (sharp_full >= sharp_thresh) & (flow_full >= flow_thresh)
+    mask = (sharp_full >= sharp_thresh) & (flow_full >= flow_thresh)
+
+    logger.debug(
+        "门控阈值: sharpness>=%.4f (q=%.4f, med=%.4f), "
+        "flow>=%.4f (q=%.4f, med=%.4f)",
+        sharp_thresh, sharp_q, sharp_med,
+        flow_thresh, flow_q, flow_med,
+    )
+    return mask
 
 
 def _enforce_time_coverage(
@@ -485,6 +605,7 @@ def _enforce_time_coverage(
     if total <= 0:
         return valid
     edges = np.linspace(0, total, n_bins + 1, dtype=int)
+    touched = 0
     for b in range(n_bins):
         lo, hi = int(edges[b]), int(edges[b + 1])
         if hi <= lo:
@@ -495,6 +616,13 @@ def _enforce_time_coverage(
         k = min(min_per_bin, hi - lo)
         top = np.argsort(seg_score)[-k:] + lo
         valid[top] = True
+        touched += 1
+
+    if touched > 0:
+        logger.info("时间覆盖兜底: 共补足 %d 个分箱（每箱至少 %d 帧）",
+                    touched, min_per_bin)
+    else:
+        logger.debug("时间覆盖兜底: 无需补足")
     return valid
 
 
@@ -512,9 +640,11 @@ def _lk_flow_magnitude(prev: np.ndarray, curr: np.ndarray) -> float:
         winSize=LK_WINDOW_SIZE, maxLevel=LK_MAX_LEVEL, criteria=LK_CRITERIA,
     )
     if status is None:
+        logger.debug("LK 光流: status 为 None，返回 0")
         return 0.0
     valid = status.ravel() == 1
     if not valid.any():
+        logger.debug("LK 光流: 无有效跟踪点，返回 0")
         return 0.0
     disp = (next_pts[valid] - pts[valid]).reshape(-1, 2)
     return float(np.mean(np.sqrt(np.sum(disp ** 2, axis=1))))
@@ -534,6 +664,7 @@ def _compute_parallax_scores(
     """
     valid_pairs = [(i, p) for i, p in enumerate(coarse_poses) if p is not None]
     if len(valid_pairs) < 2:
+        logger.warning("有效粗位姿不足（%d < 2），视差分数置零。", len(valid_pairs))
         return np.zeros(total, dtype=np.float64)
 
     coarse_scores = np.zeros(len(coarse_indices), dtype=np.float64)
@@ -551,6 +682,12 @@ def _compute_parallax_scores(
     parallax = _gaussian_smooth(parallax, sigma=2.0)
     if parallax.max() > 1e-9:
         parallax = parallax / parallax.max()
+
+    logger.debug(
+        "视差分数: 有效位姿对=%d, 归一化后[中位=%.4f, 最大=%.4f]",
+        len(valid_pairs) - 1,
+        float(np.median(parallax)), float(parallax.max()) if parallax.size else 0.0,
+    )
     return parallax
 
 
@@ -569,6 +706,7 @@ def _make_sample_indices(total: int) -> np.ndarray:
         indices = np.array([0], dtype=int)
     if indices[-1] != total - 1:
         indices = np.append(indices, total - 1)
+    logger.debug("构造采样索引: total=%d, step=%d, n=%d", total, step, len(indices))
     return indices
 
 
@@ -631,7 +769,13 @@ def _target_frame_count(
     """计算目标帧数：按目标采样率换算后夹到 [min_frames, max_frames]，再夹到 total。"""
     raw = int(total * target_fps / orig_fps)
     n = min(max(raw, min_frames), max_frames)
-    return max(1, min(n, total))
+    result = max(1, min(n, total))
+    logger.debug(
+        "目标帧数计算: total=%d, orig_fps=%.2f, target_fps=%.2f, "
+        "raw=%d, clamp[%d, %d] -> %d",
+        total, orig_fps, target_fps, raw, min_frames, max_frames, result,
+    )
+    return result
 
 
 def _compute_resized_size(orig_w: int, orig_h: int, scale: float) -> Tuple[int, int]:
@@ -642,7 +786,10 @@ def _compute_resized_size(orig_w: int, orig_h: int, scale: float) -> Tuple[int, 
         w += 1
     if h % 2 != 0:
         h += 1
-    return max(w, 2), max(h, 2)
+    result = (max(w, 2), max(h, 2))
+    logger.debug("缩放尺寸: %dx%d (scale=%.2f) -> %dx%d",
+                 orig_w, orig_h, scale, result[0], result[1])
+    return result
 
 
 def _extract_indices(
@@ -661,16 +808,26 @@ def _extract_indices(
     """
     paths: List[str] = []
     used: List[int] = []
+    read_fail = 0
     for i, idx in enumerate(indices):
         cap.set(cv2.CAP_PROP_POS_FRAMES, int(idx))
         ok, bgr = cap.read()
         if not ok:
+            read_fail += 1
+            logger.debug("抽帧读取失败: 输出序号=%d, 帧索引=%d", i, int(idx))
             continue
         resized = cv2.resize(bgr, (w, h), interpolation=cv2.INTER_AREA)
         fname = f"frame_{i:04d}.png"
         fpath = os.path.join(output_dir, fname)
         if not cv2.imwrite(fpath, resized):
+            logger.error("无法写入帧图像: %s", fpath)
             raise OSError(f"无法写入帧图像: {fpath}")
         paths.append(os.path.abspath(fpath))
         used.append(int(idx))
+
+    if read_fail > 0:
+        logger.warning("抽帧: 请求 %d 帧, 读取失败 %d 帧, 成功 %d 帧",
+                       len(indices), read_fail, len(paths))
+    else:
+        logger.debug("抽帧: 请求 %d 帧, 全部成功", len(indices))
     return paths, np.asarray(used, dtype=int)

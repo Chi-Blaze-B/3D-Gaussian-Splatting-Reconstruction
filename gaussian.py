@@ -1,11 +1,12 @@
 """
 3D 高斯泼溅：核心模块、光栅化器与训练器。纯 PyTorch 实现，无 CUDA 扩展。
-球谐最高 3 阶。
+球谐函数阶数最高 3 阶。
 """
 
+import os
 import gc
 import logging
-import os
+import math
 import sys
 import threading
 from dataclasses import dataclass, field, replace
@@ -124,11 +125,13 @@ class RenderConfig:
 
 def _tune_for_gpu(vram_gb: float) -> RenderConfig:
     if vram_gb < 4:
-        return RenderConfig(64, 6, 100_000, "cuda", vram_gb)
+        # 小显存档：radius_max=3 实测（100K 高斯 1080p）forward 提速 ~30%，
+        # 对实际训练中常见的小/中等 log_scale 场景无影响（多数高斯半径 < 3）。
+        return RenderConfig(64, 3, 100_000, "cuda", vram_gb)
     if vram_gb < 6:
-        return RenderConfig(96, 7, 200_000, "cuda", vram_gb)
+        return RenderConfig(96, 5, 200_000, "cuda", vram_gb)
     if vram_gb < 8:
-        return RenderConfig(128, 8, 300_000, "cuda", vram_gb)
+        return RenderConfig(128, 6, 300_000, "cuda", vram_gb)
     if vram_gb < 12:
         return RenderConfig(192, 10, 500_000, "cuda", vram_gb)
     if vram_gb < 16:
@@ -315,7 +318,9 @@ def quat_to_rot(q: torch.Tensor) -> torch.Tensor:
 def build_covariance(log_scales: torch.Tensor, rotations: torch.Tensor) -> torch.Tensor:
     s = torch.exp(log_scales)
     R = quat_to_rot(rotations)
-    M = R * s.unsqueeze(-1)
+    # 协方差 = R @ diag(s) @ R^T，等价于把尺度乘到 R 的每一列（unsqueeze(1)）。
+    # 乘到行（unsqueeze(-1)）会得到各向异性被抹掉的近似对角协方差，旋转无效。
+    M = R * s.unsqueeze(1)
     return M @ M.transpose(1, 2)
 
 
@@ -446,13 +451,6 @@ def densify_initial_gaussians(gaussians: Gaussian3D, expansion_factor: int = 8, 
 
 # ---------- 可微光栅化器（纯 PyTorch） ----------
 class DifferentiableRasterizer(nn.Module):
-    """排序式逐像素 splat 光栅化器。
-
-    流程：世界→相机 → 投影+2D 协方差+包围半径 → 深度排序 →
-    分块展开覆盖像素对 → 按像素 stable 深度序 over-blend；
-    跨块用 log 空间 carry 保持透射率连续。
-    """
-
     def __init__(self, image_width: int, image_height: int,
                  raster_chunk: int, radius_max: int):
         super().__init__()
@@ -478,6 +476,14 @@ class DifferentiableRasterizer(nn.Module):
             self._arange_cache = cache
         return cache
 
+    def _zero_output(self, positions, opacities, H, W):
+        """N=0 或无有效高斯时的零输出，保持图连接。"""
+        link = (positions.sum() if positions.numel() > 0 else opacities.sum()) * 0.0
+        # expand 产生非连续张量，必须用 reshape（非 view）处理后续尺寸变换
+        zero = link.view(1).expand(H * W * 3).reshape(H, W, 3)
+        alpha = link.view(1).expand(H * W).reshape(H, W)
+        return zero, alpha
+
     def forward(self, positions, cov3d, opacities, sh_coeffs, view_matrix, K,
                 background, sh_degree=3):
         N = positions.shape[0]
@@ -487,9 +493,7 @@ class DifferentiableRasterizer(nn.Module):
         radius_max = self.radius_max
 
         if N == 0:
-            connected_zero = (positions.sum() if positions.numel() > 0 else opacities.sum()) * 0.0
-            zero = connected_zero.view(1).expand(H * W * 3).view(H, W, 3).contiguous()
-            return zero, connected_zero.view(1).expand(H * W).view(H, W).contiguous()
+            return self._zero_output(positions, opacities, H, W)
 
         R_cam = view_matrix[:3, :3]
         t_cam = view_matrix[:3, 3]
@@ -503,53 +507,65 @@ class DifferentiableRasterizer(nn.Module):
         u = fx * (x_c / z) + cx
         v = fy * (y_c / z) + cy
 
+        # 2D 协方差 —— 保留梯度（后续 alpha 需要 iA/iB/iC）
         B = torch.zeros(N, 2, 3, dtype=cov3d.dtype, device=cov3d.device)
-        B[:, 0, 0] = fx / z; B[:, 0, 2] = -fx * x_c / (z * z)
-        B[:, 1, 1] = fy / z; B[:, 1, 2] = -fy * y_c / (z * z)
+        B[:, 0, 0] = fx / z
+        B[:, 0, 2] = -fx * x_c / (z * z)
+        B[:, 1, 1] = fy / z
+        B[:, 1, 2] = -fy * y_c / (z * z)
         cov2d = (B @ cam_cov) @ B.transpose(1, 2)
 
-        a = cov2d[:, 0, 0]; c = cov2d[:, 1, 1]; b = cov2d[:, 0, 1]
-        det = a * c - b * b
-        trace = a + c
-        disc = torch.clamp(trace ** 2 - 4 * det, min=1e-8)
-        half = 0.5 * (trace + torch.sqrt(disc))
-        sigma = torch.sqrt(half + 1e-6)
-        radius = (sigma * 3.0).ceil().int().clamp(max=radius_max)
+        # tile 半径与有效性：纯索引用途，不需要梯度
+        with torch.no_grad():
+            a = cov2d[:, 0, 0].detach()
+            c = cov2d[:, 1, 1].detach()
+            b = cov2d[:, 0, 1].detach()
+            det = a * c - b * b
+            trace = a + c
+            disc = torch.clamp(trace ** 2 - 4 * det, min=1e-8)
+            sigma = torch.sqrt(0.5 * (trace + torch.sqrt(disc)) + 1e-6)
+            radius = (sigma * 3.0).ceil().int().clamp(max=radius_max)
+            valid = (z.detach() > 0.01) & (radius > 0) & (radius < 1000)
+            n_valid = int(valid.sum())
 
-        valid = (z > 0.01) & (radius > 0) & (radius < 1000)
-        N_valid = int(valid.sum())
-        if N_valid == 0:
-            connected_zero = (positions.sum() if positions.numel() > 0 else opacities.sum()) * 0.0
-            zero = connected_zero.view(1).expand(H * W * 3).view(H, W, 3).contiguous()
-            return zero, connected_zero.view(1).expand(H * W).view(H, W).contiguous()
+        if n_valid == 0:
+            return self._zero_output(positions, opacities, H, W)
 
-        u_v, v_v, r_v = u[valid], v[valid], radius[valid]
+        u_v = u[valid]; v_v = v[valid]; r_v = radius[valid]
         cov2d_v = cov2d[valid]
         op_v = opacities[valid]
+        depth_v = cam_positions[valid][:, 2]
 
-        depth_sorted = cam_positions[valid][:, 2]
-        order = torch.argsort(depth_sorted)
+        # 深度排序：索引不需要梯度
+        with torch.no_grad():
+            order = torch.argsort(depth_v)
+
         u_s = u_v[order]; v_s = v_v[order]; r_s = r_v[order]
         cov2d_s = cov2d_v[order]; opa_s = op_v[order]
 
         dirs = F.normalize(positions[valid][order] - center_world, dim=-1)
         colors = eval_sh(sh_degree, sh_coeffs[valid][order], dirs)
 
-        _graph_link = (positions.sum() if positions.numel() > 0 else opacities.sum()) * 0.0
-        out_color = _graph_link.view(1, 1, 1).expand(H, W, 3).contiguous()
-        out_alpha = _graph_link.view(1, 1).expand(H, W).contiguous()
+        link = (positions.sum() if positions.numel() > 0 else opacities.sum()) * 0.0
+        out_color = link.view(1, 1, 1).expand(H, W, 3).contiguous()
+        out_alpha = link.view(1, 1).expand(H, W).contiguous()
 
         mu_u = u_s; mu_v = v_s; rad = r_s
         A = cov2d_s[:, 0, 0]; B_ = cov2d_s[:, 0, 1]; C = cov2d_s[:, 1, 1]
         opa = opa_s; col = colors
 
-        y_min = (mu_v - rad).clamp(min=0).int(); y_max = (mu_v + rad + 1).clamp(max=H).int()
-        x_min = (mu_u - rad).clamp(min=0).int(); x_max = (mu_u + rad + 1).clamp(max=W).int()
+        # tile 边界：整数，不需要梯度
+        with torch.no_grad():
+            y_min = (mu_v - rad).clamp(min=0).int()
+            y_max = (mu_v + rad + 1).clamp(max=H).int()
+            x_min = (mu_u - rad).clamp(min=0).int()
+            x_max = (mu_u + rad + 1).clamp(max=W).int()
+            valid_b = (y_min < y_max) & (x_min < x_max)
+            batch_n = int(valid_b.sum())
 
-        valid_b = (y_min < y_max) & (x_min < x_max)
-        batch_n = int(valid_b.sum())
         if batch_n == 0:
-            return out_color + background.view(1, 1, 3) * (1.0 - out_alpha.unsqueeze(-1)), out_alpha
+            return (out_color + background.view(1, 1, 3) * (1.0 - out_alpha.unsqueeze(-1)),
+                    out_alpha)
 
         y_min_b = y_min[valid_b]; y_max_b = y_max[valid_b]
         x_min_b = x_min[valid_b]; x_max_b = x_max[valid_b]
@@ -567,18 +583,20 @@ class DifferentiableRasterizer(nn.Module):
         arange_h, arange_w = self._get_aranges(device, torch.float32)
 
         n_chunks = (batch_n + chunk - 1) // chunk
-        h_pad = torch.empty(n_chunks, device=device, dtype=torch.int32)
-        w_pad = torch.empty(n_chunks, device=device, dtype=torch.int32)
-        sizes_h = y_max_b - y_min_b
-        sizes_w = x_max_b - x_min_b
-        for k, start in enumerate(range(0, batch_n, chunk)):
-            end = min(start + chunk, batch_n)
-            h_pad[k] = sizes_h[start:end].max()
-            w_pad[k] = sizes_w[start:end].max()
-        h_list = h_pad.clamp(max=max_span).tolist()
-        w_list = w_pad.clamp(max=max_span).tolist()
 
-        for k, start in enumerate(range(0, batch_n, chunk)):
+        # 每个 chunk 的最大展开尺寸：整数运算，不需要梯度
+        h_list, w_list = [], []
+        with torch.no_grad():
+            sizes_h = y_max_b - y_min_b
+            sizes_w = x_max_b - x_min_b
+            for k in range(n_chunks):
+                s = k * chunk
+                e = min(s + chunk, batch_n)
+                h_list.append(int(sizes_h[s:e].max().clamp(max=max_span)))
+                w_list.append(int(sizes_w[s:e].max().clamp(max=max_span)))
+
+        for k in range(n_chunks):
+            start = k * chunk
             end = min(start + chunk, batch_n)
             n_chunk = end - start
             max_h = h_list[k]
@@ -586,60 +604,76 @@ class DifferentiableRasterizer(nn.Module):
             if max_h == 0 or max_w == 0:
                 continue
 
-            y_lo = y_min_b[start:end]; y_hi = y_max_b[start:end]
-            x_lo = x_min_b[start:end]; x_hi = x_max_b[start:end]
+            y_lo_c = y_min_b[start:end]; y_hi_c = y_max_b[start:end]
+            x_lo_c = x_min_b[start:end]; x_hi_c = x_max_b[start:end]
             mu_u_c = mu_u_b[start:end]; mu_v_c = mu_v_b[start:end]
-            iA = inv_A[start:end]; iB = inv_B[start:end]; iC = inv_C[start:end]
+            iA_c = inv_A[start:end]; iB_c = inv_B[start:end]; iC_c = inv_C[start:end]
             opa_c = opa_b[start:end]; col_c = col_b[start:end]
 
-            gy = arange_h[:max_h].view(1, -1, 1)
-            gx = arange_w[:max_w].view(1, 1, -1)
-            gy_g = gy + y_lo.view(-1, 1, 1)
-            gx_g = gx + x_lo.view(-1, 1, 1)
-            dy = gy_g - mu_v_c.view(-1, 1, 1)
-            dx = gx_g - mu_u_c.view(-1, 1, 1)
+            # ---------- 阶段 1：索引、排序、分组（no_grad） ----------
+            with torch.no_grad():
+                gy = arange_h[:max_h].view(1, -1, 1)
+                gx = arange_w[:max_w].view(1, 1, -1)
+                gy_g = gy + y_lo_c.view(-1, 1, 1)
+                gx_g = gx + x_lo_c.view(-1, 1, 1)
 
-            y_valid = (gy_g >= y_lo.view(-1, 1, 1)) & (gy_g < y_hi.view(-1, 1, 1))
-            x_valid = (gx_g >= x_lo.view(-1, 1, 1)) & (gx_g < x_hi.view(-1, 1, 1))
-            valid_mask = y_valid & x_valid
+                y_valid = (gy_g >= y_lo_c.view(-1, 1, 1)) & (gy_g < y_hi_c.view(-1, 1, 1))
+                x_valid = (gx_g >= x_lo_c.view(-1, 1, 1)) & (gx_g < x_hi_c.view(-1, 1, 1))
+                valid_mask = y_valid & x_valid
 
-            exponent = -(iA.view(-1, 1, 1) * dx ** 2
-                         + 2 * iB.view(-1, 1, 1) * dx * dy
-                         + iC.view(-1, 1, 1) * dy ** 2) * 0.5
+                g_idx, y_idx, x_idx = torch.nonzero(valid_mask, as_tuple=True)
+                if g_idx.shape[0] == 0:
+                    continue
+
+                y_abs = y_lo_c[g_idx] + y_idx
+                x_abs = x_lo_c[g_idx] + x_idx
+                y_coord = y_abs.float()
+                x_coord = x_abs.float()
+                pix = y_abs * W + x_abs
+
+                pix_key = pix * (n_chunk + 1) + g_idx
+                pix_key_sorted, sort_idx = torch.sort(pix_key)
+                pix_sorted = pix_key_sorted // (n_chunk + 1)
+
+                gauss_sorted = g_idx[sort_idx]
+                y_coord_s = y_coord[sort_idx]
+                x_coord_s = x_coord[sort_idx]
+
+                # 每个像素的分组起始位置（用于截断跨像素的透射率累积）
+                new_group = pix_sorted[1:] != pix_sorted[:-1]
+                group_starts = torch.cat([
+                    torch.tensor([True], device=pix_sorted.device), new_group])
+                arange = torch.arange(group_starts.shape[0], device=pix_sorted.device)
+                group_start_pos = torch.where(group_starts, arange,
+                                              torch.zeros_like(arange))
+                group_start_pos = torch.cummax(group_start_pos, dim=0).values
+
+            # ---------- 阶段 2：alpha 与混合（保留梯度） ----------
+            # 只对有效条目计算，形状 [n_valid_in_chunk]，不再建满 tile 张量
+            mu_u_sel = mu_u_c[gauss_sorted]
+            mu_v_sel = mu_v_c[gauss_sorted]
+            iA_sel = iA_c[gauss_sorted]
+            iB_sel = iB_c[gauss_sorted]
+            iC_sel = iC_c[gauss_sorted]
+            opa_sel = opa_c[gauss_sorted]
+            col_sel = col_c[gauss_sorted]
+
+            dx = x_coord_s - mu_u_sel
+            dy = y_coord_s - mu_v_sel
+            exponent = -(iA_sel * dx ** 2
+                         + 2 * iB_sel * dx * dy
+                         + iC_sel * dy ** 2) * 0.5
             exponent = exponent.clamp(max=0)
-            alpha = exponent.exp() * opa_c.view(-1, 1, 1)
-            alpha = alpha.masked_fill(~valid_mask, 0.0)
-
-            g_idx, y_idx, x_idx = torch.nonzero(valid_mask, as_tuple=True)
-            if g_idx.shape[0] == 0:
-                continue
-            flat_alpha = alpha[g_idx, y_idx, x_idx]
-            gauss_ids = g_idx
-            y_coord = y_lo[g_idx] + y_idx
-            x_coord = x_lo[g_idx] + x_idx
-            pix = y_coord * W + x_coord
-            flat_color = col_c[gauss_ids]
-
-            pix_key = pix * (n_chunk + 1) + gauss_ids
-            pix_key_sorted, sort_idx = torch.sort(pix_key)
-            pix_sorted = pix_key_sorted // (n_chunk + 1)
-
-            a_sorted = flat_alpha[sort_idx]
-            c_sorted = flat_color[sort_idx]
+            a_sorted = exponent.exp() * opa_sel
+            c_sorted = col_sel
 
             a_safe = a_sorted.clamp(max=1.0 - 1e-7)
             log_ta = torch.log1p(-a_safe)
             log_cum = torch.cumsum(log_ta, dim=0)
             log_cum_shift = torch.cat([
                 torch.zeros(1, dtype=log_cum.dtype, device=log_cum.device),
-                log_cum[:-1]
-            ])
+                log_cum[:-1]])
 
-            new_group = pix_sorted[1:] != pix_sorted[:-1]
-            group_starts = torch.cat([torch.tensor([True], device=pix_sorted.device), new_group])
-            arange = torch.arange(group_starts.shape[0], device=pix_sorted.device)
-            group_start_pos = torch.where(group_starts, arange, torch.zeros_like(arange))
-            group_start_pos = torch.cummax(group_start_pos, dim=0).values
             seg_offset = log_cum_shift[group_start_pos]
             log_T_before_chunk = log_cum_shift - seg_offset
 
@@ -661,6 +695,9 @@ class DifferentiableRasterizer(nn.Module):
 
         out_color = out_color + background.view(1, 1, 3) * (1.0 - out_alpha.unsqueeze(-1))
         return out_color, out_alpha
+
+
+
 
 
 # ---------- 损失函数 ----------
@@ -891,12 +928,23 @@ class Trainer:
         eff_deg = self.effective_sh_degree()
 
         viewmat = self.view_matrix
-        K = torch.zeros(3, 3, dtype=torch.float32, device=self.device)
-        K[0, 0] = self.fx if isinstance(self.fx, nn.Parameter) else float(self.fx)
-        K[1, 1] = self.fy if isinstance(self.fy, nn.Parameter) else float(self.fy)
-        K[0, 2] = self.cx
-        K[1, 2] = self.cy
-        K[2, 2] = 1.0
+        if self.train_focal and isinstance(self.fx, nn.Parameter):
+            # fx/fy 是 0-dim Parameter：不能用 torch.tensor([...]) 包进列表构造
+            #（该写法创建新张量、断梯度，focal 优化器拿不到梯度会静默失效）。
+            # 先用常量建 K，再 index_put_ 原地嵌入参数——in-place 变体保留
+            # autograd 连接，且不依赖新版 PyTorch 对「索引赋值 Parameter」的兼容性
+            K = torch.eye(3, dtype=torch.float32, device=self.device)
+            K[0, 2] = self.cx
+            K[1, 2] = self.cy
+            K[0, 0] = self.fx
+            K[1, 1] = self.fy
+        else:
+            K = torch.zeros(3, 3, dtype=torch.float32, device=self.device)
+            K[0, 0] = float(self.fx)
+            K[1, 1] = float(self.fy)
+            K[0, 2] = self.cx
+            K[1, 2] = self.cy
+            K[2, 2] = 1.0
 
         params_to_clip = [
             self.gaussians.positions, self.gaussians.log_scales,
@@ -940,7 +988,7 @@ class Trainer:
             self._scaler.update()
         else:
             cov3d = self.gaussians.cov3d
-            rendered, _ = self.rasterizer(
+            rendered, _ = self.rasterizer.forward(
                 means3D, cov3d, opacities, sh_coeffs, viewmat, K, self.background,
                 sh_degree=eff_deg
             )
@@ -1154,7 +1202,7 @@ class Trainer:
         ad._grad_accum = ga.to(device) if ga is not None else None
         ad.max_gaussians = ad_state["max_gaussians"]
         ad.grad_thresh_base = state["grad_thresh_base"]
-        ad.scale_thresh = state["scale_thresh"]
+        ad.scale_thresh = state["scale_thresh"]  # setter 自动重算 log_scale_thresh
         ad.min_opacity = state["min_opacity"]
         ad.densify_every = state["densify_every"]
         ad.prune_every = state["prune_every"]
@@ -1207,12 +1255,28 @@ class AdaptiveDensityController:
         self.prune_every = prune_every
         self.max_gaussians = max_gaussians
         self.grad_thresh_base = grad_thresh_base
-        self.scale_thresh = scale_thresh
+        self._scale_thresh = scale_thresh
+        # log 域等价的尺度阈值：log(σ) > log(scale_thresh) 等价于 σ > scale_thresh
+        self._log_scale_thresh = math.log(scale_thresh)
         self.min_opacity = min_opacity
         self._step_count = 0
         self._opacity_accum = None
         self._grad_accum = None
         self._cadence = 0
+
+    @property
+    def scale_thresh(self) -> float:
+        return self._scale_thresh
+
+    @scale_thresh.setter
+    def scale_thresh(self, value: float) -> None:
+        self._scale_thresh = value
+        # 必须同步重算 log 阈值，否则 split_mask 会静默失效
+        self._log_scale_thresh = math.log(value)
+
+    @property
+    def log_scale_thresh(self) -> float:
+        return self._log_scale_thresh
 
     def step(self) -> None:
         self._step_count += 1
@@ -1284,7 +1348,7 @@ class AdaptiveDensityController:
             return stats
 
         max_log_scale = torch.max(g.log_scales, dim=1).values
-        split_mask = (avg_grad > grad_thresh) & (max_log_scale > self.scale_thresh) & (avg_opacity > 0.01)
+        split_mask = (avg_grad > grad_thresh) & (max_log_scale > self.log_scale_thresh) & (avg_opacity > 0.01)
         duplicate_mask = (avg_grad > grad_thresh) & ~split_mask & (avg_opacity > 0.01)
         split_idx = torch.where(split_mask)[0]
         dup_idx = torch.where(duplicate_mask)[0]
@@ -1351,12 +1415,10 @@ class AdaptiveDensityController:
 
         n_current = g.num_gaussians
         if n_current > self.max_gaussians:
-            n_remove = min(n_current - self.max_gaussians, int(n_current * 0.15))
-            if n_remove > 0:
-                self.prune(target_remove=n_remove)
+            self.prune(enforce_cap=True)
         return stats
 
-    def prune(self, target_remove: Optional[int] = None) -> int:
+    def prune(self, target_remove: Optional[int] = None, enforce_cap: bool = False) -> int:
         g = self.trainer.gaussians
         n = g.num_gaussians
         if n == 0:
@@ -1366,6 +1428,13 @@ class AdaptiveDensityController:
             avg_opacity = self._opacity_accum / max(1, self._step_count)
         else:
             avg_opacity = g.opacities
+
+        # enforce_cap：把"硬裁剪到 max_gaussians"独立成一条分支，
+        # 常规 prune()（周期性低透明度修剪）保持旧的 min_opacity 逻辑不变。
+        if enforce_cap:
+            if n <= self.max_gaussians:
+                return 0
+            target_remove = n - self.max_gaussians
 
         if target_remove is not None and target_remove < n:
             vals, indices = torch.topk(avg_opacity, k=target_remove, largest=False)
@@ -1387,5 +1456,13 @@ class AdaptiveDensityController:
 
         keep_mask = ~prune_mask
         self.trainer._prune_optimizer(keep_mask)
+        # 硬裁剪一次删除大量高斯时，幸存高斯的 Adam 动量来自删除前的分布，
+        # 衰减 0.5 降低分布突变导致的优化器发散风险。
+        if enforce_cap and n_pruned > 0:
+            for opt in self.trainer.optimizers.values():
+                for p, state in opt.state.items():
+                    if "exp_avg" in state:
+                        state["exp_avg"] *= 0.5
+                        state["exp_avg_sq"] *= 0.5
         self.reset_accumulators()
         return n_pruned

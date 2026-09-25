@@ -789,6 +789,25 @@ class PipelineWorker(QThread):
         self._log("[1/5] 正在提取视频帧...")
         self._set_progress(0, "正在提取视频帧...")
 
+        # 复用旧帧时校验缩放比例是否一致：旧帧若是用其他 scale 提取的，
+        # 直接复用会导致"日志显示 0.25，帧实际还是旧 0.5 尺寸"的静默错配。
+        # 没有元数据的旧帧（本功能上线前已存在的目录）不强制重提，只提示。
+        import json as _json
+        meta_path = workdir / "frame_meta.json"
+        old_scale_val = None
+        if has_frames and meta_path.exists():
+            try:
+                old_scale_val = _json.loads(meta_path.read_text()).get("scale")
+            except Exception:
+                old_scale_val = None
+            if old_scale_val is not None and abs(float(old_scale_val) - float(c["scale"])) >= 1e-6:
+                self._log(
+                    f"  ⚠️  工作目录已有 scale={old_scale_val} 提取的旧帧，与当前 scale={c['scale']:.2f} 不符，重新提取帧"
+                )
+                has_frames = False
+        elif has_frames:
+            self._log(f"  提示: 复用旧帧（无 frame_meta.json，未校验缩放比例）")
+
         if has_frames:
             frame_paths = [p.strip() for p in (workdir / "frame_paths.txt").read_text().splitlines()]
             self._log(f"  已加载 {len(frame_paths)} 帧（跳过提取）")
@@ -810,6 +829,7 @@ class PipelineWorker(QThread):
                 feature_type=c.get("feature_type", "orb"),
             )
             (workdir / "frame_paths.txt").write_text("\n".join(frame_paths))
+            meta_path.write_text(_json.dumps({"scale": c["scale"], "fps": c["fps"]}))
             self._log(f"  已提取 {len(frame_paths)} 帧")
 
         self.frame_paths_signal.emit(frame_paths)
@@ -998,11 +1018,13 @@ class PipelineWorker(QThread):
                 except torch.cuda.OutOfMemoryError:
                     self._log(f"\n  [OOM] CUDA 显存不足")
                     self._log("  尝试降低高斯上限并修剪...")
+                    current_n = trainer.gaussians.num_gaussians
                     new_max = max(100000, trainer.adaptive_density.max_gaussians // 2)
                     trainer.adaptive_density.max_gaussians = new_max
+                    trainer.render_config = replace(trainer.render_config, max_gaussians=new_max)
                     trainer.adaptive_density.min_opacity = 0.05
-                    n_pruned = trainer.adaptive_density.prune()
-                    self._log(f"  已修剪 {n_pruned} 个高斯，新上限 {new_max}")
+                    n_pruned = trainer.adaptive_density.prune(enforce_cap=True)
+                    self._log(f"  已修剪 {n_pruned} 个高斯，当前 {current_n - n_pruned} 个，新上限 {new_max}")
                     trainer.save_training_state(pt_ckpt)
 
                     self._log("  重新开始当前轮次训练...")

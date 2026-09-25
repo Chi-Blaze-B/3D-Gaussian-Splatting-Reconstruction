@@ -1071,11 +1071,18 @@ def _bundle_adjustment(
                                reverse=True)[:MAX_POINTS_IN_BA]
         for pid in point_ids:
             param.extend(map_points[pid]['xyz'])
+    else:
+        # 点参数冻结：只把观测限制在 map_points 已有点上（残差计算时
+        # 从 map_points 取静态坐标），未知点的观测直接丢弃。
+        # 注意 map_points 是 List[Dict]（索引 = 点 id），不能用 set()
+        known_point_ids = set(range(len(map_points)))
+        obs = [o for o in obs if o[1] in known_point_ids]
 
     # 只保留可优化点的观测。参与残差的点必须可优化，否则带误差的静态
     # 点会持续贡献正 cost，优化器只能移动位姿和点「绕着」误差走。
-    point_id_set = set(point_ids)
-    obs = [o for o in obs if o[1] in point_id_set]
+    if optimize_points:
+        point_id_set = set(point_ids)
+        obs = [o for o in obs if o[1] in point_id_set]
     n_obs = len(obs)
     if n_obs < 10:
         return focal, fy
@@ -1142,6 +1149,12 @@ def _bundle_adjustment(
             pts_start = 1 + n_poses * 6
             for j, pid in enumerate(point_ids_local):
                 pts[pid] = params[pts_start + j * 3: pts_start + j * 3 + 3]
+        else:
+            # 点参数冻结：残差用 map_points 的静态坐标
+            for obs_item in obs:
+                pid = obs_item[1]
+                if pid not in pts:
+                    pts[pid] = np.asarray(map_points[pid]['xyz'], dtype=np.float64)
 
         res = []
         obs_depths = np.zeros(n_obs, dtype=np.float64)

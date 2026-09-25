@@ -1,47 +1,32 @@
 <h1 align="center"><strong>3D Gaussian Splatting Reconstruction</strong></h1>
 <p align="center">
-  <!-- 项目标题 -->
-  <img src="https://img.shields.io/badge/🌟_3D_Gaussian_Splatting-Reconstruction-FF6F00?style=flat-square&logo=github&logoColor=white" alt="Project">
-  <br><br>
-  <!-- 环境与核心依赖 -->
   <img src="https://img.shields.io/badge/Python-3.11-3776AB?style=flat-square&logo=python&logoColor=white" alt="Python">
   <img src="https://img.shields.io/badge/PyTorch-2.0+-EE4C2C?style=flat-square&logo=pytorch&logoColor=white" alt="PyTorch">
   <img src="https://img.shields.io/badge/CUDA-11.8+-76B900?style=flat-square&logo=nvidia&logoColor=white" alt="CUDA">
-  <br><br>
-  <!-- 核心功能模块 -->
   <img src="https://img.shields.io/badge/GUI-PySide6-8A2BE2?style=flat-square&logo=qt&logoColor=white" alt="GUI">
-  <img src="https://img.shields.io/badge/SfM-COLMAP_|_OpenCV-5C3EE8?style=flat-square&logo=opencv&logoColor=white" alt="SfM">
-  <img src="https://img.shields.io/badge/Rendering-Real_Time-FF4500?style=flat-square" alt="Rendering">
-  <br><br>
-  <!-- 兼容性与许可证 -->
-  <img src="https://img.shields.io/badge/Platform-Windows_|_Linux_|_macOS-0078D4?style=flat-square&logo=windows&logoColor=white" alt="Platform">
   <img src="https://img.shields.io/badge/License-Apache_2.0-1E90FF?style=flat-square&logo=apache&logoColor=white" alt="License">
-  <br><br>
-  <!-- 社区动态（自动实时更新） -->
-  <img src="https://img.shields.io/github/stars/Chi-Blaze-B/3D-Gaussian-Splatting-Reconstruction?style=flat-square&color=yellow&logo=github" alt="Stars">
-  <img src="https://img.shields.io/github/forks/Chi-Blaze-B/3D-Gaussian-Splatting-Reconstruction?style=flat-square&color=blue&logo=github" alt="Forks">
-  <img src="https://img.shields.io/github/issues/Chi-Blaze-B/3D-Gaussian-Splatting-Reconstruction?style=flat-square&color=red&logo=github" alt="Issues">
-  <img src="https://img.shields.io/github/last-commit/Chi-Blaze-B/3D-Gaussian-Splatting-Reconstruction?style=flat-square&color=green&logo=github" alt="Last Commit">
 </p>
-基于 Python 的视频转 3D 高斯泼溅（3DGS）工作流。输入一段视频，输出一个 `.ply` 文件，可用官方 3DGS 查看器（https://github.com/graphdeco-inria/gaussian-splatting ）浏览重建的三维场景。
+
+基于 Python 的视频转 3D 高斯泼溅（3DGS）工作流。输入一段视频，输出一个 `.ply` 文件，可用官方 3DGS 查看器浏览重建的三维场景。
 
 **核心光栅化器完全基于 PyTorch 实现**，无需编译 CUDA 扩展，支持 SH 0–3 阶球谐函数，排序式逐像素 splat 向量化。整体流程还依赖 OpenCV、SciPy、PySide6、psutil 等库。
 
-- **纯 PyTorch 光栅化器**：核心光栅化器无需编译 CUDA 扩展，支持 SH 0–3 阶球谐函数，排序式逐像素 splat 向量化（大幅加速），开箱即用。
-- **鲁棒姿态估计**：内置 ORB/SIFT 增量式 SfM（无 COLMAP 依赖），BA 带自适应鲁棒加权与多重保护；也可选用 COLMAP 作为后端。
-- **智能采样**：均匀、光流驱动（smart）、两阶段（视差+光流+清晰度）三种帧采样策略。
-- **自适应密度控制**：训练中自动分裂/复制/修剪高斯，支持显存预算控制。
-- **硬件自适应配置**：按实际训练设备（显存或系统内存）自动推导光栅化分块、半径上限与高斯数量上限，避免 CPU 训练被显存分档误伤。
-- **暗色主题 GUI**：基于 PySide6，实时损失曲线、帧预览、日志输出，可配置常用参数。
-- **断点续训**：保存完整训练状态（参数、优化器、密度控制器、焦距、最佳损失等），恢复时从上次中断帧继续。
+- **纯 PyTorch 光栅化器**：无需编译 CUDA 扩展，支持 SH 0–3 阶，开箱即用。
+- **鲁棒姿态估计**：内置 ORB/SIFT 增量式 SfM，也可选用 COLMAP 后端。
+- **智能采样**：均匀、光流驱动（smart）、两阶段（视差+光流+清晰度）三种策略。
+- **自适应密度控制**：训练中自动分裂/复制/修剪高斯。
+- **硬件自适应配置**：按实际训练设备自动推导分块、半径与高斯数量上限。
+- **暗色主题 GUI**：实时损失曲线、帧预览、日志输出。
+- **断点续训**：保存完整训练状态，恢复时从上次中断帧继续。
 
 ---
+
 ## 📦 安装
 
-### 环境要求（示例）
+### 环境要求
 
 - Python 3.11（推荐）
-- CUDA 11.8+（可选，CPU 也可运行；安装示例使用 CUDA 12.1，建议根据显卡选择最适合的 CUDA 版本）
+- CUDA 11.8+（可选，CPU 也可运行）
 
 ### 步骤
 
@@ -51,14 +36,10 @@
    conda activate gs
    ```
 2. **安装 PyTorch**
-
-   GPU 版本（示例使用 CUDA 12.1）：
    ```bash
+   # GPU 示例（CUDA 12.1）
    pip install torch --index-url https://download.pytorch.org/whl/cu121
-   ```
-
-   CPU 版本：
-   ```bash
+   # CPU
    pip install torch --index-url https://download.pytorch.org/whl/cpu
    ```
 3. **安装 OpenCV（headless）**
@@ -72,13 +53,13 @@
    ```
 5. **（可选）COLMAP 后端**
 
-   需自行安装 COLMAP（https://github.com/colmap/colmap ）。`colmap_poses.py` 查找顺序：项目内 `colmap-x64-windows-nocuda/bin/colmap.exe`（若有）→ 系统 PATH 中的 `colmap`。安装后将 colmap 加入 PATH 即可使用 `--pose-estimator colmap`。
-6. **克隆本仓库**
+   需自行安装 COLMAP 并加入 PATH。`colmap_poses.py` 查找顺序：项目内 `colmap-x64-windows-nocuda/bin/colmap.exe` → 系统 PATH 中的 `colmap`。
+6. **克隆仓库**
    ```bash
    git clone https://github.com/Chi-Blaze-B/3D-Gaussian-Splatting-Reconstruction
    ```
-
 ## 🚀 使用方式
+
 ### 1. 命令行接口（CLI）
 
 基本用法：
@@ -86,33 +67,33 @@
 python cli.py --video input.mp4 --output output.ply
 ```
 
-#### 常用参数表
+#### 常用参数
 
 | 参数 | 说明 | 默认值 |
 |------|------|--------|
 | `--video` | 输入视频路径 | 必填 |
 | `--output` | 输出 PLY 文件路径 | `output.ply` |
-| `--workdir` | 工作目录（存放中间文件） | `./workdir` |
-| `--fps` | 采样帧率（均匀采样） | `15.0` |
+| `--workdir` | 工作目录 | `./workdir` |
+| `--fps` | 采样帧率 | `15.0` |
 | `--scale` | 画面缩放（0~1） | `0.5` |
 | `--min-frames / --max-frames` | 最少/最多提取帧数 | `30 / 200` |
-| `--sampling-mode` | 采样模式：uniform / smart / two-stage | `uniform` |
+| `--sampling-mode` | uniform / smart / two-stage | `uniform` |
 | `--num-epochs` | 训练轮数 | `3000` |
-| `--device` | 计算设备：auto / cpu / cuda | `auto` |
-| `--max-gaussians` | 最大高斯数量；不指定则按实际训练设备自动选择 | `None`（自动） |
+| `--device` | auto / cpu / cuda | `auto` |
+| `--max-gaussians` | 高斯上限；不指定则按设备自动选择 | `None` |
 | `--sh-degree` | 球谐阶数（0~3） | `0` |
-| `--sh-warmup-steps` | SH 阶数升温步数 | `1000` |
-| `--ssim-warmup-steps` | SSIM 权重升温步数 | `500` |
+| `--sh-warmup-steps` | SH 升温步数 | `1000` |
+| `--ssim-warmup-steps` | SSIM 升温步数 | `500` |
 | `--ssim-weight-max` | SSIM 最大权重 | `0.2` |
-| `--random-background` | 训练时随机黑白背景 | `False` |
+| `--random-background` | 随机黑白背景 | `False` |
 | `--train-focal` | 训练中微调焦距 | `False` |
-| `--amp` | 混合精度 fp16（需 CUDA + fp16 显卡，Ampere+ 可用 Tensor Core；光栅化器内部保持 fp32，无 Tensor Core 无收益） | `False` |
-| `--pose-estimator` | 姿态估计后端：opencv / colmap | `opencv` |
-| `--feature-type` | OpenCV 特征描述子：orb / sift（仅 opencv 后端生效） | `orb` |
+| `--amp` | 混合精度 fp16（需 CUDA + Ampere+） | `False` |
+| `--pose-estimator` | opencv / colmap | `opencv` |
+| `--feature-type` | orb / sift（仅 opencv 后端） | `orb` |
 | `--focal-guess` | 初始焦距猜测（像素） | `None` |
-| `--resume-dir` | 从该工作目录恢复训练 | `None` |
-| `--eval-every` | 每 N 轮打印一次日志 | `500` |
-| `--show-config` | 按 `--device` 打印硬件自适应渲染配置后退出 | `False` |
+| `--resume-dir` | 从工作目录续训 | `None` |
+| `--eval-every` | 每 N 轮打印日志 | `500` |
+| `--show-config` | 打印硬件自适应配置后退出 | `False` |
 
 #### 示例
 
@@ -123,17 +104,13 @@ python cli.py --video input.mp4 --output out.ply
 # 智能采样 + SH3 + 焦距自校准
 python cli.py --video input.mp4 --output out.ply --sampling-mode smart --sh-degree 3 --train-focal
 
-# 两阶段采样 + COLMAP + 完整功能
+# 两阶段采样 + COLMAP
 python cli.py --video input.mp4 --output out.ply --sampling-mode two-stage --pose-estimator colmap \
     --sh-degree 3 --random-background --train-focal --max-gaussians 500000
 
-# 短序列 + SIFT 特征
-python cli.py --video input.mp4 --output out.ply --feature-type sift --sh-degree 3
-
-# 查看当前设备下的自适应渲染配置
+# 查看当前设备自适应渲染配置
 python cli.py --video input.mp4 --device cuda --show-config
 ```
-
 ### 2. 图形界面（GUI）
 
 启动 GUI：
@@ -141,153 +118,163 @@ python cli.py --video input.mp4 --device cuda --show-config
 python gui.py
 ```
 
-图形界面提供常用参数配置面板：
+GUI 提供：
 
-- 选择视频、输出路径、工作目录
-- 调整采样策略、训练轮次、高斯预算等；**高斯上限自动按当前设备（CPU/CUDA）刷新范围与默认值**，切换设备下拉框即更新
-- 实时预览帧缩略图
-- 训练过程中显示损失曲线（帧级和轮次级）
-- 帧预览分页浏览：每页容量随窗口宽高自适应（列数 × 行数，默认约 24 帧），可翻页查看全部提取帧
-- 日志输出窗口详细记录每步进度
-- 支持中断训练并自动保存检查点
+- 视频、输出路径、工作目录选择
+- 采样策略、训练轮次、高斯预算等参数配置
+- 高斯上限随设备（CPU/CUDA）自动刷新范围与默认值
+- 帧缩略图预览、分页浏览
+- 帧级和轮次级损失曲线
+- 日志输出、中断训练并保存检查点
 
-**注意**：GUI 暂未提供 `--focal-guess`、`--resume-dir` 等部分 CLI 参数；`评估间隔`控件当前未生效，训练日志每轮都会输出。
+**注意**：GUI 暂未提供 `--focal-guess`、`--resume-dir`；`评估间隔`控件未生效。GUI 默认值与 CLI 有差异，以界面为准。
 
-## 🧩 核心模块说明
+## 🧩 核心模块
 
 | 模块 | 功能 |
 |------|------|
-| `frames.py` | 视频帧提取，支持三种采样策略，光流采用 Farneback/LK |
-| `poses.py` | 纯 OpenCV 增量式 SfM（ORB/SIFT），带自适应鲁棒 BA 与多重防护，点云过滤 |
-| `colmap_poses.py` | COLMAP 封装，作为备选姿态估计后端 |
-| `point_cloud.py` | 从稀疏点云初始化高斯参数（SH 0–3），自适应离群点剔除；颜色采样与高斯构造分离，复用帧内存缓存 |
-| `gaussian.py` | 3DGS 核心：纯 PyTorch 光栅化器（排序式逐像素 splat 向量化，含梯度图连接保护）、LazyFrames 帧内存预加载、Trainer、密度控制、学习率调度、硬件自适应配置（`RenderConfig` / `auto_tune_config`） |
-| `exporter.py` | 导出标准 PLY 格式，兼容官方查看器 |
-| `gui.py` | PySide6 暗色主题图形界面，帧预览分页浏览（列数×行数随窗口宽高自适应，可查看全部帧） |
+| `frames.py` | 视频帧提取，支持 uniform / smart / two-stage 采样 |
+| `poses.py` | 纯 OpenCV 增量式 SfM（ORB/SIFT），带鲁棒 BA |
+| `colmap_poses.py` | COLMAP 封装，备选姿态估计后端 |
+| `point_cloud.py` | 稀疏点云初始化高斯参数，离群点剔除 |
+| `gaussian.py` | 3DGS 核心：纯 PyTorch 光栅化器、Trainer、密度控制、硬件自适应 |
+| `exporter.py` | 导出标准 PLY，兼容官方查看器 |
+| `gui.py` | PySide6 暗色主题图形界面 |
 | `cli.py` | 命令行入口，集成完整流程 |
 
+## 📋 输入数据要求
+
+### 视角数
+
+| 路径 | 最低视角数 | 推荐视角数 |
+|------|-----------|-----------|
+| OpenCV（自研 SfM） | 30 帧 | 50~60 帧 |
+| COLMAP | 60 帧 | 100~200 帧 |
+
+### 帧间重叠率
+
+- 相邻两帧像素重叠建议 ≥70%。
+- `--fps` 越高重叠越大；过高会导致 COLMAP 注册帧过少。
+- 运动模糊会降低匹配成功率。
+
+### 曝光 / 白平衡
+
+- 自动曝光/白平衡跳变会干扰 SfM 与 BA，建议锁定或预处理。
+- RAW 或手动曝光素材重建上限更高。
+
+### 场景环绕度
+
+- 单面可见只能重建拍摄范围，未拍摄面为空白。
+- 360° 环绕建议每 ~30° 至少一个机位。
+- 垂直方向缺失会导致地板/天花板欠拟合。
+
+### 分辨率
+
+- 特征匹配建议 ≥480p。
+- `--scale 0.5` 时 1080p 训练为 960×540。
+- 过高分辨率 + 大量高斯可能 OOM。
+
+### 动态场景
+
+3DGS 假设场景静态。移动物体会产生重影/形变，属于方法边界。
 ## 🎯 姿态估计后端选择
-三种后端，按场景选择：
 
 | 后端 | 命令 | 适用场景 |
 |------|------|----------|
-| OpenCV + ORB（默认） | `--pose-estimator opencv --feature-type orb` | 纹理丰富的常规场景，速度最快 |
-| OpenCV + SIFT | `--pose-estimator opencv --feature-type sift` | 纹理不足或短序列，更稳健但慢 3~5 倍 |
-| COLMAP（推荐长序列） | `--pose-estimator colmap` | 长序列（≥60 帧），工业级 SfM，注册率与点云质量更高 |
+| OpenCV + ORB（默认） | `--pose-estimator opencv --feature-type orb` | 纹理丰富，速度最快 |
+| OpenCV + SIFT | `--pose-estimator opencv --feature-type sift` | 纹理不足或短序列，更稳健但慢 |
+| COLMAP | `--pose-estimator colmap` | 长序列（≥60 帧），质量更高 |
 
-**推荐准则**：
+**推荐**：
 
-- **短序列（<60 帧）**：用 OpenCV 后端。纹理丰富用 ORB，纹理不足换 SIFT。
-- **长序列（≥60 帧）**：优先用 COLMAP。实测 60 帧视频 COLMAP 注册 54/60、27329 点；自研 OpenCV 后端注册率偏低。
-- **想要零依赖、纯 Python**：OpenCV 后端。ORB 覆盖大部分场景，SIFT 作为备选。
-- **不确定用哪个**：先用默认（OpenCV + ORB）跑一遍，结果不满意再换后端对比。
-
-**OpenCV 后端的内部机制**：前端用 ORB/SIFT 特征 + 本质矩阵恢复运动，后端 BA 用自适应鲁棒加权（自动识别并降权异常观测），并有多重保护机制处理视频质量波动、初值异常、过拟合等情况。这些都在内部自动完成，无需手动配置。
+- 短序列（<60 帧）：OpenCV 后端。
+- 长序列（≥60 帧）：优先 COLMAP。
+- 不确定：先用默认 OpenCV + ORB。
 
 ## 🧠 硬件自适应渲染配置
 
-光栅化分块大小、半径上限与高斯数量上限由实际训练设备决定，避免「有显卡但用 CPU 训练」时按显存分档导致 RAM 被打爆。
+- `device` 决定分档依据：`cuda` → 显存；`cpu` → 系统内存；`auto` → 自动判断。
+- 配置写入 `RenderConfig`：`raster_chunk` / `radius_max` / `max_gaussians` / `source` / `hardware_gb`。
+- `--max-gaussians` 只覆盖高斯上限，其余渲染参数不变。
+- 查看方式：
+  ```bash
+  python cli.py --video input.mp4 --device cuda --show-config
+  ```
 
-- **device 决定分档依据**：`cuda` → GPU 显存；`cpu` → 系统内存；`auto/None` → 按 `torch.cuda.is_available()` 自动判断。
-- **探测顺序**：显存走 `torch.cuda.get_device_properties`；内存走 psutil → `os.sysconf` → Windows `GlobalMemoryStatusEx`。
-- **结果**：写入 `RenderConfig`（`raster_chunk` / `radius_max` / `max_gaussians` / `source` / `hardware_gb`），CLI 与 GUI 都从这里取。
-- **可手动下调**：`--max-gaussians` 只覆盖 `max_gaussians`，其余渲染参数不变；GUI 中切换设备下拉框会自动刷新高斯上限控件的范围与默认值。
-- **查看方式**：`python cli.py --video input.mp4 --device cuda --show-config`。
+GPU 分档参考：<4GB 100k、<6GB 200k、<8GB 300k、<12GB 500k、<16GB 700k、<24GB 1M、≥24GB 1.5M。  
+CPU 分档参考：<8GB 50k、<16GB 100k、<32GB 200k、<64GB 300k、<128GB 400k、≥128GB 600k。
 
-`render_config` 会随训练检查点一起保存；`load_training_state` 会同步恢复光栅化器的 `raster_chunk` / `radius_max` / `max_span`，保证续训时的渲染行为与保存时一致。
+`render_config` 会随检查点保存，续训时同步恢复。
 
 ## 📈 训练细节
-**损失函数**：`(1 - w_ssim) * L1 + w_ssim * SSIM`，SSIM 权重线性升温。
 
-**密度控制**：每 `densify_every` 步根据梯度累积和尺度分裂/复制高斯，每 `prune_every` 步修剪低不透明度高斯，并自动限制总数量。分裂/复制阈值用**梯度分布的 p60 分位数自适应**（不依赖绝对量级，适配 loss 的 mean reduction；无绝对硬底，避免小梯度量级下永不触发）；复制时**保留原高斯 + 新增带微扰副本**（总数 = n + n_dup，与官方 densify_and_clone 一致）；修剪时保护梯度高于中位数的高斯；对需梯度的参数先 `.detach()` 再操作，并用 `.detach()` 重建修剪后的叶子张量。**优化器动量按行保留**：密度控制时新增高斯动量补零、幸存者按 mask 保留（官方语义），不再重建 Adam 清空全部动量，避免训练震荡。
-**初始高斯稠密化**：若初始化后高斯数量少于 2000 个，自动对每个高斯做 8 倍扩增（加噪声），确保训练有足够的起始高斯数。
-
-**学习率衰减**：指数衰减，每 `lr_decay_steps` 步乘以 `lr_decay_gamma`。
-
-**SH 升温**：前 `sh_warmup_steps` 步逐渐提升 SH 阶数，从 0 逐步增至设定值。
-
-**梯度裁剪**：全局梯度范数限制为 10.0，防止训练发散。
-
-**光栅化器向量化**：像素级合成采用**排序式逐像素 splat**——把逐高斯 Python 内层循环重写为「展平覆盖像素对 → stable sort → 分段透射率 → scatter_add 归约」的纯张量算子，消除每颗高斯的 kernel launch 与 GPU→CPU 同步。在作者测试环境下（180x320+4000 高斯）forward 加速约 14.5x、forward+backward 约 37.7x；2160x3840+38665 高斯单帧约 1.7s（原为分钟级）。输出与旧实现逐元素一致（误差 < 1e-6）。具体加速比因硬件和场景而异。
-**光栅化器显存上界（分块）**：逐像素合成按深度有序高斯**分块**（每块大小由 `raster_chunk` 决定，随硬件分档变化），块内覆盖网格只按块内最大包围盒物化——单颗大高斯（半径已 clamp 到 `radius_max`）只撑大自己所在块，不再让全体陪跑。跨块透射率用**逐像素 log-transmittance 进位**（carry）累计，与整表算法在精确算术下等价（fp64 验证一致到 ~5e-13）。附带收益：深堆叠像素上分块版比整表全局 cumsum 更准（整表大负数相减存在灾难性抵消，分块块内 cumsum 短）。
-**混合精度（AMP）**：`--amp` 开启 fp16 混合精度，**仅 CUDA 生效**。cov3d 组合矩阵乘与 SSIM 卷积走 fp16（Ampere+ 可命中 Tensor Core），光栅化器内部保持 fp32（其 cumsum/scatter 不使用 Tensor Core，硬上 fp16 反而伤数值），配 GradScaler 动态损失缩放避免梯度下溢。无 Tensor Core 的显卡（如 GTX 10 系）开启无收益甚至略慢，**默认关闭**。
-
-**帧内存预加载**：训练每 epoch 遍历全部帧，读盘 + PNG 解码是主要开销且伤硬盘。帧在训练开始前全部预解码为 **uint8 RGB** 缓存到内存（200 帧约 5GB，具体取决于分辨率，仅为 float32 的 1/4），训练期间**零磁盘读取**，访问时按需转 float32。实测 2 epoch × 200 帧从 57.3s（全读盘）降到 21.9s（内存缓存），**2.6x 加速且消除磁盘 IO**。
-**梯度图连接保护**：光栅化器在边缘情况（高斯数为 0、全部高斯在相机后方或投影到画面外）下返回与计算图保持连接的零张量，避免 `loss.backward()` 因缺少 `grad_fn` 而崩溃。
-
-**密度控制梯度处理**：密度控制（densify/prune）对需梯度的参数先 `.detach()` 再操作，并用 `.detach()` 重建修剪后的叶子张量，避免 `numpy()` 误用崩溃和修剪后参数被优化器静默跳过。
-
-**Loss 发散保护**：若单步 loss 超过阈值（默认 1.0），自动保存检查点并中断训练，避免无限发散。
-
-**焦距自校准**：若启用 `--train-focal`，在训练中优化焦距参数（fx, fy），适应实际内参。
-
+- **损失**：`(1 - w_ssim) * L1 + w_ssim * SSIM`，SSIM 权重线性升温。
+- **密度控制**：按梯度分位数自适应分裂/复制，修剪低不透明度高斯。
+- **初始稠密化**：高斯少于 2000 时自动 8 倍扩增。
+- **学习率衰减**：指数衰减。
+- **SH 升温**：前 `sh_warmup_steps` 步逐步提升 SH 阶数。
+- **梯度裁剪**：全局范数限制 10.0。
+- **光栅化器**：排序式逐像素 splat 向量化，分块控制显存。
+- **混合精度**：`--amp` 仅 CUDA + Ampere+ 有收益，默认关闭。
+- **帧内存预加载**：训练前预解码为 uint8 RGB，减少磁盘 IO。
+- **Loss 发散保护**：单步 loss 超过阈值时保存检查点并中断。
+- **焦距自校准**：`--train-focal` 时优化 fx、fy。
 ## 💾 断点续训
-所有中间结果和训练状态保存在 `--workdir` 指定目录下：
+
+工作目录保存：
 
 | 文件 | 内容 |
 |------|------|
 | `frame_paths.txt` | 帧路径列表 |
-| `intrinsics.npy`、`poses.npy`、`sparse_points.npy` | 姿态和稀疏点云 |
-| `gaussian_params.npz` | 初始化后的高斯参数 |
-| `training_state.pt` | 完整训练状态（参数、优化器、密度控制器、焦距、SH 阶数、渲染配置等） |
-| `best_training_state.pt` | 历史最优（最低 loss）训练状态，训练过程中会保存 |
+| `frame_meta.json` | GUI 写入的帧元数据（scale/fps） |
+| `intrinsics.npy`、`poses.npy`、`sparse_points.npy` | 内参、位姿、稀疏点云 |
+| `gaussian_params.npz` | 初始化高斯参数 |
+| `training_state.pt` | 完整训练状态 |
+| `best_training_state.pt` | 历史最优训练状态 |
 
-**恢复训练**：
+恢复训练：
 ```bash
 python cli.py --video input.mp4 --resume-dir ./workdir --output restored.ply
 ```
-或通过 GUI 直接选择相同的工作目录，程序自动检测并恢复。恢复时，训练会**从上次中断的帧位置继续**（检查点记录 `last_frame_index`，配合有效位姿帧数计算），而非从头开始该轮次。检查点保存的**高斯基数与当前初始化数量不同也可恢复**（密度自适应会改变数量，恢复时直接采用检查点参数重建高斯与优化器）。**渲染配置（`raster_chunk` / `radius_max` / `max_span`）也会随检查点恢复**，保证续训时渲染行为一致。
 
-**位姿保存约定**：`poses.npy` 保存为**定长数组**（长度 = 帧数），缺失位姿的帧记为 `NaN` 行，恢复时按索引还原——中段存在未注册帧（COLMAP 常见）也不会错位。
+恢复时从上次中断帧继续；高基数不同也可恢复；渲染配置同步恢复。  
+`best_loss` 从 `training_state.pt` 恢复；`best_training_state.pt` 仅保存历史最优，恢复流程不会自动读取。
 
-**SH 颜色约定**：已对齐官方 3DGS——DC 系数存 `(RGB-0.5)/C0`、求值补 `+0.5`、视角方向用世界系；导出的 `.ply` 可直接被官方查看器 / SuperSplat 加载。
+## ⚙️ 高级参数建议
 
-**注意**：续训时 `best_loss` 从 `inf` 重新开始，不会从 `best_training_state.pt` 恢复历史最优值。如需保留最优模型，请勿覆盖 `best_training_state.pt`。
-
-## ⚙️ 高级参数调优建议
-
-**采样模式**
-
-- `--sampling-mode two-stage`：适用于快速运动或视角变化剧烈的视频，能更好保留细节。
-
-**训练**
-
-- `--sh-degree 3`：获得最强的视角相关效果，但训练时间略增。
-- `--max-gaussians`：不指定时按实际设备自动选择上限（`--show-config` 可查看）；手动设定时根据显存/内存设置，推荐 GPU 300k~500k（8GB 显存可尝试 300k，24GB 可到 1M），CPU 训练保持保守（≤200k）。
-- `--train-focal`：若视频本身运动估计不准，开启此选项可改善几何一致性。
-- `--random-background`：能提升前景物体重建质量，但背景透明区域可能受干扰。
-
-**姿态估计**
-
-- `--feature-type orb`（默认）：快，纹理丰富场景足够。
-- `--feature-type sift`：低纹理 / 短序列更稳健，速度慢 3~5 倍。
+- `--sampling-mode two-stage`：快速运动或视角变化剧烈时使用。
+- `--sh-degree 3`：最强视角相关效果，训练时间略增。
+- `--max-gaussians`：不指定则按设备自动选择；可手动下调。
+- `--train-focal`：运动估计不准时改善几何一致性。
+- `--random-background`：提升前景质量，背景透明区域可能受干扰。
+- `--feature-type sift`：低纹理 / 短序列更稳健，速度慢。
 - `--pose-estimator colmap`：长序列推荐。
 
 ## 📝 注意事项
-- **帧采样数量**：通常 100~200 帧效果较好，过少会导致欠约束，过多增加训练时间。
-- **姿态估计后端**：
-  - 长序列（≥60 帧）优先用 `--pose-estimator colmap`。COLMAP 对视频长序列的注册率低是其 mapper 的固有行为（只注册可稳定三角化的帧），但注册帧点云质量高，足以初始化高斯。mapper 可能把场景拆成多个子模型，程序会自动选择注册图像数最多的模型。
-  - 短序列（<60 帧）用 OpenCV 后端即可。默认 ORB 覆盖大部分场景；纹理不足或想更稳健可换 `--feature-type sift`。
-  - 自研 OpenCV 后端已处理常见的 BA 深度异常、尺度漂移、焦距漂移、少观测过拟合等问题，无需手动干预。
-- **显存/内存管理**：GUI 在检测到 CUDA OOM 时会尝试降低高斯上限并修剪；CLI 无此自动处理，若显存溢出需手动降低 `--max-gaussians`，或改用 `--device cpu` 走内存分档。
-- **设备选择与分档**：`--device` 决定按显存还是系统内存分档。有显卡但想用 CPU 训练时务必显式传 `--device cpu`，否则默认按显存分档会使 `max_gaussians` 远超 RAM 承受能力。
-- **CPU 亲和性**：启动时会自动绑定所有逻辑核心，提升多核利用效率（通过 psutil）。
-- **光栅化器**：本项目使用纯 PyTorch 实现的光栅化器（排序式逐像素 splat 向量化，分块显存上界），无需编译任何 CUDA 扩展，开箱即用。
-- **GPU 精度**：`--amp` 混合精度仅对 Ampere+（RTX 30 系及以上）有 Tensor Core 收益；无 Tensor Core 的显卡（GTX 10 系等）请保持默认纯 FP32。
+
+- 通常 100~200 帧效果较好。
+- 长序列优先 COLMAP；短序列 OpenCV 即可。
+- GUI 遇到 CUDA OOM 会尝试降低高斯上限并修剪；CLI 需手动降低 `--max-gaussians`。
+- 有显卡但想用 CPU 训练时务必显式传 `--device cpu`。
+- 启动时自动绑定所有逻辑核心。
+- 纯 PyTorch 光栅化器无需编译 CUDA 扩展。
+- `--amp` 仅对 Ampere+ 有 Tensor Core 收益。
 
 ## ⚠️ 已知限制
 
-- GUI 未暴露 `--focal-guess`、`--resume-dir` 等参数；评估间隔控件未生效。
-- 性能数字为作者测试环境结果，不同硬件、分辨率、场景下会有所差异。
+- GUI 未暴露 `--focal-guess`、`--resume-dir`；评估间隔控件未生效。
+- 性能数字因硬件、分辨率、场景而异。
+- 动态场景 / 运动物体会产生重影或形变，需 4D-GS 类扩展。
+- 反射 / 镜面表面会重建发雾或颜色错乱，属方法边界。
+- 训练开销与推理/渲染 FPS 无关；导出的 `.ply` 可用官方 CUDA viewer 实时浏览。
 
 ## 📄 许可证
 
-本项目采用 Apache-2.0 许可证，欢迎自由使用和修改。
+Apache-2.0，欢迎自由使用和修改。
 
 ## 🙏 致谢
 
-3D Gaussian Splatting 原始论文和开源代码。
-
+3D Gaussian Splatting 原始论文与开源代码。  
 OpenCV、PyTorch、SciPy、PySide6 等优秀开源库。
 
 如有问题，欢迎提 Issue 或 PR。Happy Splatting!
