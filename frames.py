@@ -154,7 +154,7 @@ def _uniform_extract(
             "均匀采样: 总帧数=%d, 原始FPS=%.2f, 目标FPS=%.2f, 输出尺寸=%dx%d, 目标帧数=%d",
             total, orig_fps, fps, w, h, num_frames,
         )
-        logger.debug(
+        logger.info(
             "均匀采样索引范围: 首=%d, 末=%d, 去重后=%d",
             int(indices[0]), int(indices[-1]), int(np.unique(indices).size),
         )
@@ -225,10 +225,10 @@ def _smart_extract_from_cap(
     6. 若通过帧数低于 min_frames，回退到均匀采样。
     """
     sample_indices = _make_sample_indices(total)
-    logger.debug("打分采样点: %d 个（上限 %d），首=%d, 末=%d",
-                 len(sample_indices), MAX_SCORE_SAMPLES,
-                 int(sample_indices[0]) if len(sample_indices) else -1,
-                 int(sample_indices[-1]) if len(sample_indices) else -1)
+    logger.info("打分采样点: %d 个（上限 %d），首=%d, 末=%d",
+                len(sample_indices), MAX_SCORE_SAMPLES,
+                int(sample_indices[0]) if len(sample_indices) else -1,
+                int(sample_indices[-1]) if len(sample_indices) else -1)
 
     sharpness, flow = _compute_gating_scores(cap, sample_indices, flow_method)
     sharp_full = _interp_to_full(sample_indices, sharpness, total)
@@ -259,8 +259,8 @@ def _smart_extract_from_cap(
         weights = valid.astype(np.float64)
         # 单阶段没有视差，权重全为 1，但依然走时间分层，保证时间均匀
         indices = _stratified_select(weights, valid, target, n_bins=SELECT_BINS)
-        logger.debug("时间分层选择: n_bins=%d, 目标=%d, 实际选中=%d",
-                     SELECT_BINS, target, len(indices))
+        logger.info("时间分层选择: n_bins=%d, 目标=%d, 实际选中=%d",
+                    SELECT_BINS, target, len(indices))
 
     os.makedirs(output_dir, exist_ok=True)
     paths, _ = _extract_indices(cap, indices, output_dir, w, h)
@@ -309,7 +309,7 @@ def _two_stage_extract(
     )
 
     coarse_dir = tempfile.mkdtemp(prefix="coarse_")
-    logger.debug("粗提取临时目录: %s", coarse_dir)
+    logger.info("粗提取临时目录: %s", coarse_dir)
 
     try:
         # ---------- 阶段 1：粗提取 + 粗位姿 ----------
@@ -343,7 +343,7 @@ def _two_stage_extract(
 
         # ---------- 阶段 2：打分 + 门控 + 视差加权 + 分层选择 ----------
         sample_indices = _make_sample_indices(total)
-        logger.debug("阶段 2: 打分采样点 %d 个", len(sample_indices))
+        logger.info("阶段 2: 打分采样点 %d 个", len(sample_indices))
 
         sharpness, flow = _compute_gating_scores(cap, sample_indices, flow_method)
         sharp_full = _interp_to_full(sample_indices, sharpness, total)
@@ -378,8 +378,8 @@ def _two_stage_extract(
                 weights = valid.astype(np.float64)
             target = min(num_frames, n_valid)
             indices = _stratified_select(weights, valid, target, n_bins=SELECT_BINS)
-            logger.debug("阶段 2: 分层选择 n_bins=%d, 目标=%d, 实际选中=%d",
-                         SELECT_BINS, target, len(indices))
+            logger.info("阶段 2: 分层选择 n_bins=%d, 目标=%d, 实际选中=%d",
+                        SELECT_BINS, target, len(indices))
 
         os.makedirs(output_dir, exist_ok=True)
         paths, _ = _extract_indices(cap, indices, output_dir, w, h)
@@ -389,7 +389,7 @@ def _two_stage_extract(
     finally:
         cap.release()
         shutil.rmtree(coarse_dir, ignore_errors=True)
-        logger.debug("已清理粗提取临时目录: %s", coarse_dir)
+        logger.info("已清理粗提取临时目录: %s", coarse_dir)
 
 
 # ---------- 时间分层选择 ----------
@@ -417,11 +417,11 @@ def _stratified_select(
     """
     n = len(weights)
     if n == 0 or num_frames <= 0:
-        logger.debug("分层选择跳过: n=%d, num_frames=%d", n, num_frames)
+        logger.info("分层选择跳过: n=%d, num_frames=%d", n, num_frames)
         return np.array([], dtype=int)
     num_frames = min(num_frames, int(valid.sum()))
     if num_frames <= 0:
-        logger.debug("分层选择跳过: 有效帧为 0")
+        logger.info("分层选择跳过: 有效帧为 0")
         return np.array([], dtype=int)
 
     # 段数不能超过目标帧数，否则每段名额不足，会有大量空段
@@ -465,7 +465,7 @@ def _stratified_select(
         selected.extend((seg_indices + lo).tolist())
 
     result = np.asarray(sorted(set(selected)), dtype=int)
-    logger.debug(
+    logger.info(
         "分层选择: n_bins=%d, 目标=%d, 选中=%d, 空段=%d, 零权重段=%d",
         n_bins, num_frames, len(result), empty_bins, zero_weight_bins,
     )
@@ -497,7 +497,7 @@ def _compute_gating_scores(
     sharpness = np.zeros(n, dtype=np.float64)
     flow = np.zeros(n, dtype=np.float64)
     if n == 0:
-        logger.debug("打分跳过: 采样点为空")
+        logger.info("打分跳过: 采样点为空")
         return sharpness, flow
 
     method = flow_method.lower()
@@ -510,7 +510,7 @@ def _compute_gating_scores(
         ok, bgr = cap.read()
         if not ok:
             read_fail += 1
-            logger.debug("打分读取失败: 帧索引=%d", int(idx))
+            logger.info("打分读取失败: 帧索引=%d", int(idx))
             prev_gray = None
             prev_idx = None
             continue
@@ -548,7 +548,7 @@ def _compute_gating_scores(
     if n >= 2 and flow[0] == 0.0 and flow[1] > 0.0:
         flow[0] = flow[1]
 
-    logger.debug(
+    logger.info(
         "打分完成: 采样=%d, 读取失败=%d, 清晰度[中位=%.3f, 最大=%.3f], "
         "光流[中位=%.4f, 最大=%.4f]",
         n, read_fail,
@@ -576,7 +576,7 @@ def _gating_mask(sharp_full: np.ndarray, flow_full: np.ndarray) -> np.ndarray:
     flow_thresh = max(flow_q, FLOW_MEDIAN_RATIO * flow_med)
     mask = (sharp_full >= sharp_thresh) & (flow_full >= flow_thresh)
 
-    logger.debug(
+    logger.info(
         "门控阈值: sharpness>=%.4f (q=%.4f, med=%.4f), "
         "flow>=%.4f (q=%.4f, med=%.4f)",
         sharp_thresh, sharp_q, sharp_med,
@@ -622,7 +622,7 @@ def _enforce_time_coverage(
         logger.info("时间覆盖兜底: 共补足 %d 个分箱（每箱至少 %d 帧）",
                     touched, min_per_bin)
     else:
-        logger.debug("时间覆盖兜底: 无需补足")
+        logger.info("时间覆盖兜底: 无需补足")
     return valid
 
 
@@ -640,11 +640,11 @@ def _lk_flow_magnitude(prev: np.ndarray, curr: np.ndarray) -> float:
         winSize=LK_WINDOW_SIZE, maxLevel=LK_MAX_LEVEL, criteria=LK_CRITERIA,
     )
     if status is None:
-        logger.debug("LK 光流: status 为 None，返回 0")
+        logger.info("LK 光流: status 为 None，返回 0")
         return 0.0
     valid = status.ravel() == 1
     if not valid.any():
-        logger.debug("LK 光流: 无有效跟踪点，返回 0")
+        logger.info("LK 光流: 无有效跟踪点，返回 0")
         return 0.0
     disp = (next_pts[valid] - pts[valid]).reshape(-1, 2)
     return float(np.mean(np.sqrt(np.sum(disp ** 2, axis=1))))
@@ -683,7 +683,7 @@ def _compute_parallax_scores(
     if parallax.max() > 1e-9:
         parallax = parallax / parallax.max()
 
-    logger.debug(
+    logger.info(
         "视差分数: 有效位姿对=%d, 归一化后[中位=%.4f, 最大=%.4f]",
         len(valid_pairs) - 1,
         float(np.median(parallax)), float(parallax.max()) if parallax.size else 0.0,
@@ -706,7 +706,7 @@ def _make_sample_indices(total: int) -> np.ndarray:
         indices = np.array([0], dtype=int)
     if indices[-1] != total - 1:
         indices = np.append(indices, total - 1)
-    logger.debug("构造采样索引: total=%d, step=%d, n=%d", total, step, len(indices))
+    logger.info("构造采样索引: total=%d, step=%d, n=%d", total, step, len(indices))
     return indices
 
 
@@ -770,7 +770,7 @@ def _target_frame_count(
     raw = int(total * target_fps / orig_fps)
     n = min(max(raw, min_frames), max_frames)
     result = max(1, min(n, total))
-    logger.debug(
+    logger.info(
         "目标帧数计算: total=%d, orig_fps=%.2f, target_fps=%.2f, "
         "raw=%d, clamp[%d, %d] -> %d",
         total, orig_fps, target_fps, raw, min_frames, max_frames, result,
@@ -787,8 +787,8 @@ def _compute_resized_size(orig_w: int, orig_h: int, scale: float) -> Tuple[int, 
     if h % 2 != 0:
         h += 1
     result = (max(w, 2), max(h, 2))
-    logger.debug("缩放尺寸: %dx%d (scale=%.2f) -> %dx%d",
-                 orig_w, orig_h, scale, result[0], result[1])
+    logger.info("缩放尺寸: %dx%d (scale=%.2f) -> %dx%d",
+                orig_w, orig_h, scale, result[0], result[1])
     return result
 
 
@@ -814,7 +814,7 @@ def _extract_indices(
         ok, bgr = cap.read()
         if not ok:
             read_fail += 1
-            logger.debug("抽帧读取失败: 输出序号=%d, 帧索引=%d", i, int(idx))
+            logger.info("抽帧读取失败: 输出序号=%d, 帧索引=%d", i, int(idx))
             continue
         resized = cv2.resize(bgr, (w, h), interpolation=cv2.INTER_AREA)
         fname = f"frame_{i:04d}.png"
@@ -829,5 +829,5 @@ def _extract_indices(
         logger.warning("抽帧: 请求 %d 帧, 读取失败 %d 帧, 成功 %d 帧",
                        len(indices), read_fail, len(paths))
     else:
-        logger.debug("抽帧: 请求 %d 帧, 全部成功", len(indices))
+        logger.info("抽帧: 请求 %d 帧, 全部成功", len(indices))
     return paths, np.asarray(used, dtype=int)

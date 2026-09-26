@@ -190,7 +190,7 @@ def estimate_poses_with_colmap(
                "--FeatureExtraction.max_image_size", str(max_image_size),
                "--database_path", db_path,
                "--image_path", tmp_img_dir]
-        _run_colmap(cmd, "特征提取", colmap_bin_dir)
+        _run_colmap(cmd, "特征提取中", colmap_bin_dir)
 
         # ------------------------------------------------------------------
         # 从数据库读取 image_id -> 原始文件名映射
@@ -230,10 +230,10 @@ def estimate_poses_with_colmap(
         else:
             matching_cmd = [colmap_exe_path, "exhaustive_matcher",
                             "--database_path", db_path]
-        _run_colmap(matching_cmd, "匹配", colmap_bin_dir)
+        _run_colmap(matching_cmd, "特征匹配中", colmap_bin_dir)
 
         # ------------------------------------------------------------------
-        # 校验匹配质量（检测 COLMAP 4.x 的 bug）
+        # 校验匹配质量
         # ------------------------------------------------------------------
         conn = sqlite3.connect(db_path)
         try:

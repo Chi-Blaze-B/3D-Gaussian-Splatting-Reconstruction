@@ -14,5 +14,3 @@ PySide6>=6.5.0
 matplotlib>=3.7.0
 psutil>=5.9.0
 
-# 实验性依赖（代码预留接口，默认未启用）
-# torchmetrics>=0.11.0

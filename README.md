@@ -1,13 +1,30 @@
 <h1 align="center"><strong>3D Gaussian Splatting Reconstruction</strong></h1>
 <p align="center">
+  <!-- 项目标题 -->
+  <img src="https://img.shields.io/badge/🌟_3D_Gaussian_Splatting-Reconstruction-FF6F00?style=flat-square&logo=github&logoColor=white" alt="Project">
+  <br><br>
+  <!-- 环境与核心依赖 -->
   <img src="https://img.shields.io/badge/Python-3.11-3776AB?style=flat-square&logo=python&logoColor=white" alt="Python">
   <img src="https://img.shields.io/badge/PyTorch-2.0+-EE4C2C?style=flat-square&logo=pytorch&logoColor=white" alt="PyTorch">
   <img src="https://img.shields.io/badge/CUDA-11.8+-76B900?style=flat-square&logo=nvidia&logoColor=white" alt="CUDA">
+  <br><br>
+  <!-- 核心功能模块 -->
   <img src="https://img.shields.io/badge/GUI-PySide6-8A2BE2?style=flat-square&logo=qt&logoColor=white" alt="GUI">
+  <img src="https://img.shields.io/badge/SfM-COLMAP_|_OpenCV-5C3EE8?style=flat-square&logo=opencv&logoColor=white" alt="SfM">
+  <img src="https://img.shields.io/badge/Rendering-Real_Time-FF4500?style=flat-square" alt="Rendering">
+  <br><br>
+  <!-- 兼容性与许可证 -->
+  <img src="https://img.shields.io/badge/Platform-Windows_|_Linux_|_macOS-0078D4?style=flat-square&logo=windows&logoColor=white" alt="Platform">
   <img src="https://img.shields.io/badge/License-Apache_2.0-1E90FF?style=flat-square&logo=apache&logoColor=white" alt="License">
+  <br><br>
+  <!-- 社区动态（自动实时更新） -->
+  <img src="https://img.shields.io/github/stars/Chi-Blaze-B/3D-Gaussian-Splatting-Reconstruction?style=flat-square&color=yellow&logo=github" alt="Stars">
+  <img src="https://img.shields.io/github/forks/Chi-Blaze-B/3D-Gaussian-Splatting-Reconstruction?style=flat-square&color=blue&logo=github" alt="Forks">
+  <img src="https://img.shields.io/github/issues/Chi-Blaze-B/3D-Gaussian-Splatting-Reconstruction?style=flat-square&color=red&logo=github" alt="Issues">
+  <img src="https://img.shields.io/github/last-commit/Chi-Blaze-B/3D-Gaussian-Splatting-Reconstruction?style=flat-square&color=green&logo=github" alt="Last Commit">
 </p>
 
-基于 Python 的视频转 3D 高斯泼溅（3DGS）工作流。输入一段视频，输出一个 `.ply` 文件，可用官方 3DGS 查看器浏览重建的三维场景。
+基于 Python 的视频转 3D 高斯泼溅（3DGS）工作流。输入一段视频，输出一个 `.ply` 文件，可用官方 3DGS 查看器（https://github.com/graphdeco-inria/gaussian-splatting ）浏览重建的三维场景。。
 
 **核心光栅化器完全基于 PyTorch 实现**，无需编译 CUDA 扩展，支持 SH 0–3 阶球谐函数，排序式逐像素 splat 向量化。整体流程还依赖 OpenCV、SciPy、PySide6、psutil 等库。
 

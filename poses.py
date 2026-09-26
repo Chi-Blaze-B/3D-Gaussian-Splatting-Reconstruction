@@ -1491,7 +1491,7 @@ def _prune_map_points(map_points, feat_map, frame_to_points, reproj_thresh,
         for f_idx, _, _, _ in pt['obs']:
             frame_to_points[f_idx].add(new_idx)
 
-    logger.debug(f"修剪 {len(to_remove)} 个点，剩余 {len(map_points)}")
+    logger.info("[prune] 修剪 %d 个点，剩余 %d", len(to_remove), len(map_points))
 
 
 def _filter_point_cloud(map_points, frame_poses, focal, fy, cx, cy,

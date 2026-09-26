@@ -10,7 +10,7 @@ import math
 import sys
 import threading
 from dataclasses import dataclass, field, replace
-from typing import Optional, List, Dict, Callable, Union
+from typing import Optional, List, Dict, Union, Callable
 from collections import OrderedDict
 
 import numpy as np
@@ -105,13 +105,7 @@ def _detect_system_memory_gb() -> float:
 # ---------- 渲染配置 ----------
 @dataclass(frozen=True)
 class RenderConfig:
-    """光栅化器 + 密度上限的硬件相关配置。
-
-    raster_chunk: 光栅化分块的高斯数。
-    radius_max:   3σ 半径上限；max_span = 2*radius_max + 1。
-    max_gaussians: 高斯数量硬上限。
-    source/hardware_gb: 配置来源与触发档位的硬件容量。
-    """
+    """光栅化器 + 密度上限的硬件相关配置。"""
     raster_chunk: int
     radius_max: int
     max_gaussians: int
@@ -125,8 +119,6 @@ class RenderConfig:
 
 def _tune_for_gpu(vram_gb: float) -> RenderConfig:
     if vram_gb < 4:
-        # 小显存档：radius_max=3 实测（100K 高斯 1080p）forward 提速 ~30%，
-        # 对实际训练中常见的小/中等 log_scale 场景无影响（多数高斯半径 < 3）。
         return RenderConfig(64, 3, 100_000, "cuda", vram_gb)
     if vram_gb < 6:
         return RenderConfig(96, 5, 200_000, "cuda", vram_gb)
@@ -163,7 +155,6 @@ def auto_tune_config(device: Optional[str] = None,
     """按实际训练设备推导渲染配置。
 
     device 决定分档依据：cuda → 显存；cpu → 系统内存；None/auto → 自动判断。
-    显式传 device 是关键：用 CPU 训练时不能按显存分档，否则内存会爆。
     """
     if device is None or device == "auto":
         use_cuda = torch.cuda.is_available()
@@ -318,24 +309,21 @@ def quat_to_rot(q: torch.Tensor) -> torch.Tensor:
 def build_covariance(log_scales: torch.Tensor, rotations: torch.Tensor) -> torch.Tensor:
     s = torch.exp(log_scales)
     R = quat_to_rot(rotations)
-    # 协方差 = R @ diag(s) @ R^T，等价于把尺度乘到 R 的每一列（unsqueeze(1)）。
-    # 乘到行（unsqueeze(-1)）会得到各向异性被抹掉的近似对角协方差，旋转无效。
+    # 协方差 = R @ diag(s) @ R^T，等价于把尺度乘到 R 的每一列。
     M = R * s.unsqueeze(1)
     return M @ M.transpose(1, 2)
 
 
 # ---------- 球谐求值 ----------
 def eval_sh(deg: int, sh_coeffs: torch.Tensor, dirs: torch.Tensor) -> torch.Tensor:
-    """求值球谐，返回 [N, 3] 颜色。
+    """求值球谐，返回 [N, 3] 颜色。"""
+    dirs = F.normalize(dirs, dim=-1)
+    if deg == 0:
+        return torch.clamp(sh_coeffs[:, 0] * 0.28209479177387814 + 0.5, min=0.0)
 
-    sh_coeffs: [N, (deg+1)^2, 3]，DC 通道已存 (RGB-0.5)/C0。
-    dirs: [N, 3] 单位方向（世界系：高斯中心 - 相机中心）。
-    """
     N = sh_coeffs.shape[0]
     device = sh_coeffs.device
     dtype = sh_coeffs.dtype
-
-    dirs = F.normalize(dirs, dim=-1)
     x, y, z = dirs[..., 0], dirs[..., 1], dirs[..., 2]
 
     sh0 = torch.ones(N, 1, device=device, dtype=dtype) * 0.28209479177387814
@@ -421,32 +409,32 @@ class Gaussian3D:
 
 
 def densify_initial_gaussians(gaussians: Gaussian3D, expansion_factor: int = 8, noise_scale: float = 0.02):
-    """对初始稀疏高斯做复制加噪。"""
+    """对初始稀疏高斯做复制加噪（全向量化）。"""
     n = gaussians.num_gaussians
     if n == 0:
         return
     device = gaussians.positions.device
-    pos = gaussians.positions.detach().cpu().numpy()
-    log_scales = gaussians.log_scales.detach().cpu().numpy()
-    opa = gaussians.opacities_raw.detach().cpu().numpy()
-    rot = gaussians.rotations.detach().cpu().numpy()
-    sh = gaussians.sh_coeffs.detach().cpu().numpy()
-    new_pos, new_log_scales, new_opa, new_rot, new_sh = [], [], [], [], []
-    for i in range(n):
-        for _ in range(expansion_factor):
-            new_pos.append(pos[i] + np.random.normal(0, noise_scale, 3).astype(np.float32))
-            new_log_scales.append(log_scales[i] + np.log(0.8))
-            new_opa.append(opa[i] + np.random.normal(0, 0.1))
-            new_rot.append(rot[i] + np.random.normal(0, 0.01, 4))
-            new_sh.append(sh[i] + np.random.normal(0, 0.01, (sh.shape[1], 3)))
-    gaussians.positions = torch.from_numpy(np.array(new_pos)).float().to(device)
-    gaussians.log_scales = torch.from_numpy(np.array(new_log_scales)).float().to(device)
-    gaussians.opacities_raw = torch.from_numpy(np.array(new_opa)).float().to(device)
-    gaussians.rotations = torch.from_numpy(np.array(new_rot)).float().to(device)
-    gaussians.sh_coeffs = torch.from_numpy(np.array(new_sh)).float().to(device)
-    for param in [gaussians.positions, gaussians.log_scales, gaussians.opacities_raw,
-                  gaussians.rotations, gaussians.sh_coeffs]:
-        param.requires_grad_(True)
+    dtype = gaussians.positions.dtype
+    S = gaussians.sh_coeffs.shape[1]
+
+    idx = torch.arange(n, device=device).repeat_interleave(expansion_factor)
+    m = n * expansion_factor
+
+    new_pos = gaussians.positions.detach()[idx] + \
+        torch.randn(m, 3, device=device, dtype=dtype) * noise_scale
+    new_log_scales = gaussians.log_scales.detach()[idx] + math.log(0.8)
+    new_opa = gaussians.opacities_raw.detach()[idx] + \
+        torch.randn(m, device=device, dtype=dtype) * 0.1
+    new_rot = gaussians.rotations.detach()[idx] + \
+        torch.randn(m, 4, device=device, dtype=dtype) * 0.01
+    new_sh = gaussians.sh_coeffs.detach()[idx] + \
+        torch.randn(m, S, 3, device=device, dtype=dtype) * 0.01
+
+    gaussians.positions = new_pos.requires_grad_(True)
+    gaussians.log_scales = new_log_scales.requires_grad_(True)
+    gaussians.opacities_raw = new_opa.requires_grad_(True)
+    gaussians.rotations = new_rot.requires_grad_(True)
+    gaussians.sh_coeffs = new_sh.requires_grad_(True)
 
 
 # ---------- 可微光栅化器（纯 PyTorch） ----------
@@ -479,9 +467,8 @@ class DifferentiableRasterizer(nn.Module):
     def _zero_output(self, positions, opacities, H, W):
         """N=0 或无有效高斯时的零输出，保持图连接。"""
         link = (positions.sum() if positions.numel() > 0 else opacities.sum()) * 0.0
-        # expand 产生非连续张量，必须用 reshape（非 view）处理后续尺寸变换
-        zero = link.view(1).expand(H * W * 3).reshape(H, W, 3)
-        alpha = link.view(1).expand(H * W).reshape(H, W)
+        zero = link.view(1, 1, 1).expand(H, W, 3)
+        alpha = link.view(1, 1).expand(H, W)
         return zero, alpha
 
     def forward(self, positions, cov3d, opacities, sh_coeffs, view_matrix, K,
@@ -507,7 +494,7 @@ class DifferentiableRasterizer(nn.Module):
         u = fx * (x_c / z) + cx
         v = fy * (y_c / z) + cy
 
-        # 2D 协方差 —— 保留梯度（后续 alpha 需要 iA/iB/iC）
+        # 2D 协方差 —— 保留梯度
         B = torch.zeros(N, 2, 3, dtype=cov3d.dtype, device=cov3d.device)
         B[:, 0, 0] = fx / z
         B[:, 0, 2] = -fx * x_c / (z * z)
@@ -515,7 +502,7 @@ class DifferentiableRasterizer(nn.Module):
         B[:, 1, 2] = -fy * y_c / (z * z)
         cov2d = (B @ cam_cov) @ B.transpose(1, 2)
 
-        # tile 半径与有效性：纯索引用途，不需要梯度
+        # tile 半径与有效性：纯索引，不需要梯度
         with torch.no_grad():
             a = cov2d[:, 0, 0].detach()
             c = cov2d[:, 1, 1].detach()
@@ -546,9 +533,8 @@ class DifferentiableRasterizer(nn.Module):
         dirs = F.normalize(positions[valid][order] - center_world, dim=-1)
         colors = eval_sh(sh_degree, sh_coeffs[valid][order], dirs)
 
-        link = (positions.sum() if positions.numel() > 0 else opacities.sum()) * 0.0
-        out_color = link.view(1, 1, 1).expand(H, W, 3).contiguous()
-        out_alpha = link.view(1, 1).expand(H, W).contiguous()
+        # 零标量，仅用于保持图连接
+        link = positions.sum() * 0.0
 
         mu_u = u_s; mu_v = v_s; rad = r_s
         A = cov2d_s[:, 0, 0]; B_ = cov2d_s[:, 0, 1]; C = cov2d_s[:, 1, 1]
@@ -564,8 +550,11 @@ class DifferentiableRasterizer(nn.Module):
             batch_n = int(valid_b.sum())
 
         if batch_n == 0:
-            return (out_color + background.view(1, 1, 3) * (1.0 - out_alpha.unsqueeze(-1)),
-                    out_alpha)
+            # 空 tile：零图 + 背景
+            zero_alpha = link.view(1, 1).expand(H, W)
+            zero_color = link.view(1, 1, 1).expand(H, W, 3)
+            return (zero_color + background.view(1, 1, 3) * (1.0 - zero_alpha.unsqueeze(-1)),
+                    zero_alpha)
 
         y_min_b = y_min[valid_b]; y_max_b = y_max[valid_b]
         x_min_b = x_min[valid_b]; x_max_b = x_max[valid_b]
@@ -584,16 +573,14 @@ class DifferentiableRasterizer(nn.Module):
 
         n_chunks = (batch_n + chunk - 1) // chunk
 
-        # 每个 chunk 的最大展开尺寸：整数运算，不需要梯度
-        h_list, w_list = [], []
+        # 一次 D2H 取全部 chunk 的 tile 边界，避免逐 chunk host 同步
         with torch.no_grad():
-            sizes_h = y_max_b - y_min_b
-            sizes_w = x_max_b - x_min_b
-            for k in range(n_chunks):
-                s = k * chunk
-                e = min(s + chunk, batch_n)
-                h_list.append(int(sizes_h[s:e].max().clamp(max=max_span)))
-                w_list.append(int(sizes_w[s:e].max().clamp(max=max_span)))
+            sizes_h_np = (y_max_b - y_min_b).clamp(max=max_span).cpu().numpy()
+            sizes_w_np = (x_max_b - x_min_b).clamp(max=max_span).cpu().numpy()
+        h_list = [int(sizes_h_np[k * chunk:min((k + 1) * chunk, batch_n)].max())
+                  for k in range(n_chunks)]
+        w_list = [int(sizes_w_np[k * chunk:min((k + 1) * chunk, batch_n)].max())
+                  for k in range(n_chunks)]
 
         for k in range(n_chunks):
             start = k * chunk
@@ -639,7 +626,7 @@ class DifferentiableRasterizer(nn.Module):
                 y_coord_s = y_coord[sort_idx]
                 x_coord_s = x_coord[sort_idx]
 
-                # 每个像素的分组起始位置（用于截断跨像素的透射率累积）
+                # 每个像素的分组起始位置
                 new_group = pix_sorted[1:] != pix_sorted[:-1]
                 group_starts = torch.cat([
                     torch.tensor([True], device=pix_sorted.device), new_group])
@@ -649,7 +636,6 @@ class DifferentiableRasterizer(nn.Module):
                 group_start_pos = torch.cummax(group_start_pos, dim=0).values
 
             # ---------- 阶段 2：alpha 与混合（保留梯度） ----------
-            # 只对有效条目计算，形状 [n_valid_in_chunk]，不再建满 tile 张量
             mu_u_sel = mu_u_c[gauss_sorted]
             mu_v_sel = mu_v_c[gauss_sorted]
             iA_sel = iA_c[gauss_sorted]
@@ -688,16 +674,12 @@ class DifferentiableRasterizer(nn.Module):
             ], dim=-1)
             acc.index_add_(0, pix_sorted, payload)
 
-        out_color = out_color.view(HpW, 3) + acc[:, :3]
-        out_alpha = out_alpha.view(HpW) + (1.0 - torch.exp(acc[:, 3].clamp(min=-50.0)))
-        out_color = out_color.view(H, W, 3)
-        out_alpha = out_alpha.view(H, W)
+        # 由 acc 直接合成，省去 H×W 零基线物化
+        out_color = (acc[:, :3] + link).reshape(H, W, 3)
+        out_alpha = (1.0 - torch.exp(acc[:, 3].clamp(min=-50.0)) + link).reshape(H, W)
 
         out_color = out_color + background.view(1, 1, 3) * (1.0 - out_alpha.unsqueeze(-1))
         return out_color, out_alpha
-
-
-
 
 
 # ---------- 损失函数 ----------
@@ -743,11 +725,6 @@ class Trainer:
                  grad_thresh_base: float = GRAD_THRESH_BASE, scale_thresh: float = SCALE_THRESH,
                  min_opacity: float = MIN_OPACITY, densify_every: int = DENSIFY_EVERY,
                  prune_every: int = PRUNE_EVERY):
-        """构造训练器。
-
-        render_config 是光栅化器与密度上限的唯一来源；未传时按实际 device 自动探测。
-        max_gaussians 仅覆盖密度上限，其余渲染参数不变。
-        """
         self.device = device
         self.image_height = image_height
         self.image_width = image_width
@@ -929,10 +906,7 @@ class Trainer:
 
         viewmat = self.view_matrix
         if self.train_focal and isinstance(self.fx, nn.Parameter):
-            # fx/fy 是 0-dim Parameter：不能用 torch.tensor([...]) 包进列表构造
-            #（该写法创建新张量、断梯度，focal 优化器拿不到梯度会静默失效）。
-            # 先用常量建 K，再 index_put_ 原地嵌入参数——in-place 变体保留
-            # autograd 连接，且不依赖新版 PyTorch 对「索引赋值 Parameter」的兼容性
+            # 先用常量建 K，再 index_put_ 原地嵌入参数——保留 autograd 连接
             K = torch.eye(3, dtype=torch.float32, device=self.device)
             K[0, 2] = self.cx
             K[1, 2] = self.cy
@@ -958,10 +932,11 @@ class Trainer:
         if amp_on:
             assert self._scaler is not None
             with torch.autocast(device_type="cuda", dtype=torch.float16):
-                cov3d = self.gaussians.cov3d
                 with torch.autocast(device_type="cuda", enabled=False):
+                    # cov3d 与光栅化器都在 fp32 下算，避免协方差精度损失
+                    cov3d = self.gaussians.cov3d
                     rendered, _ = self.rasterizer(
-                        means3D, cov3d.float(), opacities, sh_coeffs, viewmat, K,
+                        means3D, cov3d, opacities, sh_coeffs, viewmat, K,
                         self.background, sh_degree=eff_deg,
                     )
                 if rendered.dim() == 3 and rendered.shape[0] == 3:
@@ -1016,13 +991,17 @@ class Trainer:
 
     def train_epoch(self, frames_iter, camera_poses: List[Optional[np.ndarray]],
                     stop_event: Optional[threading.Event] = None,
-                    progress_callback: Optional[Callable] = None,
                     loss_threshold: float = LOSS_THRESHOLD,
                     checkpoint_path: Optional[str] = None,
-                    start_frame: int = 0) -> float:
+                    start_frame: int = 0,
+                    progress_callback: Optional[Callable[[int, int, float], None]] = None) -> float:
         total_loss = 0.0
         processed_count = 0
-        n = len(frames_iter) if hasattr(frames_iter, '__len__') else 0
+
+        try:
+            total_frames = len(frames_iter)  # type: ignore[arg-type]
+        except TypeError:
+            total_frames = len(camera_poses)
 
         try:
             if not self._pre_train_cache_cleared:
@@ -1040,13 +1019,14 @@ class Trainer:
                     frame = _load_frame_from_path(frame)
                 pose = camera_poses[i] if i < len(camera_poses) else None
                 if pose is None:
-                    if progress_callback:
-                        progress_callback(i + 1, n if n > 0 else i + 1, 0.0)
                     continue
                 loss = self.step(frame, pose)
                 self.last_frame_index = i
                 total_loss += loss
                 processed_count += 1
+
+                if progress_callback is not None:
+                    progress_callback(i + 1, total_frames, loss)
 
                 if checkpoint_path and self.current_step % CHECKPOINT_INTERVAL_STEPS == 0:
                     self.save_training_state(checkpoint_path)
@@ -1055,8 +1035,6 @@ class Trainer:
                         self.save_training_state(checkpoint_path)
                     raise LossDivergenceError(
                         f"Loss {loss:.4f} > threshold {loss_threshold} at frame {i+1}")
-                if progress_callback:
-                    progress_callback(i + 1, n if n > 0 else i + 1, loss)
 
             avg_loss = total_loss / max(processed_count, 1)
             if checkpoint_path:
@@ -1308,14 +1286,10 @@ class AdaptiveDensityController:
             stats = self.densify()
             logger.info("[密度自适应][稠密化] 分裂 %d 个高斯, 复制 %d 个高斯",
                         stats["split"], stats["duplicate"])
-            if torch.cuda.is_available():
-                torch.cuda.empty_cache()
         if self.should_prune():
             n_pruned = self.prune()
             if n_pruned > 0:
                 logger.info("[密度自适应][修剪] 移除 %d 个高斯", n_pruned)
-            if torch.cuda.is_available():
-                torch.cuda.empty_cache()
 
     def should_densify(self) -> bool:
         return self._cadence > 0 and self._cadence % self.densify_every == 0
@@ -1429,8 +1403,7 @@ class AdaptiveDensityController:
         else:
             avg_opacity = g.opacities
 
-        # enforce_cap：把"硬裁剪到 max_gaussians"独立成一条分支，
-        # 常规 prune()（周期性低透明度修剪）保持旧的 min_opacity 逻辑不变。
+        # enforce_cap：把"硬裁剪到 max_gaussians"独立成一条分支
         if enforce_cap:
             if n <= self.max_gaussians:
                 return 0
@@ -1456,8 +1429,7 @@ class AdaptiveDensityController:
 
         keep_mask = ~prune_mask
         self.trainer._prune_optimizer(keep_mask)
-        # 硬裁剪一次删除大量高斯时，幸存高斯的 Adam 动量来自删除前的分布，
-        # 衰减 0.5 降低分布突变导致的优化器发散风险。
+        # 硬裁剪时衰减幸存高斯的 Adam 动量，降低分布突变导致的发散风险
         if enforce_cap and n_pruned > 0:
             for opt in self.trainer.optimizers.values():
                 for p, state in opt.state.items():
