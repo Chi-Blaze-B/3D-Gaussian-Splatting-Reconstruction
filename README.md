@@ -147,7 +147,6 @@ GUI 提供：
 **注意**：GUI 暂未提供 `--focal-guess`、`--resume-dir`；`评估间隔`控件未生效。GUI 默认值与 CLI 有差异，以界面为准。
 
 ## 🧩 核心模块
-
 | 模块 | 功能 |
 |------|------|
 | `frames.py` | 视频帧提取，支持 uniform / smart / two-stage 采样 |

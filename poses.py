@@ -1,14 +1,14 @@
 """
-基于 ORB（或 SIFT）特征 + 增量式 SfM 的鲁棒相机位姿估计。
+基于 ORB/SIFT 特征 + 增量式 SfM 的相机位姿估计。
 
-模块职责：
-  - 特征提取（ORB / SIFT，按 dtype 自动选择 Hamming / L2 度量）
+职责：
+  - 特征提取与匹配（ORB→Hamming，SIFT→L2）
   - 本质矩阵初始化 + 局部地图 PnP 重定位
-  - 带共视关系与冗余剔除的关键帧管理
-  - 局部 / 全局光束法平差（BA，含地图点优化；外层套 GMM-EM 软内点加权）
+  - 关键帧管理与冗余剔除
+  - 局部/全局 BA（含地图点优化，外层套 GMM-EM 软内点加权）
   - 地图点修剪、过滤与输出
 
-依赖：仅 OpenCV + SciPy + NumPy，不依赖 COLMAP。
+依赖：OpenCV + SciPy + NumPy。
 """
 
 import logging
@@ -24,67 +24,67 @@ from scipy.special import expit
 # =========================================================================
 # 阈值与常量
 # =========================================================================
-# —— 帧级判定 ——
-MIN_INLIERS = 25                     # 有效内点下限，低于此值的帧视为匹配失败
+# 帧级判定
+MIN_INLIERS = 25                     # 内点下限，低于视为匹配失败
 MIN_FEATURES = 80                    # 单帧最少特征数
-KEYFRAME_ANGLE_DEG = 5.0             # 关键帧旋转阈值（相对最后一个关键帧，度）
+KEYFRAME_ANGLE_DEG = 5.0             # 关键帧旋转阈值（相对最后一个关键帧）
 KEYFRAME_TRANS_RATIO = 0.05          # 关键帧平移阈值（相对场景尺度）
-COVIS_RATIO_THRESH = 0.25            # 共视比例阈值，低于此值触发新关键帧
-KEYFRAME_CULLING_WINDOW = 10         # 冗余关键帧剔除的回看窗口
-PNP_WINDOW = 12                      # PnP 使用最近多少个关键帧
-SMALL_TRANSLATION = 1e-4             # 判定「纯旋转」的平移阈值
-INIT_MIN_TRANSLATION = 0.01          # 判定「可用于初始化」的最小平移
-MAX_INIT_CANDIDATES = 30             # 初始化候选帧队列上限，防止 O(n²) 配对
+COVIS_RATIO_THRESH = 0.25            # 共视比例阈值
+KEYFRAME_CULLING_WINDOW = 10         # 冗余剔除回看窗口
+PNP_WINDOW = 12                      # PnP 使用的最近关键帧数
+SMALL_TRANSLATION = 1e-4             # 纯旋转判定阈值
+INIT_MIN_TRANSLATION = 0.01          # 可用于初始化的最小平移
+MAX_INIT_CANDIDATES = 30             # 初始化候选队列上限
 MAX_CANDIDATE_TRIES = 5              # 每次尝试的最新候选数
 MIN_COVIS_MATCHES = 10               # 共视估计所需最少绑定匹配数
 
-# —— 特征匹配 ——
-MATCH_DIST = 90                      # ORB 匹配距离上限
-DESC_UPDATE_THRESH = 35              # ORB 描述子更新距离阈值
-SIFT_MATCH_DIST = 400.0              # SIFT 匹配距离上限
-SIFT_DESC_UPDATE_THRESH = 150.0      # SIFT 描述子更新距离阈值
+# 特征匹配
+MATCH_DIST = 90
+DESC_UPDATE_THRESH = 35
+SIFT_MATCH_DIST = 400.0
+SIFT_DESC_UPDATE_THRESH = 150.0
 
-# —— 三角化 ——
-MIN_TRI_ANGLE_DEG = 2.0              # 三角化最小视差角（度）
+# 三角化
+MIN_TRI_ANGLE_DEG = 2.0              # 最小视差角
 
-# —— 地图点维护 ——
-PRUNE_INTERVAL = 200                 # 地图点修剪间隔（帧）
-MIN_OBSERVATIONS = 2                 # 地图点最少观测数
+# 地图点维护
+PRUNE_INTERVAL = 200                 # 修剪间隔（帧）
+MIN_OBSERVATIONS = 2                 # 最少观测数
 MAX_REPROJ_ERROR = 4.0               # 重投影误差上限（倍 reproj_thresh）
 
-# —— BA 迭代与规模 ——
-BA_MAX_ITER = 15                     # 局部 BA 最大迭代
-GLOBAL_BA_ITER = 25                  # 全局 BA 最大迭代
-MIN_BA_WINDOW = 5                    # 触发局部 BA 所需的关键帧数
-MAX_POINTS_IN_BA = 300               # BA 单次最多参与优化的点数
-BA_MAX_OBS = 2000                    # BA 观测上限（超过则随机抽样）
-BA_MIN_OBS = 200                     # BA 最少观测数，低于此值跳过
+# BA 规模
+BA_MAX_ITER = 15
+GLOBAL_BA_ITER = 25
+MIN_BA_WINDOW = 5
+MAX_POINTS_IN_BA = 300
+BA_MAX_OBS = 2000
+BA_MIN_OBS = 200
 
-# —— BA 防护 ——
-BA_MAX_INIT_RMS_RATIO = 3.0          # 初值中位 RMS 超过 reproj_thresh × ratio 则跳过
-BA_OVERFIT_MIN_RMS = 0.02            # BA 后中位 RMS 低于此值视为可疑（局部 BA）
-BA_OVERFIT_MIN_RMS_GLOBAL = 0.005    # 全局 BA 阶段放宽阈值（最终精修）
-BA_OVERFIT_MIN_BEFORE = 0.15         # 且 BA 前中位 RMS 高于此值时才判过拟合
-BA_MAX_RMS_INCREASE = 1.2            # BA 后中位 RMS 超过此倍数则视为变差并回滚
-FOCAL_MAX_STEP_RATIO = 0.05          # BA 单步焦距最大变化比例
-FOCAL_GLOBAL_DRIFT_MAX = 0.15        # 焦距相对初始值的累计漂移上限
+# BA 防护
+BA_MAX_INIT_RMS_RATIO = 3.0          # 初值中位 RMS 超过阈值倍数则跳过
+BA_OVERFIT_MIN_RMS = 0.02            # BA 后 RMS 低于此值疑似过拟合（局部）
+BA_OVERFIT_MIN_RMS_GLOBAL = 0.005    # 全局 BA 放宽
+BA_OVERFIT_MIN_BEFORE = 0.15         # BA 前 RMS 需高于此值才判过拟合
+BA_MAX_RMS_INCREASE = 1.2            # BA 后 RMS 超过此倍数视为变差
+FOCAL_MAX_STEP_RATIO = 0.05          # 单步焦距最大变化比例
+FOCAL_GLOBAL_DRIFT_MAX = 0.15        # 焦距相对初值的累计漂移上限
 
-# —— EM-BA ——
-EM_ITERS = 3                         # 外层 EM 迭代次数
-EM_PI_IN_INIT = 0.85                 # 内点比例初值
-EM_PI_IN_MAX = 0.95                  # π_in 动态上限的基准值
-EM_PI_IN_HARD_CAP = 0.99             # π_in 绝对上限，任何情况下不突破
-EM_SIGMA_CAP_RATIO = 1.5             # σ 上限 = reproj_thresh × ratio
-EM_SIGMA_OUT_RATIO = 8.0             # σ_out = reproj_thresh × ratio
-EM_GAMMA_FLOOR = 1e-4                # γ 下限，防止权重完全归零
+# EM-BA
+EM_ITERS = 3
+EM_PI_IN_INIT = 0.85
+EM_PI_IN_MAX = 0.95
+EM_PI_IN_HARD_CAP = 0.99
+EM_SIGMA_CAP_RATIO = 1.5
+EM_SIGMA_OUT_RATIO = 8.0
+EM_GAMMA_FLOOR = 1e-4
 
-# —— 深度障碍 ——
-EPS_MIN = 1e-8                       # BA 深度障碍下限
-EPS_MAX = 0.1                        # BA 深度障碍上限
+# 深度障碍
+EPS_MIN = 1e-8
+EPS_MAX = 0.1
 
-# —— 尺度归一化 ——
-SCALE_CLAMP = (0.5, 2.0)             # 尺度修正裁剪区间
-SCALE_DEADBAND = 0.05                # 尺度修正死区（避免抖动）
+# 尺度归一化
+SCALE_CLAMP = (0.5, 2.0)
+SCALE_DEADBAND = 0.05
 
 logger = logging.getLogger(__name__)
 
@@ -94,7 +94,7 @@ logger = logging.getLogger(__name__)
 # =========================================================================
 @dataclass(frozen=True)
 class CameraIntrinsics:
-    """针孔相机内参（fx, fy, cx, cy）。"""
+    """针孔相机内参。"""
     fx: float
     fy: float
     cx: float
@@ -109,7 +109,7 @@ class CameraIntrinsics:
 
 @dataclass(frozen=True)
 class CameraPose:
-    """相机外参：世界→相机的 R、t（X_cam = R · X_world + t）。"""
+    """相机外参：X_cam = R · X_world + t。"""
     R: np.ndarray
     t: np.ndarray
 
@@ -122,7 +122,7 @@ class CameraPose:
 
     @property
     def center(self) -> np.ndarray:
-        """相机光心的世界坐标：C = -R^T · t。"""
+        """相机光心的世界坐标 C = -R^T · t。"""
         return (-self.R.T @ self.t).flatten()
 
 
@@ -139,22 +139,11 @@ def estimate_poses(
 ) -> Tuple[CameraIntrinsics, List[CameraPose], np.ndarray]:
     """从有序图像序列估计相机位姿与稀疏点云。
 
-    参数：
-        frame_paths: 帧路径列表（按拍摄时间排序）
-        min_inliers: 单帧有效内点下限
-        feature_type: "orb" 或 "sift"（SIFT 不可用时自动回退 ORB）
-        focal_guess: 焦距初值（像素），默认 max(w, h) * 1.2
-        aspect_ratio: fy / fx 比例
-
-    返回：
-        (intrinsics, poses, xyz) — 内参、每帧位姿、稀疏点云
-
-    焦距语义：
-        focal_init  — 初始焦距（冻结），只用于 BA 内部的漂移保护。
-        focal0      — 「当前焦距」，循环内会被 BA 更新，用于 E 矩阵 / PnP /
-                      BA 输出的内参。像素空间阈值（reproj_thresh /
-                      ransac_thresh）在循环外一次性算好后冻结，保持
-                      「像素绝对容差」语义，不随 focal0 变动。
+    返回 (intrinsics, poses, xyz)。焦距语义：
+        focal_init — 冻结初值，供 BA 漂移保护用。
+        focal0     — 当前焦距，循环内随 BA 更新。
+    像素阈值（reproj_thresh 等）在循环外一次性算好并冻结，保持像素绝对
+    容差语义，不随 focal0 变动。
     """
     if not frame_paths:
         raise ValueError("frame_paths 不能为空")
@@ -167,11 +156,11 @@ def estimate_poses(
     h, w = img_shape
     cx, cy = w / 2.0, h / 2.0
     focal0 = focal_guess if focal_guess is not None else max(w, h) * 1.2
-    focal_init = float(focal0)       # 冻结的初始焦距，供 BA 漂移保护
+    focal_init = float(focal0)
     fy0 = focal0 * aspect_ratio
     image_size = max(w, h)
 
-    # 阈值按图像尺寸自适应，跨分辨率可用。冻结，不随 focal0 变动。
+    # 阈值按图像尺寸自适应，跨分辨率可用
     reproj_thresh = max(0.5, min(3.0, image_size * 0.0015))
     ransac_thresh = reproj_thresh * 0.8
     triang_thresh = reproj_thresh
@@ -190,28 +179,22 @@ def estimate_poses(
     frame_poses[0] = CameraPose(np.eye(3), np.zeros((3, 1)))
     keyframes = [0]
 
-    # 描述子度量由 dtype 决定（ORB→Hamming，SIFT→L2）。
-    # bf 供 knnMatch 使用（crossCheck=False），bf_cross 供 desc < 2 的
-    # 退化场景使用（crossCheck=True）。
+    # 描述子度量由 dtype 决定（ORB→Hamming，SIFT→L2）
     norm_type, match_dist, _ = _descriptor_metric(desc_list)
     bf = cv2.BFMatcher(norm_type, crossCheck=False)
     bf_cross = cv2.BFMatcher(norm_type, crossCheck=True)
 
     initialized = False
-    init_candidates: List[int] = []   # 待配对的候选帧（纯旋转 / 平移不足）
+    init_candidates: List[int] = []   # 纯旋转/平移不足的候选帧
     ba_counter = 0
 
     for i in range(1, len(frame_paths)):
         logger.info(f"处理帧 {i}/{len(frame_paths)-1}")
 
-        # 每轮从 frame_poses 读起，避免任何缓存与 BA 修正后的位姿分叉。
-        # frame_poses[i-1] 一定有效：初值在第 0 帧设置，之后每轮末尾都会
-        # 写回 frame_poses[i]。
+        # 每轮从 frame_poses 读起，避免缓存与 BA 修正后的位姿分叉
         prev_pose = frame_poses[i - 1]
 
-        # 特征过少的帧：无法可靠估计，沿用上一帧位姿。
-        # 本帧不会登记进 feat_map，共视率会偏低，可能额外触发关键帧——
-        # 这是可接受的权衡。
+        # 特征过少的帧：无法可靠估计，沿用上一帧位姿
         if len(kp_list[i]) < MIN_FEATURES // 2:
             logger.warning(f"帧 {i} 特征过少，沿用上一帧位姿")
             frame_poses[i] = prev_pose
@@ -273,16 +256,15 @@ def estimate_poses(
                     logger.info(f"初始化成功（帧 {i-1} + {i}）")
                     continue
 
-            # 纯旋转 / 平移不足：登记为候选，等后续出现足够基线的帧再配对。
-            # 队列长度有上限，否则长时间无法初始化会退化成 O(n²) 匹配。
+            # 纯旋转/平移不足：登记为候选，等后续出现足够基线的帧再配对。
+            # 队列有上限，否则长时间无法初始化会退化成 O(n²) 匹配
             init_candidates.append(i)
             if len(init_candidates) > MAX_INIT_CANDIDATES:
                 init_candidates.pop(0)
 
             if len(init_candidates) >= 2:
-                # 只尝试最新的 MAX_CANDIDATE_TRIES 个候选。全量尝试在
-                # ORB 12000 特征时每帧都要跑最多 30 次 _match_features。
-                # 旧候选基线更大但成功概率更低。
+                # 只尝试最新的 MAX_CANDIDATE_TRIES 个：旧候选基线虽大但成功
+                # 概率低，全量尝试在 ORB 12000 特征时开销过大
                 for idx_cand in reversed(init_candidates[-MAX_CANDIDATE_TRIES:]):
                     if idx_cand <= 0 or idx_cand >= i:
                         continue
@@ -324,8 +306,8 @@ def estimate_poses(
                     new_pose = CameraPose(R_curr2, t_curr2)
                     frame_poses[i] = new_pose
                     initialized = True
-                    # prev_idx 必须与三角化的参考帧一致：显式传 idx_cand，
-                    # 不用 i-1——否则观测错记帧、描述子取错、feat_map 错位。
+                    # prev_idx 必须与三角化参考帧一致：显式传 idx_cand，
+                    # 避免观测错记帧、描述子取错、feat_map 错位
                     _, new_pose = _triangulate_new_points(
                         i, idx_cand, matches_cand,
                         mask_pose2.ravel().astype(bool),
@@ -343,8 +325,7 @@ def estimate_poses(
             if initialized:
                 continue
 
-            # 候选帧保留 R（小基线时 R 准，t 不可靠）。若退化为 I，
-            # 后续配对三角化会用错位姿 → 明显误差。
+            # 候选帧保留 R（小基线时 R 准，t 不可靠）
             frame_poses[i] = CameraPose(R_curr, t_curr)
             continue
 
@@ -361,17 +342,27 @@ def estimate_poses(
             triang_thresh)
 
         # ----- 局部地图 PnP 重定位 -----
-        # PnP 用已知 3D 地图点恢复位姿，天然提供正确的场景尺度，抑制
-        # 纯 E 矩阵链式累积的尺度漂移。只用最近 PNP_WINDOW 个关键帧。
+        # PnP 用已知 3D 点恢复位姿，提供正确尺度，抑制纯 E 矩阵链式累积的
+        # 尺度漂移。只用最近 PNP_WINDOW 个关键帧；匹配只喂「已绑定到地图点」
+        # 的描述子，规模缩减一个量级
         if len(keyframes) > 1:
             pts3d_local, pts2d_local = [], []
             for kf in keyframes[-PNP_WINDOW:]:
+                kf_row = feat_map[kf]
+                if not kf_row:
+                    continue
+                kf_bound_kp = [k for k, p in enumerate(kf_row) if p >= 0]
+                if len(kf_bound_kp) < 4:
+                    continue
+                mapped_idx = np.array(kf_bound_kp, dtype=np.int64)
+                mapped_desc = desc_list[kf][mapped_idx]
                 matches_kf = _match_features(
-                    desc_list[kf], desc_list[i], bf,
+                    mapped_desc, desc_list[i], bf,
                     match_dist=match_dist, norm_type=norm_type,
                     bf_cross=bf_cross)
                 for m in matches_kf:
-                    pt_idx = feat_map[kf][m.queryIdx]
+                    orig_kf_feat = int(mapped_idx[m.queryIdx])
+                    pt_idx = kf_row[orig_kf_feat]
                     if pt_idx >= 0:
                         pts3d_local.append(map_points[pt_idx]['xyz'])
                         pts2d_local.append(kp_list[i][m.trainIdx].pt)
@@ -388,8 +379,8 @@ def estimate_poses(
                 if inliers_pnp is not None and len(inliers_pnp) >= 8:
                     R_pnp, _ = cv2.Rodrigues(rvec_pnp)
                     t_pnp = tvec_pnp.reshape(3, 1)
-                    # 用局部点云质心 + 中位半径刻画场景尺度。不用 ||t_pnp||
-                    # 与世界原点比较：相机远离原点后会失真。
+                    # 用局部点云质心 + 中位半径刻画场景尺度：不用 ||t_pnp||
+                    # 与世界原点比较，相机远离原点后会失真
                     centroid = pts3d_local.mean(axis=0)
                     scene_scale = float(np.median(np.linalg.norm(
                         pts3d_local - centroid, axis=1))) + 1e-6
@@ -398,14 +389,13 @@ def estimate_poses(
                     if cam_offset < 10.0 * scene_scale:
                         new_pose = CameraPose(R_pnp, t_pnp)
 
-        # 关键：BA 之前把位姿写回 frame_poses。否则本帧会被
-        # _bundle_adjustment 的 valid_kfs 过滤掉，其观测在 BA 中被丢弃，
-        # 位姿要等下一轮 BA 才第一次被修正。
+        # BA 之前必须写回 frame_poses：否则本帧会被 valid_kfs 过滤掉，
+        # 观测在 BA 中丢失，位姿要等下一轮才第一次被修正
         frame_poses[i] = new_pose
 
         # ----- 关键帧判定 -----
-        # 旋转阈值量「相对最后一个关键帧」的累积旋转，而非相邻帧。
-        # 用相邻帧会漏掉匀速旋转（每帧 <5° 但累积 >5°）并误判抖动帧。
+        # 旋转阈值量相对最后一个关键帧的累积旋转：用相邻帧会漏掉匀速旋转
+        # （每帧 <5° 但累积 >5°）并误判抖动帧
         if keyframes:
             R_delta = new_pose.R @ frame_poses[keyframes[-1]].R.T
             angle = _compute_rotation_angle(R_delta)
@@ -420,7 +410,7 @@ def estimate_poses(
                 recent_pts - c_recent, axis=1))) + 1e-6
         else:
             scene_ref = 1e-6
-        # 平移用相机光心之差：t 在旋转大时与实际位移偏离明显。
+        # 平移用相机光心之差：旋转大时 t 与实际位移偏离明显
         trans_world = (np.linalg.norm(new_pose.center - prev_pose.center)
                        / scene_ref)
         covis_ratio = _compute_covisibility_ratio(
@@ -431,7 +421,7 @@ def estimate_poses(
                        covis_ratio < COVIS_RATIO_THRESH)
 
         if is_keyframe and not is_pure_rotation and len(map_points) > 20:
-            # 冗余关键帧剔除：窗口内与当前帧共视过高则替换
+            # 冗余剔除：窗口内与当前帧共视过高则替换
             if len(keyframes) > KEYFRAME_CULLING_WINDOW:
                 recent = keyframes[-KEYFRAME_CULLING_WINDOW:-1]
                 for kf in recent:
@@ -456,7 +446,7 @@ def estimate_poses(
                     is_global=False,
                     focal_init=focal_init,
                 )
-                # BA 可能修正了本帧位姿，读回以保持与 frame_poses 一致
+                # BA 可能修正了本帧位姿，读回以保持一致
                 new_pose = frame_poses[i]
 
         frame_poses[i] = new_pose
@@ -486,7 +476,7 @@ def estimate_poses(
     all_xyz, mask = _filter_point_cloud(
         map_points, frame_poses, focal0, fy0, cx, cy, reproj_thresh)
 
-    # 过滤后若为空，直接返回空点云——不回退到未过滤点云（那是最差的一批）。
+    # 过滤后为空就直接返回空点云，不回退到未过滤点云（那是最差的一批）
     if all_xyz.size == 0:
         pass
     elif np.any(mask):
@@ -514,14 +504,9 @@ def estimate_poses(
 def _extract_features(paths: List[str], feature_type: str = "orb"):
     """逐帧提取特征。
 
-    不把整幅原图常驻内存（200 帧 1080p 约 1.2GB），每帧读完立即释放。
-    返回 (图像尺寸, 关键点列表, 描述子列表)。
-
-    无特征帧填「与该特征类型匹配的空描述子」：
-      - ORB  → (0, 32) uint8
-      - SIFT → (0, 128) float32
-    形状/类型一致让下游 _descriptor_metric 与 _match_features 的早退逻辑
-    不产生歧义。
+    不把原图常驻内存（200 帧 1080p 约 1.2GB），每帧读完立即释放。
+    无特征帧填与特征类型匹配的空描述子（ORB: (0,32) uint8，SIFT:
+    (0,128) float32），保证下游早退逻辑不产生歧义。
     """
     kps, descs = [], []
     if feature_type == "sift":
@@ -559,11 +544,10 @@ def _extract_features(paths: List[str], feature_type: str = "orb"):
 # 描述子度量
 # =========================================================================
 def _descriptor_metric(desc_list):
-    """按实际描述子 dtype 返回 (cv2 范数类型, 匹配距离上限, 描述子更新阈值)。
+    """按描述子 dtype 返回 (cv2 范数类型, 匹配距离上限, 描述子更新阈值)。
 
-    ORB 描述子为 uint8 二进制 → Hamming；
-    SIFT 描述子为 float32（OpenCV 归一化到约 512 范数）→ L2。
-    对 float 描述子用 Hamming 会得到随机匹配或直接断言崩溃。
+    ORB 为 uint8 二进制 → Hamming；SIFT 为 float32（OpenCV 归一化约 512
+    范数）→ L2。对 float 描述子用 Hamming 会得到随机匹配或崩溃。
     空描述子列表按 ORB/Hamming 处理。
     """
     for d in desc_list:
@@ -581,14 +565,7 @@ def _match_features(desc1, desc2, bf, ratio=0.75,
                     match_dist=None, norm_type=None, bf_cross=None):
     """Lowe 比值测试 + 距离上限过滤。
 
-    参数：
-        desc1, desc2: 两帧描述子
-        bf:          预建的 BFMatcher（crossCheck=False）
-        ratio:       Lowe 比值阈值
-        match_dist:  距离上限；None 时按 desc1 的 dtype 现算
-        norm_type:   范数类型；None 时按 desc1 的 dtype 现算
-        bf_cross:    预建的 BFMatcher（crossCheck=True），仅当 desc2 < 2
-                     时使用；None 时惰性创建
+    bf_cross 仅在 desc2 < 2 无法做 kNN 时使用。
     """
     if desc1 is None or desc2 is None or len(desc1) == 0 or len(desc2) == 0:
         return []
@@ -631,13 +608,9 @@ def _compute_covisibility_ratio(curr_idx, keyframes, matches,
                                 feat_map, frame_to_points):
     """当前帧匹配与最近关键帧地图点的共视比例。
 
-    对每条匹配，查当前帧特征已绑定的地图点是否被 last_kf 观测过。
-    应在 _triangulate_new_points 之后调用——那时 feat_map[curr_idx] 才
-    含有本帧三角化得到的绑定。
-
-    分母用「已绑定到某个地图点的当前帧匹配数」而非全部匹配数：三角化
-    失败率高时用全部匹配数会系统性低估共视率，导致关键帧膨胀。
-    绑定匹配过少（< MIN_COVIS_MATCHES）时返回 0，触发新关键帧。
+    分母用「已绑定到某地图点的当前帧匹配数」而非全部匹配数：三角化失败
+    率高时用全部匹配数会系统性低估共视率，导致关键帧膨胀。
+    绑定匹配过少时返回 0，触发新关键帧。需在三角化之后调用。
     """
     if not matches or len(keyframes) < 2:
         return 1.0
@@ -681,10 +654,7 @@ def _add_observation(pt_dict, frame_idx, kp_idx, uv, frame_to_points):
 
 
 def _update_map_point_descriptor(pt_dict, new_desc):
-    """按观测数和描述子年龄决定是否替换地图点描述子。
-
-    观测少 / 描述子过旧 / 差异过大 → 替换；否则累积年龄。
-    """
+    """观测少/描述子过旧/差异过大时替换描述子，否则累积年龄。"""
     old = pt_dict.get('desc')
     if old is None:
         pt_dict['desc'] = new_desc.copy()
@@ -709,18 +679,14 @@ def _triangulate_new_points(curr_idx, prev_idx, matches, inlier_mask,
                             focal, fy, cx, cy,
                             map_points, feat_map, desc_list, frame_to_points,
                             triang_thresh):
-    """对当前帧的内点做三角化，新增或复用地图点，并做尺度归一化。
+    """对当前帧内点做三角化，新增或复用地图点，并做尺度归一化。
 
-    参数：
-        prev_idx:  三角化参考帧索引（必须 < curr_idx）
-        pose_prev: prev_idx 的位姿
-        pose_curr: curr_idx 的位姿（可能在尺度归一化时被调整）
-
+    prev_idx 必须由调用方显式传入（正常增量路径为 i-1，候选配对路径为
+    idx_cand），硬编码 curr_idx-1 会让候选路径的观测错记帧、feat_map 错位。
     返回 (新增点索引列表, 可能被尺度归一化调整后的 pose_curr)。
 
-    prev_idx 必须由调用方显式传入：正常增量路径为 i-1，候选配对路径为
-    idx_cand。硬编码 curr_idx-1 会让候选路径的观测错记帧、描述子取错、
-    feat_map 索引错位。
+    批处理版本：cv2.triangulatePoints 与深度/视差/重投影合法性检查全部
+    向量化，避免逐点 Python 循环。
     """
     if prev_idx >= curr_idx:
         raise RuntimeError(
@@ -728,109 +694,170 @@ def _triangulate_new_points(curr_idx, prev_idx, matches, inlier_mask,
             f"curr_idx={curr_idx}"
         )
 
-    K = np.array([[focal, 0, cx], [0, fy, cy], [0, 0, 1]], dtype=np.float32)
-    P_prev = K @ pose_prev.RT[:3]
-    P_curr = K @ pose_curr.RT[:3]
+    K = np.array([[focal, 0, cx], [0, fy, cy], [0, 0, 1]], dtype=np.float64)
+    P_prev = K @ np.asarray(pose_prev.RT[:3], dtype=np.float64)
+    P_curr = K @ np.asarray(pose_curr.RT[:3], dtype=np.float64)
     new_indices = []
 
-    for idx in np.where(inlier_mask)[0]:
+    inlier_ids = np.where(inlier_mask)[0]
+    if len(inlier_ids) == 0:
+        return new_indices, pose_curr
+
+    feat_map_curr_row = feat_map[curr_idx]
+    feat_map_prev_row = feat_map[prev_idx]
+    R_curr = pose_curr.R
+    t_curr = pose_curr.t
+    err_thresh = MAX_REPROJ_ERROR * triang_thresh
+    err_thresh_sq = err_thresh * err_thresh
+
+    # ---- 分类：复用已有地图点 vs 新三角化 ----
+    reuse_items: List[Tuple[int, int]] = []
+    new_items: List[int] = []
+    for idx in inlier_ids:
         m = matches[idx]
-        pt_prev = pts_prev[idx].reshape(2, 1)
-        pt_curr = pts_curr[idx].reshape(2, 1)
-        prev_feat = m.queryIdx
         curr_feat = m.trainIdx
-
-        if feat_map[curr_idx][curr_feat] >= 0:
+        if feat_map_curr_row[curr_feat] >= 0:
             continue
-
-        # prev_idx 已有对应地图点 → 只添加观测，不重复三角化。
-        # 但先校验重投影误差：漂移点可能已偏离当前观测，加进去会污染 BA。
-        existing = feat_map[prev_idx][prev_feat]
+        prev_feat = m.queryIdx
+        existing = feat_map_prev_row[prev_feat]
         if existing >= 0:
             xyz_existing = map_points[existing]['xyz']
-            pt_cam = pose_curr.R @ xyz_existing.reshape(3, 1) + pose_curr.t
+            pt_cam = R_curr @ xyz_existing.reshape(3, 1) + t_curr
             depth_check = float(pt_cam[2, 0])
             if depth_check <= 1e-6:
                 continue
-            uv_proj = np.array([
-                focal * float(pt_cam[0, 0]) / depth_check + cx,
-                fy * float(pt_cam[1, 0]) / depth_check + cy,
-            ])
-            if (np.linalg.norm(uv_proj - pt_curr.flatten())
-                    > MAX_REPROJ_ERROR * triang_thresh):
+            du = (focal * float(pt_cam[0, 0]) / depth_check + cx
+                  - pts_curr[idx][0])
+            dv = (fy * float(pt_cam[1, 0]) / depth_check + cy
+                  - pts_curr[idx][1])
+            if du * du + dv * dv > err_thresh_sq:
                 continue
-            _add_observation(map_points[existing], curr_idx, curr_feat,
-                             pt_curr.flatten(), frame_to_points)
-            feat_map[curr_idx][curr_feat] = existing
-            _update_map_point_descriptor(
-                map_points[existing], desc_list[curr_idx][curr_feat])
-            continue
+            reuse_items.append((int(idx), int(existing)))
+        else:
+            new_items.append(int(idx))
 
-        pts4d = cv2.triangulatePoints(P_prev, P_curr, pt_prev, pt_curr)
-        pt3d = (pts4d[:3] / (float(pts4d[3][0]) + 1e-12)).flatten()
+    # ---- 复用已有地图点：仅追加观测 ----
+    for idx, existing in reuse_items:
+        m = matches[idx]
+        _add_observation(map_points[existing], curr_idx, m.trainIdx,
+                         pts_curr[idx], frame_to_points)
+        feat_map_curr_row[m.trainIdx] = existing
+        _update_map_point_descriptor(map_points[existing],
+                                     desc_list[curr_idx][m.trainIdx])
 
-        if not _is_valid_point(pt3d, pose_prev, pose_curr,
-                               triang_thresh, P_prev, P_curr, pt_prev, pt_curr):
-            continue
+    # ---- 批量三角化 + 批量合法性检查 ----
+    if new_items:
+        new_arr = np.asarray(new_items, dtype=np.int64)
+        pts_prev_b = pts_prev[new_arr].astype(np.float64)   # (N,2)
+        pts_curr_b = pts_curr[new_arr].astype(np.float64)   # (N,2)
 
-        pt_idx = len(map_points)
-        pt_dict = {
-            'idx': pt_idx,
-            'xyz': pt3d.astype(np.float32),
-            'desc': desc_list[prev_idx][prev_feat].copy(),
-            'obs': [],
-            'obs_set': set(),
-            'obs_count': 0,
-            'desc_age': 0,
-        }
-        _add_observation(pt_dict, prev_idx, prev_feat,
-                         pt_prev.flatten(), frame_to_points)
-        _add_observation(pt_dict, curr_idx, curr_feat,
-                         pt_curr.flatten(), frame_to_points)
-        map_points.append(pt_dict)
-        feat_map[prev_idx][prev_feat] = pt_idx
-        feat_map[curr_idx][curr_feat] = pt_idx
-        new_indices.append(pt_idx)
+        pts4d = cv2.triangulatePoints(
+            P_prev, P_curr,
+            pts_prev_b.T.reshape(2, -1).astype(np.float64),
+            pts_curr_b.T.reshape(2, -1).astype(np.float64),
+        )
+        w = pts4d[3].astype(np.float64)
+        pts3d = (pts4d[:3].astype(np.float64) / (w + 1e-12)).T   # (N,3)
 
-    # ----- 尺度归一化 -----
-    # 每次本质矩阵恢复的 t_rel 是单位范数（up-to-scale），链式叠加
-    #   t_curr = R_rel @ prev.t + t_rel
-    # 会导致尺度随帧数累积漂移。这里把「本次新增点的相机 z 向深度中位数」
-    # 对齐到「已有地图点的相机 z 向深度中位数」，并同步缩放当前相机位移。
-    #
-    # 两个关键点：
-    # 1) 缩放相对上一帧相机中心，不是世界原点；否则越到后段越离谱。
-    # 2) 「是否需要修正」必须在裁剪之前判断，否则 <0.5 的负向修正永远被
-    #    裁剪成 0.5，等于禁用负向修正。
+        finite = np.isfinite(pts3d).all(axis=1)
+
+        cam_prev_c = pose_prev.center.astype(np.float64)
+        cam_curr_c = pose_curr.center.astype(np.float64)
+        R_prev_2 = pose_prev.R[2].astype(np.float64)
+        R_curr_2 = pose_curr.R[2].astype(np.float64)
+        c_prev = float(R_prev_2 @ cam_prev_c)
+        c_curr = float(R_curr_2 @ cam_curr_c)
+
+        d_prev = pts3d @ R_prev_2 - c_prev
+        d_curr = pts3d @ R_curr_2 - c_curr
+        valid = finite & (d_prev > 0) & (d_curr > 0)
+
+        # 视差角
+        v1 = pts3d - cam_prev_c
+        v2 = pts3d - cam_curr_c
+        n1 = np.linalg.norm(v1, axis=1)
+        n2 = np.linalg.norm(v2, axis=1)
+        n1_safe = np.where(n1 > 1e-8, n1, 1.0)
+        n2_safe = np.where(n2 > 1e-8, n2, 1.0)
+        cos_a = np.sum(v1 * v2, axis=1) / (n1_safe * n2_safe)
+        cos_thresh = np.cos(np.radians(MIN_TRI_ANGLE_DEG))
+        valid &= (n1 > 1e-8) & (n2 > 1e-8) & (cos_a <= cos_thresh)
+
+        # 重投影误差
+        pts_h = np.hstack([pts3d, np.ones((len(pts3d), 1))])
+        proj_prev = pts_h @ P_prev.T
+        proj_curr = pts_h @ P_curr.T
+        proj_prev = proj_prev[:, :2] / (proj_prev[:, 2:3] + 1e-12)
+        proj_curr = proj_curr[:, :2] / (proj_curr[:, 2:3] + 1e-12)
+        err_prev = np.linalg.norm(proj_prev - pts_prev_b, axis=1)
+        err_curr = np.linalg.norm(proj_curr - pts_curr_b, axis=1)
+        valid &= (err_prev <= triang_thresh) & (err_curr <= triang_thresh)
+
+        # ---- 落库 ----
+        for k in np.where(valid)[0]:
+            idx = int(new_arr[k])
+            m = matches[idx]
+            prev_feat = m.queryIdx
+            curr_feat = m.trainIdx
+            pt_idx = len(map_points)
+            pt_dict = {
+                'idx': pt_idx,
+                'xyz': pts3d[k].astype(np.float32),
+                'desc': desc_list[prev_idx][prev_feat].copy(),
+                'obs': [],
+                'obs_set': set(),
+                'obs_count': 0,
+                'desc_age': 0,
+            }
+            _add_observation(pt_dict, prev_idx, prev_feat,
+                             pts_prev[idx], frame_to_points)
+            _add_observation(pt_dict, curr_idx, curr_feat,
+                             pts_curr[idx], frame_to_points)
+            map_points.append(pt_dict)
+            feat_map[prev_idx][prev_feat] = pt_idx
+            feat_map_curr_row[curr_feat] = pt_idx
+            new_indices.append(pt_idx)
+
+    # ----- 尺度归一化（向量化）-----
+    # E 矩阵恢复的 t_rel 是单位范数，链式叠加会导致尺度随帧累积漂移。
+    # 把本次新增点的相机 z 深度中位数对齐到已有地图点的中位数，并同步
+    # 缩放当前相机位移。
+    # 关键：缩放相对上一帧相机中心（不是世界原点）；且是否修正必须在
+    # 裁剪之前判断，否则 <0.5 的负向修正永远被裁成 0.5，等于禁用它。
     if new_indices and map_points:
         old_count = len(map_points) - len(new_indices)
         if old_count >= 10:
-            cam_curr_flat = pose_curr.center
-            old_depths = []
-            for p in map_points[:old_count]:
-                if p['xyz'].size == 3:
-                    d = float(pose_curr.R[2] @ (p['xyz'] - cam_curr_flat))
-                    if d > 0:
-                        old_depths.append(d)
+            cam_curr_flat = pose_curr.center.astype(np.float64)
+            R_curr_2 = pose_curr.R[2].astype(np.float64)
+            c_curr = float(R_curr_2 @ cam_curr_flat)
+
+            old_xyz_list = [p['xyz'] for p in map_points[:old_count]
+                            if p['xyz'].size == 3]
+            if len(old_xyz_list) >= 5:
+                old_xyz = np.asarray(old_xyz_list, dtype=np.float64)
+                old_depths = old_xyz @ R_curr_2 - c_curr
+                old_depths = old_depths[old_depths > 0]
+            else:
+                old_depths = np.empty(0, dtype=np.float64)
+
             if len(old_depths) >= 5:
                 ref_median = float(np.median(old_depths))
-                new_depths = []
-                for pi in new_indices:
-                    d = float(pose_curr.R[2] @ (map_points[pi]['xyz'] - cam_curr_flat))
-                    if d > 0:
-                        new_depths.append(d)
-                if new_depths:
+                new_xyz = np.asarray(
+                    [map_points[pi]['xyz'] for pi in new_indices],
+                    dtype=np.float64)
+                new_depths = new_xyz @ R_curr_2 - c_curr
+                new_depths = new_depths[new_depths > 0]
+
+                if len(new_depths) > 0:
                     new_median = float(np.median(new_depths))
                     if new_median > 1e-8 and ref_median > 1e-8:
                         raw_scale = ref_median / new_median
                         if abs(raw_scale - 1.0) > SCALE_DEADBAND:
                             scale = float(np.clip(raw_scale, *SCALE_CLAMP))
-                            origin = pose_prev.center
-                            for pi in new_indices:
-                                xyz = map_points[pi]['xyz']
-                                map_points[pi]['xyz'] = (
-                                    origin + scale * (xyz - origin)
-                                ).astype(np.float32)
+                            origin = pose_prev.center.astype(np.float64)
+                            scaled = origin + scale * (new_xyz - origin)
+                            for k, pi in enumerate(new_indices):
+                                map_points[pi]['xyz'] = scaled[k].astype(np.float32)
                             cam_curr_new = origin + scale * (cam_curr_flat - origin)
                             # 由相机中心反解 t：t = -R @ C
                             t_new = -pose_curr.R @ cam_curr_new.reshape(3, 1)
@@ -842,7 +869,10 @@ def _triangulate_new_points(curr_idx, prev_idx, matches, inlier_mask,
 
 def _is_valid_point(pt3d, pose_prev, pose_curr,
                     reproj_th, P_prev, P_curr, pt_prev, pt_curr):
-    """三角化点的合法性检查：有限性、正深度、视差角、重投影误差。"""
+    """三角化点的合法性检查：有限性、正深度、视差角、重投影误差。
+
+    保留标量版；_triangulate_new_points 内部已经改用批处理路径。
+    """
     if pt3d.shape != (3,):
         pt3d = pt3d.flatten()
     if not np.isfinite(pt3d).all():
@@ -881,39 +911,26 @@ def _is_valid_point(pt3d, pose_prev, pose_curr,
 def _em_e_step(res, obs_depths, sigma, pi_in, sigma_out, eps):
     """EM 的 E 步：计算每个观测属于内点的后验概率 γ。
 
-    模型：每个观测的 2 维残差 r 来自混合高斯
-        p(r) = π_in · N(0, σ²I) + (1 - π_in) · N(0, σ_out²I)
-    γ = p(z_in | r)，用 log-odds 经 sigmoid 得到：
-        log p(r|in) - log p(r|out)
-          = log(π_in / (1-π_in)) + 2·log(σ_out/σ)
-            + r² · (1/(2σ_out²) - 1/(2σ²))
-
-    r² 项系数为负——残差越大越倾向外点。符号写反会让 γ 随残差升高而
-    升高，最终塌缩到 1。
-
-    深度不足（depth ≤ eps）的观测强制 γ=1：其残差是深度障碍项，不是
-    真实重投影误差，不参与外点判定。
-
+    模型：r ~ π_in·N(0,σ²I) + (1-π_in)·N(0,σ_out²I)。
+    γ 由 log-odds 经 sigmoid 得到，r² 项系数为负（残差越大越倾向外点）。
+    深度不足的观测强制 γ=1：其残差是深度障碍项，不参与外点判定。
     返回 (gamma, r2)；r2 中深度不足的观测置 0。
     """
     n_obs = len(obs_depths)
-    # res 由 _compute_residuals 产出，每个观测固定 2 个残差。
-    # 用 raise 而非 assert：-O 下 assert 被剥离，而这个不变量一旦破坏
-    # 会静默错位残差对（不报错但结果全错）。
+    # res 由 _compute_residuals 产出，每个观测固定 2 个残差；用 raise 而非
+    # assert，避免 -O 下不变量检查被剥离后静默错位残差对
     if len(res) != 2 * n_obs:
         raise RuntimeError(
             f"_em_e_step: res 长度 {len(res)} 与观测数 {n_obs} 不匹配（应为 2×）"
         )
 
-    r2 = np.empty(n_obs, dtype=np.float64)
-    for i in range(n_obs):
-        r2[i] = res[2 * i] ** 2 + res[2 * i + 1] ** 2
+    r2 = (res.reshape(n_obs, 2) ** 2).sum(axis=1)
 
     log_ratio = (np.log(pi_in / max(1.0 - pi_in, 1e-12))
                  + 2.0 * np.log(sigma_out / sigma)
                  + r2 * (1.0 / (2.0 * sigma_out ** 2)
                          - 1.0 / (2.0 * sigma ** 2)))
-    # expit 按符号分段计算，log_ratio 很负时也不会溢出
+    # expit 按符号分段，log_ratio 很负时也不会溢出
     gamma = expit(log_ratio)
 
     invalid = obs_depths <= eps
@@ -926,12 +943,9 @@ def _em_e_step(res, obs_depths, sigma, pi_in, sigma_out, eps):
 def _em_m_step(r2, gamma, sigma_cap):
     """EM 的 M 步：加权重估 σ 和 π_in。
 
-    σ 只从高置信内点（γ > 0.9）估计。若用全部 γ 加权，大残差观测即使
-    γ 只有 0.5 也会贡献一半权重，把 σ 拉大；σ 变大后 γ 又降不下来，
-    形成「塌缩」正反馈。用高置信子集可打破该循环。
-
-    π_in 上限根据当前 γ 分布动态调整：高置信内点占比高说明匹配质量好，
-    允许 π_in 更接近 1。r² 是 2 维残差平方和，E[r²] = 2σ²。
+    σ 只从高置信内点（γ>0.9）估计：用全部 γ 加权时大残差观测也会贡献权重
+    把 σ 拉大，σ 变大又让 γ 降不下来，形成塌缩正反馈。
+    π_in 上限按当前 γ 分布动态调整。r² 是 2 维残差平方和，E[r²]=2σ²。
     """
     high_conf_ratio = float((gamma > 0.9).mean())
     if high_conf_ratio > 0.8:
@@ -946,7 +960,7 @@ def _em_m_step(r2, gamma, sigma_cap):
     if high_conf.sum() >= 5:
         sigma2 = float(np.sum(r2[high_conf]) / (2.0 * high_conf.sum()))
     else:
-        # 高置信样本太少，退回到 γ 加权
+        # 高置信样本太少，退回 γ 加权
         denom = 2.0 * (np.sum(gamma) + 1e-12)
         sigma2 = float(np.sum(gamma * r2) / denom)
 
@@ -955,9 +969,9 @@ def _em_m_step(r2, gamma, sigma_cap):
 
 
 def _compute_adaptive_eps(map_points, ref_pose, default_eps=0.01):
-    """按参考相机下的 z 向深度中位数确定深度障碍阈值。
+    """按参考相机下 z 向深度中位数确定深度障碍阈值。
 
-    用 ||p||（到世界原点的距离）近似会在相机远离原点后失真。
+    用 ||p||（到世界原点距离）近似会在相机远离原点后失真。
     """
     if ref_pose is None:
         return default_eps
@@ -989,29 +1003,24 @@ def _bundle_adjustment(
     is_global=False,
     focal_init=None,
 ):
-    """局部 / 全局 BA，外层套 GMM-EM 软内点加权。
+    """局部/全局 BA，外层套 GMM-EM 软内点加权。
 
-    参数化：[focal, (rv_kf, t_kf) * N_other_kf, (xyz_pt) * N_pts]
-    焦距 fy 锁定为 focal * fy_ratio，避免与场景尺度耦合导致病态。
+    参数化：[focal, (rv_kf, t_kf) * N_other_kf, (xyz_pt) * N_pts]。
+    fy 锁定为 focal * fy_ratio，避免与场景尺度耦合导致病态。
+    每个观测先估计内点后验概率 γ，再用 sqrt(γ) 加权跑最小二乘。
+    深度不足的观测强制 γ=1，残差（深度障碍项）保持完整权重。
 
-    每个观测先按混合高斯模型估计内点后验概率 γ，再用 sqrt(γ) 加权跑
-    最小二乘（loss='linear'，鲁棒性完全由 γ 提供）。深度不足的观测强制
-    γ=1，其残差（深度障碍项）保留完整权重。
+    防护：最小观测门槛、全深度不足跳过、初值过差跳过、焦距边界交叉跳过、
+    焦距全局漂移保护、BA 后过拟合/变差检测回滚。
 
-    防护机制：
-      - BA 最小观测门槛：观测数 < BA_MIN_OBS 时跳过
-      - 全深度不足：直接跳过
-      - BA 初值门槛：中位 RMS > reproj_thresh × BA_MAX_INIT_RMS_RATIO 时跳过
-      - 焦距边界交叉：lo ≥ hi 时跳过
-      - 焦距全局漂移保护：相对 focal_init 最多 ±FOCAL_GLOBAL_DRIFT_MAX
-      - BA 后过拟合 / 变差检测：中位 RMS 异常低或异常升高时回滚
+    残差函数已完全向量化：所有观测的投影、深度障碍、加权一次算完。
     """
     if focal_init is None:
         focal_init = focal
 
     sigma_cap = reproj_thresh * EM_SIGMA_CAP_RATIO
     sigma_out = reproj_thresh * EM_SIGMA_OUT_RATIO
-    # 全局 BA 是最终精修，允许 RMS 降到更低；局部 BA 用较严阈值避免误判
+    # 全局 BA 是最终精修，允许 RMS 更低；局部 BA 用较严阈值避免误判
     overfit_rms_thresh = (BA_OVERFIT_MIN_RMS_GLOBAL if is_global
                           else BA_OVERFIT_MIN_RMS)
 
@@ -1072,14 +1081,12 @@ def _bundle_adjustment(
         for pid in point_ids:
             param.extend(map_points[pid]['xyz'])
     else:
-        # 点参数冻结：只把观测限制在 map_points 已有点上（残差计算时
-        # 从 map_points 取静态坐标），未知点的观测直接丢弃。
-        # 注意 map_points 是 List[Dict]（索引 = 点 id），不能用 set()
+        # 点参数冻结：观测限制在已有点上，未知点的观测丢弃
         known_point_ids = set(range(len(map_points)))
         obs = [o for o in obs if o[1] in known_point_ids]
 
-    # 只保留可优化点的观测。参与残差的点必须可优化，否则带误差的静态
-    # 点会持续贡献正 cost，优化器只能移动位姿和点「绕着」误差走。
+    # 只保留可优化点的观测：否则静态点带误差会持续贡献正 cost，优化器只能
+    # 移动位姿和点「绕着」误差走
     if optimize_points:
         point_id_set = set(point_ids)
         obs = [o for o in obs if o[1] in point_id_set]
@@ -1098,11 +1105,11 @@ def _bundle_adjustment(
               if frame_poses[k] is not None]
     cam_t_max = max(cam_ts) if cam_ts else 1.0
     t_bound = max(scene_scale * 5.0, cam_t_max * 2.0, 10.0)
-    r_bound = np.inf   # 旋转向量范数可近 4π，任何有限边界都可能触发初值越界
+    # 旋转向量范数可近 4π，任何有限边界都可能触发初值越界
+    r_bound = np.inf
 
-    # 焦距边界：单步 ±FOCAL_MAX_STEP_RATIO 与相对初值 ±FOCAL_GLOBAL_DRIFT_MAX
-    # 取交集。两者理论上可能交叉（例如 focal 已接近漂移上限时），
-    # 交叉会导致 least_squares 因 lower > upper 抛异常，必须提前拦截。
+    # 焦距边界取「单步 ±ratio」与「相对初值 ±drift」的交集；两者理论上可能
+    # 交叉，导致 least_squares 因 lower > upper 抛异常，必须提前拦截
     focal_lo = max(focal * (1.0 - FOCAL_MAX_STEP_RATIO),
                    focal_init * (1.0 - FOCAL_GLOBAL_DRIFT_MAX))
     focal_hi = min(focal * (1.0 + FOCAL_MAX_STEP_RATIO),
@@ -1124,75 +1131,97 @@ def _bundle_adjustment(
         bounds_lower += [-np.inf] * len(point_ids) * 3
         bounds_upper += [np.inf] * len(point_ids) * 3
 
-    # ---------- 3. 残差闭包 ----------
+    # ---------- 3. 残差闭包（向量化） ----------
     point_ids_local = list(point_ids)
     n_poses = len(other_kfs)
 
-    def _compute_residuals(params):
-        """返回 (res, obs_depths)。
+    kf_to_pos = {kf: k for k, kf in enumerate(keyframe_ids)}
+    n_kfs = len(keyframe_ids)
+    fixed_kf_pos = kf_to_pos[fixed_kf]
 
-        res 长度恒为 2 * n_obs；obs_depths 长度 n_obs，供 E 步判断深度。
-        """
+    # 点参数位置索引：optimize_points 时用 point_ids 的顺序（与 param 追加
+    # 顺序一致）；否则用 obs 中出现过的点集
+    if optimize_points and point_ids_local:
+        all_pt_ids = list(point_ids_local)
+    else:
+        all_pt_ids = sorted({o[1] for o in obs})
+    ptid_to_pos = {pid: j for j, pid in enumerate(all_pt_ids)}
+
+    obs_fpos = np.fromiter((kf_to_pos[f] for f, _, _, _ in obs),
+                           dtype=np.int64, count=n_obs)
+    obs_ppos = np.fromiter((ptid_to_pos[pid] for _, pid, _, _ in obs),
+                           dtype=np.int64, count=n_obs)
+    obs_u = np.fromiter((u for _, _, u, _ in obs),
+                        dtype=np.float64, count=n_obs)
+    obs_v = np.fromiter((v for _, _, _, v in obs),
+                        dtype=np.float64, count=n_obs)
+
+    # 点参数冻结时预先构造静态坐标数组
+    static_pts_arr = None
+    if not (optimize_points and point_ids_local):
+        static_pts_arr = np.zeros((len(all_pt_ids), 3), dtype=np.float64)
+        for pid, j in ptid_to_pos.items():
+            static_pts_arr[j] = map_points[pid]['xyz']
+
+    def _compute_residuals(params):
+        """返回 (res_flat, obs_depths)，res_flat 长度恒为 2*n_obs。"""
         f = params[0]
         fy_local = f * fy_ratio
 
-        poses = {fixed_kf: frame_poses[fixed_kf]}
+        # ---- 位姿 ----
+        R_arr = np.empty((n_kfs, 3, 3), dtype=np.float64)
+        t_arr = np.empty((n_kfs, 3), dtype=np.float64)
+        R_arr[fixed_kf_pos] = frame_poses[fixed_kf].R
+        t_arr[fixed_kf_pos] = frame_poses[fixed_kf].t.flatten()
         for i_kf, idx in enumerate(other_kfs):
             start = 1 + i_kf * 6
-            rv = params[start:start + 3]
-            t = params[start + 3:start + 6]
-            R, _ = cv2.Rodrigues(rv)
-            poses[idx] = CameraPose(R, t.reshape(3, 1))
+            R, _ = cv2.Rodrigues(params[start:start + 3])
+            R_arr[kf_to_pos[idx]] = R
+            t_arr[kf_to_pos[idx]] = params[start + 3:start + 6]
 
-        pts = {}
-        if point_ids_local:
+        # ---- 点 ----
+        if optimize_points and point_ids_local:
             pts_start = 1 + n_poses * 6
-            for j, pid in enumerate(point_ids_local):
-                pts[pid] = params[pts_start + j * 3: pts_start + j * 3 + 3]
+            n_pts = len(point_ids_local)
+            pts_arr = params[pts_start:pts_start + n_pts * 3].reshape(-1, 3)
         else:
-            # 点参数冻结：残差用 map_points 的静态坐标
-            for obs_item in obs:
-                pid = obs_item[1]
-                if pid not in pts:
-                    pts[pid] = np.asarray(map_points[pid]['xyz'], dtype=np.float64)
+            pts_arr = static_pts_arr
 
-        res = []
-        obs_depths = np.zeros(n_obs, dtype=np.float64)
-        for obs_i, (f_idx, pt_idx, u_obs, v_obs) in enumerate(obs):
-            pt3d = pts[pt_idx]
-            pose = poses[f_idx]
-            pt_cam = pose.R @ pt3d.reshape(3, 1) + pose.t
-            depth = float(pt_cam[2, 0])
-            obs_depths[obs_i] = depth
+        # ---- 批量投影 ----
+        xyz_o = pts_arr[obs_ppos]                       # (M,3)
+        R_o = R_arr[obs_fpos]                           # (M,3,3)
+        t_o = t_arr[obs_fpos]                           # (M,3)
+        pt_cam = np.einsum('nij,nj->ni', R_o, xyz_o) + t_o
+        depth = pt_cam[:, 2]
 
-            if depth <= eps:
-                # 深度障碍：对深度过浅或为负的观测施加对数惩罚。这些观测
-                # 在 E 步会被强制 γ=1，不参与外点判定。
-                if depth <= 1e-6:
-                    barrier = -np.log(max(depth / 1e-6, 1e-10))
-                else:
-                    barrier = -np.log(max(depth / eps, 1e-10))
-                res.append(barrier)
-                res.append(barrier)
-                continue
+        # ---- 残差 ----
+        res = np.empty((n_obs, 2), dtype=np.float64)
+        depth_safe = np.where(depth > eps, depth, 1.0)
+        res[:, 0] = f * (pt_cam[:, 0] / depth_safe) + cx - obs_u
+        res[:, 1] = fy_local * (pt_cam[:, 1] / depth_safe) + cy - obs_v
 
-            x = float(pt_cam[0, 0]) / depth
-            y = float(pt_cam[1, 0]) / depth
-            res.append(f * x + cx - u_obs)
-            res.append(fy_local * y + cy - v_obs)
+        # ---- 深度障碍 ----
+        shallow = depth <= eps
+        if np.any(shallow):
+            d_sh = depth[shallow]
+            very_sh = d_sh <= 1e-6
+            denom = np.where(very_sh, 1e-6, eps)
+            barrier = -np.log(np.maximum(d_sh / denom, 1e-10))
+            res[shallow, 0] = barrier
+            res[shallow, 1] = barrier
 
-        return np.array(res, dtype=np.float64), obs_depths
+        return res.flatten(), depth
 
     # ---------- 4. 初值检查 ----------
     param_np = np.array(param, dtype=np.float64)
     res0, depths0 = _compute_residuals(param_np)
-    r2_0 = np.sum(res0.reshape(n_obs, 2) ** 2, axis=1)
+    r2_0 = (res0.reshape(n_obs, 2) ** 2).sum(axis=1)
     valid_mask = depths0 > eps
     if valid_mask.sum() == 0:
         logger.warning("[BA] 所有观测深度不足，跳过本次 BA")
         return focal, fy
 
-    # 中位 RMS：残差重尾，中位数比平均值更能反映「典型观测」的拟合质量
+    # 中位 RMS：残差重尾，中位数比均值更能反映典型拟合质量
     rms_before = float(np.sqrt(np.median(r2_0[valid_mask]) / 2))
 
     init_rms_limit = reproj_thresh * BA_MAX_INIT_RMS_RATIO
@@ -1203,7 +1232,7 @@ def _bundle_adjustment(
         )
         return focal, fy
 
-    # 保存 BA 前状态，用于过拟合 / 变差检测的回滚
+    # 保存 BA 前状态，供过拟合/变差检测回滚
     pre_ba_poses = {idx: frame_poses[idx] for idx in other_kfs}
     pre_ba_points_xyz = {pid: map_points[pid]['xyz'].copy()
                          for pid in point_ids_local}
@@ -1226,7 +1255,7 @@ def _bundle_adjustment(
     gamma = np.ones(n_obs, dtype=np.float64)
 
     for em_iter in range(EM_ITERS):
-        # ----- E 步：用当前 σ/π_in 算每个观测的内点后验概率 -----
+        # ----- E 步 -----
         gamma, r2 = _em_e_step(res0, depths0, sigma, pi_in, sigma_out, eps)
         gamma = np.maximum(gamma, EM_GAMMA_FLOOR)
 
@@ -1249,10 +1278,11 @@ def _bundle_adjustment(
 
         # ----- M 步：加权最小二乘 -----
         sqrt_gamma = np.sqrt(gamma)
+        sqrt_gamma_rep = np.repeat(sqrt_gamma, 2)
 
-        def _weighted_residuals(params, _sg=sqrt_gamma):
+        def _weighted_residuals(params, _sg_rep=sqrt_gamma_rep):
             res_plain, _ = _compute_residuals(params)
-            return res_plain * np.repeat(_sg, 2)
+            return res_plain * _sg_rep
 
         # 第一轮给完整预算，后续轮起点已接近最优，减半
         iters_this = max_iter if em_iter == 0 else max(3, max_iter // 2)
@@ -1270,15 +1300,15 @@ def _bundle_adjustment(
             logger.warning(f"[BA] M 步异常：{e}")
             break
 
-        # ----- 更新 σ 和 π_in（用新残差 + 当前 γ） -----
+        # ----- 更新 σ 和 π_in -----
         res0, depths0 = _compute_residuals(param_np)
-        r2 = np.sum(res0.reshape(n_obs, 2) ** 2, axis=1)
+        r2 = (res0.reshape(n_obs, 2) ** 2).sum(axis=1)
         valid_now = depths0 > eps
         if valid_now.sum() > 0:
             sigma, pi_in = _em_m_step(r2[valid_now], gamma[valid_now],
                                       sigma_cap)
-            # inlier_rms：只统计 γ>0.5 的观测，反映内点拟合质量
-            # weighted_rms：所有观测按 γ 加权，反映整体优化目标
+            # inlier_rms 只统计 γ>0.5 的观测，反映内点拟合质量；
+            # weighted_rms 按 γ 加权，反映整体优化目标
             in_mask = gamma[valid_now] > 0.5
             if in_mask.sum() > 0:
                 inlier_rms = float(np.sqrt(
@@ -1305,17 +1335,16 @@ def _bundle_adjustment(
     focal_new = max(float(param_np[0]), 1.0)
     fy_new = focal_new * fy_ratio
 
-    # BA 后统计（用于过拟合 / 变差检测）
     res_final, depths_final = _compute_residuals(param_np)
-    r2_final = np.sum(res_final.reshape(n_obs, 2) ** 2, axis=1)
+    r2_final = (res_final.reshape(n_obs, 2) ** 2).sum(axis=1)
     valid_final = depths_final > eps
     if valid_final.sum() > 0:
         rms_after = float(np.sqrt(np.median(r2_final[valid_final]) / 2.0))
     else:
         rms_after = 0.0
 
-    # 过拟合检测：BA 后中位 RMS 异常低（真实匹配噪声不可能低于阈值下限），
-    # 或 BA 后 RMS 反而升高（BA 破坏了结果），都回滚。
+    # 过拟合：RMS 异常低（真实噪声不会低于阈值下限）；变差：RMS 反升。
+    # 两者都回滚
     overfit = (rms_after < overfit_rms_thresh
                and rms_before > BA_OVERFIT_MIN_BEFORE)
     worse = (rms_after > rms_before * BA_MAX_RMS_INCREASE)
@@ -1345,8 +1374,7 @@ def _bundle_adjustment(
             map_points[pid]['xyz'] = param_np[pts_start + j * 3:
                                               pts_start + j * 3 + 3]
 
-    # 重算 γ 以匹配最终的 σ/π_in，让 inlier_ratio 反映最终参数。
-    # 循环内的 γ 来自上一轮 E 步，与最终残差不同步。
+    # 重算 γ 匹配最终 σ/π_in：循环内的 γ 来自上一轮 E 步，与最终残差不同步
     if valid_final.sum() > 0:
         gamma, _ = _em_e_step(res_final, depths_final, sigma, pi_in,
                               sigma_out, eps)
@@ -1369,10 +1397,12 @@ def _bundle_adjustment(
 def _compute_point_errors(map_points, frame_poses, focal, fy, cx, cy):
     """遍历所有地图点的观测，统计重投影误差。
 
-    返回三个与 map_points 等长的数组：
+    返回三个与 map_points 等长数组：
         mean_err:    有效观测的平均重投影误差；xyz 非法或无有效观测时为 inf
         valid_count: 有效观测数（位姿存在且 depth > 0）
-        neg_ratio:   负深度观测占已评估观测的比例；xyz 非法时记 1.0
+        neg_ratio:   负深度观测占比；xyz 非法时记 1.0
+
+    向量化版本：先收集所有观测，批量投影，再用 bincount 聚合到每个点上。
     """
     N = len(map_points)
     mean_err = np.full(N, np.inf, dtype=np.float64)
@@ -1381,42 +1411,73 @@ def _compute_point_errors(map_points, frame_poses, focal, fy, cx, cy):
     if N == 0:
         return mean_err, valid_count, neg_ratio
 
+    xyz_all = np.full((N, 3), np.nan, dtype=np.float64)
+    pt_ids_l, f_ids_l, us_l, vs_l = [], [], [], []
     for i, pt in enumerate(map_points):
         xyz = pt['xyz']
-        if xyz.size != 3 or not np.isfinite(xyz).all():
-            neg_ratio[i] = 1.0
+        if xyz.size != 3:
             continue
+        xyz_all[i] = xyz
+        for f_idx, _, u_obs, v_obs in pt.get('obs', []):
+            pt_ids_l.append(i)
+            f_ids_l.append(f_idx)
+            us_l.append(u_obs)
+            vs_l.append(v_obs)
 
-        obs = pt.get('obs', [])
-        if not obs:
-            continue
+    invalid_pts = ~np.isfinite(xyz_all).all(axis=1)
+    neg_ratio[invalid_pts] = 1.0
 
-        xyz_col = xyz.reshape(3, 1)
-        total_err = 0.0
-        count = 0
-        neg_depth = 0
-        total_obs = 0
-        for f_idx, _, u_obs, v_obs in obs:
-            pose = frame_poses[f_idx]
-            if pose is None:
-                continue
-            total_obs += 1
-            pt_cam = pose.R @ xyz_col + pose.t
-            depth = float(pt_cam[2, 0])
-            if depth <= 0:
-                neg_depth += 1
-                continue
-            x = float(pt_cam[0, 0]) / depth
-            y = float(pt_cam[1, 0]) / depth
-            total_err += np.sqrt((focal * x + cx - u_obs) ** 2 +
-                                 (fy * y + cy - v_obs) ** 2)
-            count += 1
+    if not pt_ids_l:
+        return mean_err, valid_count, neg_ratio
 
-        valid_count[i] = count
-        if total_obs > 0:
-            neg_ratio[i] = neg_depth / total_obs
-        if count > 0:
-            mean_err[i] = total_err / count
+    pt_ids = np.asarray(pt_ids_l, dtype=np.int64)
+    f_ids = np.asarray(f_ids_l, dtype=np.int64)
+    us = np.asarray(us_l, dtype=np.float64)
+    vs = np.asarray(vs_l, dtype=np.float64)
+
+    n_frames = len(frame_poses)
+    R_all = np.zeros((n_frames, 3, 3), dtype=np.float64)
+    t_all = np.zeros((n_frames, 3), dtype=np.float64)
+    pose_valid = np.zeros(n_frames, dtype=bool)
+    for f_idx, pose in enumerate(frame_poses):
+        if pose is not None:
+            R_all[f_idx] = pose.R
+            t_all[f_idx] = pose.t.flatten()
+            pose_valid[f_idx] = True
+
+    keep = (~invalid_pts[pt_ids]) & pose_valid[f_ids]
+    if not np.any(keep):
+        return mean_err, valid_count, neg_ratio
+    pt_ids = pt_ids[keep]
+    f_ids = f_ids[keep]
+    us = us[keep]
+    vs = vs[keep]
+
+    xyz_o = xyz_all[pt_ids]                 # (M,3)
+    R_o = R_all[f_ids]                      # (M,3,3)
+    t_o = t_all[f_ids]                      # (M,3)
+    pt_cam = np.einsum('nij,nj->ni', R_o, xyz_o) + t_o
+
+    depth = pt_cam[:, 2]
+    valid_depth = depth > 0
+    depth_safe = np.where(valid_depth, depth, 1.0)
+    proj_u = focal * (pt_cam[:, 0] / depth_safe) + cx
+    proj_v = fy    * (pt_cam[:, 1] / depth_safe) + cy
+    err = np.sqrt((proj_u - us) ** 2 + (proj_v - vs) ** 2)
+    err[~valid_depth] = 0.0
+
+    total_obs_per_pt = np.bincount(pt_ids, minlength=N)
+    vd_ids = pt_ids[valid_depth]
+    neg_ids = pt_ids[~valid_depth]
+    valid_count[:] = np.bincount(vd_ids, minlength=N)
+    err_sum = np.bincount(vd_ids, weights=err[valid_depth], minlength=N)
+    neg_depth_count = np.bincount(neg_ids, minlength=N)
+
+    has_valid = valid_count > 0
+    mean_err[has_valid] = err_sum[has_valid] / valid_count[has_valid]
+    has_obs = total_obs_per_pt > 0
+    neg_ratio[has_obs] = neg_depth_count[has_obs] / total_obs_per_pt[has_obs]
+    neg_ratio[invalid_pts] = 1.0
 
     return mean_err, valid_count, neg_ratio
 
@@ -1452,34 +1513,35 @@ def _prune_map_points(map_points, feat_map, frame_to_points, reproj_thresh,
     if not to_remove:
         return
 
-    remove_set = set(to_remove)
-    idx_map = {}
-    new_idx = 0
-    for old_idx in range(n_old):
-        if old_idx in remove_set:
-            idx_map[old_idx] = -1
-        else:
-            idx_map[old_idx] = new_idx
-            new_idx += 1
+    # 用向量化的索引映射替换逐点字典重建
+    keep_mask = np.ones(n_old, dtype=bool)
+    keep_mask[np.asarray(to_remove, dtype=np.int64)] = False
+    idx_map_arr = np.full(n_old, -1, dtype=np.int64)
+    idx_map_arr[keep_mask] = np.arange(int(keep_mask.sum()), dtype=np.int64)
 
-    # feat_map 重映射：显式处理越界索引，避免静默错位掩盖同步问题。
-    # 用 warning 而非 debug——feat_map 与 map_points 不同步是需要立刻
-    # 发现的 bug。
+    # feat_map 重映射（向量化）：越界索引显式告警，避免静默错位掩盖
+    # feat_map 与 map_points 不同步的 bug
     for f_idx in range(len(feat_map)):
         row = feat_map[f_idx]
-        for kp_idx in range(len(row)):
-            old = row[kp_idx]
-            if old < 0:
-                continue
-            if old >= n_old:
+        if not row:
+            continue
+        arr = np.asarray(row, dtype=np.int64)
+        if arr.size == 0:
+            continue
+        oob = arr >= n_old
+        if np.any(oob):
+            for kp_idx in np.where(oob)[0]:
                 logger.warning(
-                    f"[prune] feat_map[{f_idx}][{kp_idx}]={old} 越界"
-                    f"（n_old={n_old}），重置为 -1；"
+                    f"[prune] feat_map[{f_idx}][{int(kp_idx)}]={int(arr[kp_idx])} "
+                    f"越界（n_old={n_old}），重置为 -1；"
                     f"这通常意味着 feat_map 与 map_points 不同步"
                 )
-                row[kp_idx] = -1
-                continue
-            row[kp_idx] = idx_map.get(old, -1)
+            arr = np.where(oob, -1, arr)
+        valid = arr >= 0
+        arr_new = np.full(arr.shape, -1, dtype=np.int64)
+        if np.any(valid):
+            arr_new[valid] = idx_map_arr[arr[valid]]
+        feat_map[f_idx] = arr_new.tolist()
 
     # frame_to_points 重建
     for f in list(frame_to_points.keys()):
@@ -1496,11 +1558,10 @@ def _prune_map_points(map_points, feat_map, frame_to_points, reproj_thresh,
 
 def _filter_point_cloud(map_points, frame_poses, focal, fy, cx, cy,
                         reproj_thresh):
-    """输出点云：剔除观测不足 / 负深度为主 / 误差过大的点。
+    """输出点云：剔除观测不足/负深度为主/误差过大的点。
 
-    阈值 = max(中位误差 × 2.5, reproj_thresh × 1.5)。
-    经验上 >2.5× 中位的点大概率是外点；同时给一个绝对下限，防止在极低
-    噪声场景（中位误差极小时）把所有点都判为外点。
+    阈值 = max(中位误差 × 2.5, reproj_thresh × 1.5)。2.5× 中位是经验值；
+    绝对下限防止低噪声场景把所有点都判为外点。
     """
     if not map_points:
         return np.empty((0, 3), dtype=np.float32), np.empty(0, dtype=bool)
