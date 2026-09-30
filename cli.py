@@ -33,7 +33,6 @@ def setup_logging() -> None:
 
 
 def set_affinity_to_all_cores() -> None:
-    """将当前进程绑定到所有逻辑核心。"""
     try:
         p = psutil.Process(os.getpid())
         all_cpus = list(range(psutil.cpu_count()))
@@ -55,28 +54,50 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--workdir", type=str, default="./workdir", help="中间文件工作目录")
 
     # 帧提取
+    parser.add_argument(
+        "--sampling-mode", type=str,
+        choices=["uniform", "smart", "two-stage"], default="uniform",
+        help="帧采样策略：uniform / smart（光流）/ two-stage（视差+光流+纹理）",
+    )
     parser.add_argument("--fps", type=float, default=15.0, help="目标帧率（均匀采样模式）")
     parser.add_argument("--scale", type=float, default=0.5, help="缩放系数 (0<scale<=1)")
     parser.add_argument("--min-frames", type=int, default=30, help="最少提取帧数")
     parser.add_argument("--max-frames", type=int, default=200, help="最多提取帧数")
+
+    # 位姿估计
     parser.add_argument(
-        "--sampling-mode",
-        type=str,
-        choices=["uniform", "smart", "two-stage"],
-        default="uniform",
-        help="帧采样策略：uniform / smart（光流）/ two-stage（视差+光流+纹理）",
+        "--pose-estimator", type=str,
+        choices=["opencv", "colmap"], default="opencv",
+        help="相机位姿估计后端（opencv=ORB+EM，colmap=外部 COLMAP）",
+    )
+    parser.add_argument(
+        "--feature-type", type=str,
+        choices=["orb", "sift"], default="orb",
+        help="OpenCV 位姿估计的特征描述子（orb=快速二进制，sift=鲁棒浮点，较慢）",
+    )
+    parser.add_argument(
+        "--use-focal-guess", action="store_true",
+        help="以 1.0×图像长边作为初始像素焦距（约 53° 长边方向 FOV）传给位姿估计器；"
+            "仅在 --pose-estimator opencv 时生效",
     )
 
     # 训练
     parser.add_argument("--num-epochs", type=int, default=3000, help="训练轮数")
-    parser.add_argument("--device", type=str, default="auto", choices=["auto", "cpu", "cuda"], help="运行设备")
+    parser.add_argument(
+        "--device", type=str, default="auto", choices=["auto", "cpu", "cuda"],
+        help="运行设备",
+    )
+    parser.add_argument(
+        "--max-gaussians", type=int, default=None,
+        help="高斯数量上限；不指定则按训练设备自动选择（可用 --show-config 查看）",
+    )
     parser.add_argument("--eval-every", type=int, default=500, help="每 N 轮打印一次损失")
-    parser.add_argument("--max-gaussians", type=int, default=None,
-                        help="高斯数量上限；不指定则按实际训练设备自动选择（可用 --show-config 查看）")
 
     # 高级特性
-    parser.add_argument("--sh-degree", type=int, default=0, choices=[0, 1, 2, 3],
-                        help="球谐阶数（0=仅漫反射，3=完整视角相关）")
+    parser.add_argument(
+        "--sh-degree", type=int, default=0, choices=[0, 1, 2, 3],
+        help="球谐阶数（0=仅漫反射，3=完整视角相关）",
+    )
     parser.add_argument("--sh-warmup-steps", type=int, default=200,
                         help="球谐阶数渐进提升的步数")
     parser.add_argument("--ssim-warmup-steps", type=int, default=500,
@@ -88,24 +109,7 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--train-focal", action="store_true",
                         help="训练时学习焦距（自标定）")
     parser.add_argument("--amp", action="store_true",
-                        help="混合精度训练（fp16，需 CUDA + 安培以上 GPU，光栅化器保持 fp32；CPU 无效）")
-
-    # 位姿估计
-    parser.add_argument(
-        "--pose-estimator",
-        type=str,
-        choices=["opencv", "colmap"],
-        default="opencv",
-        help="相机位姿估计后端（opencv=ORB+EM，colmap=外部 COLMAP）",
-    )
-    parser.add_argument(
-        "--feature-type",
-        type=str,
-        choices=["orb", "sift"],
-        default="orb",
-        help="OpenCV 位姿估计的特征描述子（orb=快速二进制，sift=鲁棒浮点，较慢）",
-    )
-    parser.add_argument("--focal-guess", type=float, default=None, help="初始焦距估计值（可选）")
+                        help="混合精度训练（fp16，仅 CUDA + Tensor Core（Volta及以后）有收益，光栅化器保持 fp32；CPU 无效）")
 
     # 断点续训
     parser.add_argument("--resume-dir", type=str, default=None,
@@ -139,14 +143,12 @@ def save_poses(poses: list, path: Path) -> None:
 
 
 def resolve_device(device_arg: str) -> str:
-    """把 "auto" 解析为实际设备字符串。"""
     if device_arg == "auto":
         return "cuda" if torch.cuda.is_available() else "cpu"
     return device_arg
 
 
 def print_render_config(device: str) -> None:
-    """按指定设备打印硬件自适应渲染配置。"""
     cfg = auto_tune_config(device=device)
     print("硬件自适应渲染配置：")
     print(f"  设备:          {device}")
@@ -161,7 +163,7 @@ def print_render_config(device: str) -> None:
 def run_pipeline(args: argparse.Namespace) -> None:
     overall_start = time.time()
 
-    # 指定 resume-dir 时，workdir 强制指向该目录
+    # --resume-dir 时 workdir 强制指向该目录
     workdir = Path(args.workdir)
     if args.resume_dir is not None:
         workdir = Path(args.resume_dir)
@@ -183,7 +185,7 @@ def run_pipeline(args: argparse.Namespace) -> None:
     logger.info("  视频 → 3D 高斯泼溅")
     logger.info("=" * 60)
 
-    # ---------- 步骤 1：提取帧 ----------
+    # 步骤 1：提取帧
     logger.info("[1/5] 正在提取帧...")
     t0 = time.time()
 
@@ -219,7 +221,7 @@ def run_pipeline(args: argparse.Namespace) -> None:
     h, w = frames[0].shape[:2]
     logger.info("帧分辨率: %dx%d", w, h)
 
-    # ---------- 步骤 2：估计相机位姿 ----------
+    # 步骤 2：估计相机位姿
     logger.info("[2/5] 正在估计相机位姿...")
     t0 = time.time()
 
@@ -233,6 +235,14 @@ def run_pipeline(args: argparse.Namespace) -> None:
         poses = load_poses(np.load(poses_file))
         logger.info("已从 %s 加载位姿", workdir)
     else:
+        focal_guess = None
+        if args.use_focal_guess:
+            focal_guess = float(max(w, h))
+            fov_deg = 2.0 * np.degrees(np.arctan(max(w, h) / (2.0 * focal_guess)))
+            axis = "水平" if w >= h else "垂直"
+            logger.info("初始焦距猜测: %.1fpx（约 %.0f° %s FOV）",
+                        focal_guess, fov_deg, axis)
+
         if args.pose_estimator == "colmap":
             try:
                 from colmap_poses import estimate_poses_with_colmap
@@ -248,7 +258,7 @@ def run_pipeline(args: argparse.Namespace) -> None:
                 frame_paths,
                 min_inliers=25,
                 feature_type=args.feature_type,
-                focal_guess=args.focal_guess,
+                focal_guess=focal_guess,
                 aspect_ratio=1.0,
             )
             K = intrinsics.K
@@ -268,7 +278,7 @@ def run_pipeline(args: argparse.Namespace) -> None:
         logger.error("有效位姿过少。请检查视频质量，或改用 --pose-estimator colmap。")
         sys.exit(1)
 
-    # ---------- 步骤 3：初始化高斯 ----------
+    # 步骤 3：初始化高斯
     logger.info("[3/5] 正在初始化 3D 高斯...")
     t0 = time.time()
 
@@ -289,7 +299,7 @@ def run_pipeline(args: argparse.Namespace) -> None:
     logger.info("已初始化 %d 个高斯（耗时 %.1fs）",
                 gauss_init["positions"].shape[0], time.time() - t0)
 
-    # ---------- 步骤 4：训练 ----------
+    # 步骤 4：训练
     logger.info("[4/5] 正在训练 3D 高斯...")
     if args.sh_degree > 0:
         logger.info("SH 阶数: %d，升温步数: %d", args.sh_degree, args.sh_warmup_steps)
@@ -304,7 +314,7 @@ def run_pipeline(args: argparse.Namespace) -> None:
     gaussians = Gaussian3D()
     gaussians.initialize_from_dict(gauss_init, device=device)
 
-    # 按实际训练设备分档；--max-gaussians 只覆盖密度上限，光栅化器参数不变。
+    # max_gaussians 只覆盖密度上限，光栅化器参数仍按设备自动分档
     render_config = auto_tune_config(device=device)
     if args.max_gaussians is not None and args.max_gaussians != render_config.max_gaussians:
         old_max = render_config.max_gaussians
@@ -392,6 +402,7 @@ def run_pipeline(args: argparse.Namespace) -> None:
     total_train = time.time() - training_start
     logger.info("训练完成。最佳损失: %.6f（耗时 %.1fs）", best_loss, total_train)
 
+    # 步骤 5：导出
     logger.info("[5/5] 正在导出 PLY...")
     export_training_checkpoint(trainer, args.output, sh_degree=args.sh_degree)
 
@@ -408,7 +419,7 @@ def cli(argv: list[str] = None) -> None:
     parser = build_parser()
     args = parser.parse_args(argv)
 
-    # --show-config 只打印配置，不跑流程，也不要求 --video
+    # --show-config 只打印配置后退出
     if args.show_config:
         print_render_config(resolve_device(args.device))
         sys.exit(0)

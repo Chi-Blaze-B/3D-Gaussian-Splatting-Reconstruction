@@ -24,9 +24,9 @@
   <img src="https://img.shields.io/github/last-commit/Chi-Blaze-B/3D-Gaussian-Splatting-Reconstruction?style=flat-square&color=green&logo=github" alt="Last Commit">
 </p>
 
-基于 Python 的视频转 3D 高斯泼溅（3DGS）工作流。输入一段视频，输出一个 `.ply` 文件，可用官方 3DGS 查看器（https://github.com/graphdeco-inria/gaussian-splatting ）浏览重建的三维场景。。
+基于 Python 的视频转 3D 高斯泼溅（3DGS）工作流。输入一段视频，输出一个 `.ply` 文件，可用官方 3DGS 查看器（https://github.com/graphdeco-inria/gaussian-splatting ）浏览重建的三维场景。
 
-**核心光栅化器完全基于 PyTorch 实现**，无需编译 CUDA 扩展，支持 SH 0–3 阶球谐函数，排序式逐像素 splat 向量化。整体流程还依赖 OpenCV、SciPy、PySide6、psutil 等库。
+**核心光栅化器完全基于 PyTorch 实现**，无需编译 CUDA 扩展，支持 SH 0–3 阶球谐函数，排序式逐像素 splat 向量化。整体流程还依赖 OpenCV、SciPy、PySide6、matplotlib、psutil 等库。
 
 - **纯 PyTorch 光栅化器**：无需编译 CUDA 扩展，支持 SH 0–3 阶，开箱即用。
 - **鲁棒姿态估计**：内置 ORB/SIFT 增量式 SfM，也可选用 COLMAP 后端。
@@ -99,15 +99,15 @@ python cli.py --video input.mp4 --output output.ply
 | `--device` | auto / cpu / cuda | `auto` |
 | `--max-gaussians` | 高斯上限；不指定则按设备自动选择 | `None` |
 | `--sh-degree` | 球谐阶数（0~3） | `0` |
-| `--sh-warmup-steps` | SH 升温步数 | `1000` |
+| `--sh-warmup-steps` | SH 升温步数 | `200` |
 | `--ssim-warmup-steps` | SSIM 升温步数 | `500` |
 | `--ssim-weight-max` | SSIM 最大权重 | `0.2` |
 | `--random-background` | 随机黑白背景 | `False` |
 | `--train-focal` | 训练中微调焦距 | `False` |
-| `--amp` | 混合精度 fp16（需 CUDA + Ampere+） | `False` |
+| `--amp` | 混合精度 fp16（需 CUDA + Volta架构及以后显卡） | `False` |
 | `--pose-estimator` | opencv / colmap | `opencv` |
 | `--feature-type` | orb / sift（仅 opencv 后端） | `orb` |
-| `--focal-guess` | 初始焦距猜测（像素） | `None` |
+| `--use-focal-guess` | 以 1.0×图像长边作为初始像素焦距（约 53° 长边方向 FOV）传给位姿估计器；仅 `--pose-estimator opencv` 时生效 | `False` |
 | `--resume-dir` | 从工作目录续训 | `None` |
 | `--eval-every` | 每 N 轮打印日志 | `500` |
 | `--show-config` | 打印硬件自适应配置后退出 | `False` |
@@ -143,14 +143,16 @@ GUI 提供：
 - 帧缩略图预览、分页浏览
 - 帧级和轮次级损失曲线
 - 日志输出、中断训练并保存检查点
+- “使用初始焦距猜测”开关、随机背景、焦距自校准、AMP 等训练选项
+- 自动检测 `training_state.pt` 并续训
 
-**注意**：GUI 暂未提供 `--focal-guess`、`--resume-dir`；`评估间隔`控件未生效。GUI 默认值与 CLI 有差异，以界面为准。
+**注意**：GUI 提供“使用初始焦距猜测”开关，等价于 CLI 的 `--use-focal-guess`，但不支持自定义像素焦距值。GUI 无 --eval-every 对应控件，日志全量展示。GUI 通过工作目录自动检测 `training_state.pt` 续训，无需类似 `--resume-dir`的配置项。GUI 默认值与 CLI 有差异：训练轮次默认 1000（CLI 为 3000）、SH 阶数默认 3（CLI 为 0）、随机背景默认开（CLI 为 关）、焦距自校准默认开（CLI 为 关）、初始焦距猜测默认开（CLI 为 关），以界面为准。
 
 ## 🧩 核心模块
 | 模块 | 功能 |
 |------|------|
 | `frames.py` | 视频帧提取，支持 uniform / smart / two-stage 采样 |
-| `poses.py` | 纯 OpenCV 增量式 SfM（ORB/SIFT），带鲁棒 BA |
+| `poses.py` | 纯 OpenCV+SciPy 增量式 SfM（ORB/SIFT），带鲁棒 BA |
 | `colmap_poses.py` | COLMAP 封装，备选姿态估计后端 |
 | `point_cloud.py` | 稀疏点云初始化高斯参数，离群点剔除 |
 | `gaussian.py` | 3DGS 核心：纯 PyTorch 光栅化器、Trainer、密度控制、硬件自适应 |
@@ -193,6 +195,7 @@ GUI 提供：
 ### 动态场景
 
 3DGS 假设场景静态。移动物体会产生重影/形变，属于方法边界。
+
 ## 🎯 姿态估计后端选择
 
 | 后端 | 命令 | 适用场景 |
@@ -217,7 +220,7 @@ GUI 提供：
   python cli.py --video input.mp4 --device cuda --show-config
   ```
 
-GPU 分档参考：<4GB 100k、<6GB 200k、<8GB 300k、<12GB 500k、<16GB 700k、<24GB 1M、≥24GB 1.5M。  
+GPU 分档参考：<4GB 150k、<6GB 250k、<8GB 350k、<12GB 500k、<16GB 700k、<24GB 1M、≥24GB 1.5M。  
 CPU 分档参考：<8GB 50k、<16GB 100k、<32GB 200k、<64GB 300k、<128GB 400k、≥128GB 600k。
 
 `render_config` 会随检查点保存，续训时同步恢复。
@@ -231,10 +234,11 @@ CPU 分档参考：<8GB 50k、<16GB 100k、<32GB 200k、<64GB 300k、<128GB 400k
 - **SH 升温**：前 `sh_warmup_steps` 步逐步提升 SH 阶数。
 - **梯度裁剪**：全局范数限制 10.0。
 - **光栅化器**：排序式逐像素 splat 向量化，分块控制显存。
-- **混合精度**：`--amp` 仅 CUDA + Ampere+ 有收益，默认关闭。
+- **混合精度**：`--amp` 仅 CUDA + Tensor Core（Volta及以后）有收益，默认关闭。
 - **帧内存预加载**：训练前预解码为 uint8 RGB，减少磁盘 IO。
 - **Loss 发散保护**：单步 loss 超过阈值时保存检查点并中断。
 - **焦距自校准**：`--train-focal` 时优化 fx、fy。
+
 ## 💾 断点续训
 
 工作目录保存：
@@ -273,12 +277,11 @@ python cli.py --video input.mp4 --resume-dir ./workdir --output restored.ply
 - GUI 遇到 CUDA OOM 会尝试降低高斯上限并修剪；CLI 需手动降低 `--max-gaussians`。
 - 有显卡但想用 CPU 训练时务必显式传 `--device cpu`。
 - 启动时自动绑定所有逻辑核心。
-- 纯 PyTorch 光栅化器无需编译 CUDA 扩展。
-- `--amp` 仅对 Ampere+ 有 Tensor Core 收益。
+- 纯 PyTorch 光栅化器无需编译 CUDA 扩展，完成环境配置即可直接运行。
+- `--amp` 仅对Volta架构及以后有 Tensor Core 收益，无 Tensor Core 或低端显卡通常收益很小甚至变慢，建议关闭。
 
 ## ⚠️ 已知限制
 
-- GUI 未暴露 `--focal-guess`、`--resume-dir`；评估间隔控件未生效，预计下次更新修复。
 - 性能数字因硬件、分辨率、场景而异。
 - 动态场景 / 运动物体会产生重影或形变，需 4D-GS 类扩展，目前无计划支持。
 - 反射 / 镜面表面偶见重建效果不理想，目前正在优化。
@@ -291,6 +294,6 @@ Apache-2.0，欢迎自由使用和修改。
 ## 🙏 致谢
 
 3D Gaussian Splatting 原始论文与开源代码。  
-OpenCV、PyTorch、SciPy、PySide6 等优秀开源库。
+OpenCV、PyTorch、SciPy、PySide6、matplotlib 等优秀开源库。
 
 如有问题，欢迎提 Issue 或 PR。Happy Splatting!

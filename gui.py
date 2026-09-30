@@ -32,7 +32,6 @@ def setup_logging() -> None:
 
 
 def set_affinity_to_all_cores() -> None:
-    """将当前进程绑定到所有逻辑核心。"""
     try:
         p = psutil.Process(os.getpid())
         all_cpus = list(range(psutil.cpu_count()))
@@ -61,9 +60,9 @@ from gaussian import (
 from exporter import export_training_checkpoint
 
 
-# ============================================================================
+# ---------------------------------------------------------------------------
 # 设计系统
-# ============================================================================
+# ---------------------------------------------------------------------------
 
 C = {
     "bg":             "#0f1724",
@@ -110,9 +109,9 @@ def input_fg():
     )
 
 
-# ============================================================================
+# ---------------------------------------------------------------------------
 # 自定义控件
-# ============================================================================
+# ---------------------------------------------------------------------------
 
 class RoundedCard(QFrame):
     def __init__(self, parent=None):
@@ -583,9 +582,9 @@ class PreviewImage(QLabel):
         self.setPixmap(QPixmap.fromImage(qimg).scaled(self.width() - 4, self.height() - 4, Qt.KeepAspectRatio, Qt.SmoothTransformation))
 
 
-# ============================================================================
+# ---------------------------------------------------------------------------
 # 损失曲线页
-# ============================================================================
+# ---------------------------------------------------------------------------
 
 class LossCurvePage(QWidget):
     def __init__(self, parent=None):
@@ -719,9 +718,9 @@ class LossCurvePage(QWidget):
         buf.close()
 
 
-# ============================================================================
+# ---------------------------------------------------------------------------
 # 工作线程
-# ============================================================================
+# ---------------------------------------------------------------------------
 
 class PipelineWorker(QThread):
     log_signal = Signal(str)
@@ -785,13 +784,10 @@ class PipelineWorker(QThread):
         has_training_state = (workdir / "training_state.pt").exists()
         can_resume = has_frames and has_poses and has_gaussians
 
-        # ---------- 步骤 1：提取帧 ----------
+        # 步骤 1：提取帧
         self._log("[1/5] 正在提取视频帧...")
         self._set_progress(0, "正在提取视频帧...")
 
-        # 复用旧帧时校验缩放比例是否一致：旧帧若是用其他 scale 提取的，
-        # 直接复用会导致"日志显示 0.25，帧实际还是旧 0.5 尺寸"的静默错配。
-        # 没有元数据的旧帧（本功能上线前已存在的目录）不强制重提，只提示。
         import json as _json
         meta_path = workdir / "frame_meta.json"
         old_scale_val = None
@@ -839,7 +835,7 @@ class PipelineWorker(QThread):
         h, w = frames[0].shape[:2]
         self._log(f"  分辨率: {w}x{h}")
 
-        # ---------- 步骤 2：估计相机位姿 ----------
+        # 步骤 2：估计位姿
         self._log("\n[2/5] 正在估算相机位姿...")
         self._set_progress(20, "正在估算相机位姿...")
 
@@ -861,6 +857,13 @@ class PipelineWorker(QThread):
                     poses.append(None)
             self._log(f"  已加载 {len(poses)} 个位姿（跳过估算）")
         else:
+            focal_guess = None
+            if c.get("use_focal_guess"):
+                focal_guess = float(max(w, h))
+                fov_deg = 2.0 * np.degrees(np.arctan(max(w, h) / (2.0 * focal_guess)))
+                axis = "水平" if w >= h else "垂直"
+                self._log(f"  初始焦距猜测: {focal_guess:.1f}px（约 {fov_deg:.0f}° {axis} FOV）")
+
             if c["pose_estimator"] == "colmap":
                 try:
                     from colmap_poses import estimate_poses_with_colmap
@@ -881,7 +884,7 @@ class PipelineWorker(QThread):
                     frame_paths,
                     min_inliers=25,
                     feature_type=feature_type,
-                    focal_guess=c.get("focal_guess"),
+                    focal_guess=focal_guess,
                     aspect_ratio=1.0,
                 )
                 K = intrinsics.K
@@ -906,7 +909,7 @@ class PipelineWorker(QThread):
             self.finished_signal.emit(False, "有效位姿过少")
             return
 
-        # ---------- 步骤 3：初始化高斯 ----------
+        # 步骤 3：初始化高斯
         self._log("\n[3/5] 正在初始化3D高斯...")
         self._set_progress(35, "正在初始化高斯...")
 
@@ -927,7 +930,7 @@ class PipelineWorker(QThread):
         self._log(f"  共 {num_gs} 个高斯")
         self._set_progress(40, f"{num_gs} 个高斯就绪")
 
-        # ---------- 步骤 4：训练 ----------
+        # 步骤 4：训练
         self._log(f"\n[4/5] 正在训练 ({c['device']}，{c['num_epochs']} 轮)...")
         self._set_progress(45, "正在训练...")
 
@@ -1073,7 +1076,7 @@ class PipelineWorker(QThread):
         self._log(f"\n  训练完成。最佳损失: {best_loss:.6f}")
         self._set_progress(95, "训练完成")
 
-        # ---------- 步骤 5：导出 ----------
+        # 步骤 5：导出
         self._log("\n[5/5] 正在导出 PLY...")
         self._set_progress(98, "正在导出...")
 
@@ -1084,9 +1087,9 @@ class PipelineWorker(QThread):
         self.finished_signal.emit(True, "成功")
 
 
-# ============================================================================
+# ---------------------------------------------------------------------------
 # 主窗口
-# ============================================================================
+# ---------------------------------------------------------------------------
 
 class MainWindow(QMainWindow):
     def __init__(self):
@@ -1111,7 +1114,6 @@ class MainWindow(QMainWindow):
         main_layout.setSpacing(0)
         main_layout.setContentsMargins(0, 0, 0, 0)
 
-        # ---- 侧边栏 ----
         sidebar = RoundedCard()
         sidebar.setFixedWidth(410)
         sidebar.setStyleSheet(f"background-color: {C['bg_sidebar']}; border-right: 1px solid {C['border']}; border-radius: 0;")
@@ -1201,7 +1203,6 @@ class MainWindow(QMainWindow):
         sidebar_layout.addWidget(scroll)
         main_layout.addWidget(sidebar)
 
-        # ---- 右侧面板 ----
         ma = QWidget()
         rl = QVBoxLayout(ma)
         rl.setContentsMargins(0, 0, 0, 0)
@@ -1324,25 +1325,60 @@ class MainWindow(QMainWindow):
         setattr(self, f"{name}_edit", edit)
         return row
 
-    def _add_input_section(self, parent_layout):
-        card = RoundedCard()
-        cl = QVBoxLayout(card)
-        cl.setContentsMargins(16, 14, 16, 14)
-        cl.setSpacing(10)
-        cl.addWidget(StyledLabel("📁 输入设置", font_size=12, bold=True, color=C["title"]))
+    def _make_step_header(self, title: str) -> QWidget:
+        w = QWidget()
+        lay = QHBoxLayout(w)
+        lay.setContentsMargins(0, 8, 0, 0)
+        lay.setSpacing(8)
 
+        lay.addWidget(StyledLabel(title, font_size=11, bold=True, color=C["accent"]))
+
+        line = QFrame()
+        line.setFixedHeight(1)
+        line.setStyleSheet(f"background-color: {C['border']};")
+        lay.addWidget(line, stretch=1)
+        return w
+
+    def _make_form(self) -> QFormLayout:
         form = QFormLayout()
         form.setSpacing(10)
         form.setLabelAlignment(Qt.AlignLeft | Qt.AlignVCenter)
         form.setFormAlignment(Qt.AlignLeft)
         form.setContentsMargins(0, 0, 0, 0)
+        return form
 
+    def _add_input_section(self, parent_layout):
+        card = RoundedCard()
+        cl = QVBoxLayout(card)
+        cl.setContentsMargins(16, 14, 16, 14)
+        cl.setSpacing(10)
+        cl.addWidget(StyledLabel("📁 输入 / 输出 · 开始前设置", font_size=12, bold=True, color=C["title"]))
+
+        form = self._make_form()
         form.addRow(StyledLabel("视频文件:", font_size=11, color=C["text_secondary"]), self._make_path_row("video"))
         form.addRow(StyledLabel("输出文件:", font_size=11, color=C["text_secondary"]), self._make_path_row("output", default="output.ply"))
         form.addRow(StyledLabel("工作目录:", font_size=11, color=C["text_secondary"]), self._make_path_row("workdir", default="./workdir"))
 
         cl.addLayout(form)
+
+        self.resume_hint = StyledLabel("", font_size=10, color=C["text_muted"])
+        self.resume_hint.setWordWrap(True)
+        cl.addWidget(self.resume_hint)
+
         parent_layout.addWidget(card)
+
+        self.workdir_edit.textChanged.connect(self._refresh_resume_hint)
+        self._refresh_resume_hint()
+
+    def _refresh_resume_hint(self):
+        wd = self.workdir_edit.text().strip() or "./workdir"
+        base = "font-size: 10pt; font-family: 'Microsoft YaHei UI', 'Segoe UI', sans-serif;"
+        if Path(wd, "training_state.pt").exists():
+            self.resume_hint.setText("🔁 检测到 training_state.pt：将从该目录续训")
+            self.resume_hint.setStyleSheet(f"color: {C['success']}; {base}")
+        else:
+            self.resume_hint.setText("○ 未检测到检查点：将从头训练")
+            self.resume_hint.setStyleSheet(f"color: {C['text_muted']}; {base}")
 
     def _add_param_section(self, parent_layout):
         card = RoundedCard()
@@ -1350,12 +1386,6 @@ class MainWindow(QMainWindow):
         cl.setContentsMargins(16, 14, 16, 14)
         cl.setSpacing(10)
         cl.addWidget(StyledLabel("⚙️ 训练参数", font_size=12, bold=True, color=C["title"]))
-
-        form = QFormLayout()
-        form.setSpacing(10)
-        form.setLabelAlignment(Qt.AlignLeft | Qt.AlignVCenter)
-        form.setFormAlignment(Qt.AlignLeft)
-        form.setContentsMargins(0, 0, 0, 0)
 
         self.sampling_combo = StyledComboBox()
         self.sampling_combo.addItems(["均匀采样", "智能采样", "两阶段采样"])
@@ -1379,14 +1409,33 @@ class MainWindow(QMainWindow):
         self.max_frames_spin.setRange(10, 500)
         self.max_frames_spin.setValue(200)
 
+        self.pose_estimator_combo = StyledComboBox()
+        self.pose_estimator_combo.addItems(["OpenCV", "COLMAP"])
+
+        self.feature_type_label = StyledLabel("特征描述子:", font_size=11, color=C["text_secondary"])
+        self.feature_type_combo = StyledComboBox()
+        self.feature_type_combo.addItems(["ORB（快）", "SIFT（稳）"])
+        self.feature_type_combo.setToolTip(
+            "ORB：二进制描述子，Hamming 距离匹配，速度快。\n"
+            "SIFT：浮点描述子，L2 距离匹配，更稳健但较慢。\n"
+            "流程：提取特征 → E 本质矩阵初始化 → 三角化/PnP 重定位 → EM 加权 BA。"
+        )
+
+        self.focal_guess_label = StyledLabel("初始焦距:", font_size=11, color=C["text_secondary"])
+
+        self.focal_guess_cb = QCheckBox("使用初始焦距猜测")
+        self.focal_guess_cb.setChecked(True)
+        self.focal_guess_cb.setStyleSheet(f"color: {C['text_primary']}; font-size: 11px; font-weight: 500;")
+        self.focal_guess_cb.setToolTip(
+            "以 1.0×图像长边作为初始像素焦距（约 53° 长边方向 FOV）\n"
+            "传给位姿估算器，作为 E 矩阵与 PnP 的焦距初值。\n"
+            "仅在使用 OpenCV 位姿估算时生效；COLMAP 后端忽略此参数。"
+        )
+
         self.epochs_spin = StyledSpinBox()
         self.epochs_spin.setRange(10, 10000)
         self.epochs_spin.setValue(1000)
         self.epochs_spin.setSingleStep(100)
-
-        self.eval_every_spin = StyledSpinBox()
-        self.eval_every_spin.setRange(1, 1000)
-        self.eval_every_spin.setValue(10)
 
         self.max_gaussians_spin = StyledSpinBox()
 
@@ -1417,11 +1466,19 @@ class MainWindow(QMainWindow):
         self.train_focal_cb.setChecked(True)
         self.train_focal_cb.setStyleSheet(f"color: {C['text_primary']}; font-size: 11px; font-weight: 500;")
 
-        self.amp_cb = QCheckBox("混合精度 (AMP / Tensor Core)")
+        self.amp_label = StyledLabel("混合精度:", font_size=11, color=C["text_secondary"])
+
+        self.amp_cb = QCheckBox("自动混合精度 (AMP)")
         self.amp_cb.setChecked(False)
         self.amp_cb.setStyleSheet(f"color: {C['text_primary']}; font-size: 11px; font-weight: 500;")
-        self.amp_cb.setToolTip("混合精度 fp16（需 CUDA + fp16 显卡，Ampere+ 可用 Tensor Core）。"
-                               "光栅化器内部保持 fp32；无 Tensor Core 的低端卡无收益，请保持关闭。")
+        self.amp_cb.setToolTip(
+            "启用 PyTorch 自动混合精度（AMP）：在 CUDA 上通过 torch.autocast 让适合的算子自动以 FP16 计算，"
+            "并用 GradScaler 处理梯度缩放，以加速并降低显存占用。\n"
+            "光栅化器、协方差等数值敏感部分仍会保持 FP32，避免影响训练效果。\n"
+            "推荐带 Tensor Core 的 NVIDIA 显卡（Volta架构及以后）；"
+            "无 Tensor Core 或低端显卡通常收益很小甚至变慢，建议关闭。\n"
+            "仅 CUDA 设备可用。"
+        )
 
         self.device_combo = StyledComboBox()
         if torch.cuda.is_available():
@@ -1432,43 +1489,42 @@ class MainWindow(QMainWindow):
             self._device_map = {"自动": "auto", "CPU": "cpu"}
 
         self.device_combo.currentTextChanged.connect(self._on_device_changed)
-        self._init_max_gaussians_spinbox()
+        self._on_device_changed(self.device_combo.currentText())
 
-        self.pose_estimator_combo = StyledComboBox()
-        self.pose_estimator_combo.addItems(["OpenCV", "COLMAP"])
+        cl.addWidget(self._make_step_header("帧提取"))
+        f1 = self._make_form()
+        f1.addRow(StyledLabel("采样模式:", font_size=11, color=C["text_secondary"]), self.sampling_combo)
+        f1.addRow(StyledLabel("采样帧率:", font_size=11, color=C["text_secondary"]), self.fps_spin)
+        f1.addRow(StyledLabel("画面缩放:", font_size=11, color=C["text_secondary"]), self.scale_spin)
+        f1.addRow(StyledLabel("最少帧数:", font_size=11, color=C["text_secondary"]), self.min_frames_spin)
+        f1.addRow(StyledLabel("最多帧数:", font_size=11, color=C["text_secondary"]), self.max_frames_spin)
+        cl.addLayout(f1)
 
-        self.feature_type_label = StyledLabel("特征描述子:", font_size=11, color=C["text_secondary"])
-        self.feature_type_combo = StyledComboBox()
-        self.feature_type_combo.addItems(["ORB（快）", "SIFT（稳）"])
-        self.feature_type_combo.setToolTip(
-            "ORB：二进制描述子，使用 Hamming 距离匹配，速度快。<br>"
-            "SIFT：浮点描述子，使用 L2 距离匹配，更稳健但较慢。<br><br>"
-            "完整流程：提取图像特征 → E 本质矩阵初始化 → 三角化、PnP 重定位 → EM 加权 BA。"
-        )
+        cl.addWidget(self._make_step_header("相机位姿估算"))
+        f2 = self._make_form()
+        f2.addRow(StyledLabel("位姿估算:", font_size=11, color=C["text_secondary"]), self.pose_estimator_combo)
+        f2.addRow(self.feature_type_label, self.feature_type_combo)
+        f2.addRow(self.focal_guess_label, self.focal_guess_cb)
+        cl.addLayout(f2)
 
-        form.addRow(StyledLabel("采样模式:", font_size=11, color=C["text_secondary"]), self.sampling_combo)
-        form.addRow(StyledLabel("采样帧率:", font_size=11, color=C["text_secondary"]), self.fps_spin)
-        form.addRow(StyledLabel("画面缩放:", font_size=11, color=C["text_secondary"]), self.scale_spin)
-        form.addRow(StyledLabel("最少帧数:", font_size=11, color=C["text_secondary"]), self.min_frames_spin)
-        form.addRow(StyledLabel("最多帧数:", font_size=11, color=C["text_secondary"]), self.max_frames_spin)
-        form.addRow(StyledLabel("训练轮次:", font_size=11, color=C["text_secondary"]), self.epochs_spin)
-        form.addRow(StyledLabel("评估间隔:", font_size=11, color=C["text_secondary"]), self.eval_every_spin)
-        form.addRow(StyledLabel("高斯上限:", font_size=11, color=C["text_secondary"]), self.max_gaussians_spin)
-        form.addRow(StyledLabel("SH 阶数:", font_size=11, color=C["text_secondary"]), self.sh_degree_combo)
-        form.addRow(StyledLabel("SH 升温步数:", font_size=11, color=C["text_secondary"]), self.sh_warmup_spin)
-        form.addRow(StyledLabel("SSIM 升温步数:", font_size=11, color=C["text_secondary"]), self.ssim_warmup_spin)
-        form.addRow(StyledLabel("SSIM 最大权重:", font_size=11, color=C["text_secondary"]), self.ssim_weight_spin)
-        form.addRow(StyledLabel("动态背景:", font_size=11, color=C["text_secondary"]), self.random_bg_cb)
-        form.addRow(StyledLabel("焦距自校准:", font_size=11, color=C["text_secondary"]), self.train_focal_cb)
-        form.addRow(StyledLabel("混合精度:", font_size=11, color=C["text_secondary"]), self.amp_cb)
-        form.addRow(StyledLabel("计算设备:", font_size=11, color=C["text_secondary"]), self.device_combo)
-        form.addRow(StyledLabel("位姿估算:", font_size=11, color=C["text_secondary"]), self.pose_estimator_combo)
-        form.addRow(self.feature_type_label, self.feature_type_combo)
+        cl.addWidget(self._make_step_header("高斯训练"))
+        f3 = self._make_form()
+        f3.addRow(StyledLabel("训练轮次:", font_size=11, color=C["text_secondary"]), self.epochs_spin)
+        f3.addRow(StyledLabel("高斯上限:", font_size=11, color=C["text_secondary"]), self.max_gaussians_spin)
+        f3.addRow(StyledLabel("SH 阶数:", font_size=11, color=C["text_secondary"]), self.sh_degree_combo)
+        f3.addRow(StyledLabel("SH 升温步数:", font_size=11, color=C["text_secondary"]), self.sh_warmup_spin)
+        f3.addRow(StyledLabel("SSIM 升温步数:", font_size=11, color=C["text_secondary"]), self.ssim_warmup_spin)
+        f3.addRow(StyledLabel("SSIM 最大权重:", font_size=11, color=C["text_secondary"]), self.ssim_weight_spin)
+        f3.addRow(StyledLabel("动态背景:", font_size=11, color=C["text_secondary"]), self.random_bg_cb)
+        f3.addRow(StyledLabel("焦距自校准:", font_size=11, color=C["text_secondary"]), self.train_focal_cb)
+        f3.addRow(self.amp_label, self.amp_cb)
+        f3.addRow(StyledLabel("计算设备:", font_size=11, color=C["text_secondary"]), self.device_combo)
+        cl.addLayout(f3)
 
-        cl.addLayout(form)
         parent_layout.addWidget(card)
 
         self._on_pose_estimator_changed(self.pose_estimator_combo.currentText())
+        self.pose_estimator_combo.currentTextChanged.connect(self._on_pose_estimator_changed)
 
     def _resolve_device(self) -> str:
         device = self._device_map.get(self.device_combo.currentText(), "auto")
@@ -1477,7 +1533,6 @@ class MainWindow(QMainWindow):
         return device
 
     def _init_max_gaussians_spinbox(self):
-        """按当前设备刷新高斯上限 spinbox。"""
         device = self._resolve_device()
         cfg = auto_tune_config(device=device)
         self._current_render_cfg = cfg
@@ -1493,11 +1548,18 @@ class MainWindow(QMainWindow):
 
     def _on_device_changed(self, _text: str):
         self._init_max_gaussians_spinbox()
+        is_cuda = self._resolve_device() == "cuda"
+        self.amp_label.setVisible(is_cuda)
+        self.amp_cb.setVisible(is_cuda)
+        if not is_cuda:
+            self.amp_cb.setChecked(False)
 
     def _on_pose_estimator_changed(self, text: str):
         is_colmap = text == "COLMAP"
         self.feature_type_label.setVisible(not is_colmap)
         self.feature_type_combo.setVisible(not is_colmap)
+        self.focal_guess_label.setVisible(not is_colmap)
+        self.focal_guess_cb.setVisible(not is_colmap)
 
     def _apply_theme(self):
         self.setStyleSheet(f"""
@@ -1580,7 +1642,7 @@ class MainWindow(QMainWindow):
             "min_frames": self.min_frames_spin.value(),
             "max_frames": self.max_frames_spin.value(),
             "num_epochs": self.epochs_spin.value(),
-            "eval_every": self.eval_every_spin.value(),
+            "use_focal_guess": self.focal_guess_cb.isChecked(),
             "sh_degree": sh_degree,
             "sh_warmup_steps": self.sh_warmup_spin.value(),
             "ssim_warmup_steps": self.ssim_warmup_spin.value(),
@@ -1604,6 +1666,8 @@ class MainWindow(QMainWindow):
         self.progress_label.setStyleSheet(f"color: {C['text_secondary']}; font-size: 10pt;")
         self.log_viewer.clear()
 
+        has_ckpt = Path(workdir, "training_state.pt").exists()
+
         self._log("━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━")
         self._log("  3D 高斯泼溅重建 启动")
         self._log("━━━━━━━━━━━━━━━━━━━━━━━━━━━━━")
@@ -1613,6 +1677,8 @@ class MainWindow(QMainWindow):
         self._log(f"⚙️   帧率:      {config['fps']} FPS")
         self._log(f"📐  缩放比例:  {config['scale']:.2f}")
         self._log(f"🎞️   帧数范围:  {config['min_frames']}–{config['max_frames']}")
+        self._log(f"🗺️  位姿估算:  {config['pose_estimator']}")
+        self._log(f"🔎  初始焦距:  {'开（1.0×长边）' if config['use_focal_guess'] else '关'}")
         self._log(f"🔄  训练轮次:  {config['num_epochs']}")
 
         auto_max = render_config.max_gaussians
@@ -1622,12 +1688,12 @@ class MainWindow(QMainWindow):
 
         self._log(f"💻  计算设备:  {config['device']}")
         self._log(f"📂  工作目录:  {config['workdir']}")
-        self._log(f"🎨 SH 阶数:   {config['sh_degree']}")
-        self._log(f"🔥 SH 升温:   {config['sh_warmup_steps']} 步")
-        self._log(f"📈 SSIM 升温: {config['ssim_warmup_steps']} 步")
-        self._log(f"🎲 动态背景:  {'是' if config['random_background'] else '否'}")
-        self._log(f"🔍 焦距自校准: {'是' if config['train_focal'] else '否'}")
-        self._log(f"🗺️  位姿估算:  {config['pose_estimator']}")
+        self._log(f"🔁  续训检查点: {'有（将续训）' if has_ckpt else '无（从头训练）'}")
+        self._log(f"🎨  SH 阶数:   {config['sh_degree']}")
+        self._log(f"🔥  SH 升温:   {config['sh_warmup_steps']} 步")
+        self._log(f"📈  SSIM 升温: {config['ssim_warmup_steps']} 步")
+        self._log(f"🎲  动态背景:  {'是' if config['random_background'] else '否'}")
+        self._log(f"🔍  焦距自校准: {'是' if config['train_focal'] else '否'}")
 
         self.worker = PipelineWorker(config)
         self.worker.log_signal.connect(self._append_log)
@@ -1662,6 +1728,8 @@ class MainWindow(QMainWindow):
             self.progress_label.setText("重建失败")
             self.progress_label.setStyleSheet(f"color: {C['danger']}; font-size: 10pt;")
             self._log(f"❌ {message}")
+
+        self._refresh_resume_hint()
 
     def _append_log(self, msg):
         self.log_viewer.append_log(msg)
@@ -1811,9 +1879,9 @@ class MainWindow(QMainWindow):
         event.accept()
 
 
-# ============================================================================
+# ---------------------------------------------------------------------------
 # 入口
-# ============================================================================
+# ---------------------------------------------------------------------------
 
 def main():
     setup_logging()
