@@ -278,10 +278,10 @@ python cli.py --video input.mp4 --resume-dir ./workdir --output restored.ply
 
 ## ⚠️ 已知限制
 
-- GUI 未暴露 `--focal-guess`、`--resume-dir`；评估间隔控件未生效。
+- GUI 未暴露 `--focal-guess`、`--resume-dir`；评估间隔控件未生效，预计下次更新修复。
 - 性能数字因硬件、分辨率、场景而异。
-- 动态场景 / 运动物体会产生重影或形变，需 4D-GS 类扩展。
-- 反射 / 镜面表面会重建发雾或颜色错乱，属方法边界。
+- 动态场景 / 运动物体会产生重影或形变，需 4D-GS 类扩展，目前无计划支持。
+- 反射 / 镜面表面偶见重建效果不理想，目前正在优化。
 - 训练开销与推理/渲染 FPS 无关；导出的 `.ply` 可用官方 CUDA viewer 实时浏览。
 
 ## 📄 许可证

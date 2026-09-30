@@ -33,7 +33,7 @@ PRUNE_EVERY = 1000
 GRAD_THRESH_BASE = 0.0002
 SCALE_THRESH = 0.01
 MIN_OPACITY = 0.005
-SH_WARMUP_STEPS = 1000
+SH_WARMUP_STEPS = 200
 SSIM_WARMUP_STEPS = 500
 SSIM_WEIGHT_MAX = 0.2
 GRAD_CLIP_NORM = 10.0
@@ -45,24 +45,30 @@ USE_LR_SCHEDULE = True
 
 
 # ---------- 硬件探测 ----------
-def _detect_gpu_total_memory_gb(device_index: int = 0) -> float:
-    """返回 GPU 总显存（GB）。无 CUDA 或探测失败返回 0。"""
+
+def _detect_gpu_available_memory_gb(device_index: int = 0) -> float:
+    """可用显存（GB）。优先 free*0.95，失败退回 total*0.8。"""
     if not torch.cuda.is_available():
         return 0.0
     try:
-        return float(torch.cuda.get_device_properties(device_index).total_memory) / (1024 ** 3)
-    except Exception as e:
-        logger.warning("探测 GPU 显存失败：%s", e)
+        free_bytes, _ = torch.cuda.mem_get_info(device_index)
+        usable = free_bytes * 0.95 / (1024 ** 3)
+        if usable > 0:
+            return usable
+    except Exception:
+        pass
+    try:
+        total = torch.cuda.get_device_properties(device_index).total_memory
+        return total * 0.8 / (1024 ** 3)
+    except Exception:
         return 0.0
 
 
 def _detect_system_memory_gb() -> float:
-    """返回系统内存（GB）。按 psutil → sysconf → Windows ctypes 依次尝试。"""
+    """系统内存（GB）。psutil → sysconf → /proc/meminfo → Windows ctypes。"""
     try:
         import psutil  # type: ignore
         return float(psutil.virtual_memory().total) / (1024 ** 3)
-    except ImportError:
-        pass
     except Exception:
         pass
 
@@ -74,6 +80,14 @@ def _detect_system_memory_gb() -> float:
                 return float(pages * page_size) / (1024 ** 3)
         except (ValueError, OSError, AttributeError):
             pass
+
+    try:
+        with open("/proc/meminfo", "r") as f:
+            for line in f:
+                if line.startswith("MemTotal:"):
+                    return float(line.split()[1]) / (1024 ** 2)
+    except Exception:
+        pass
 
     if sys.platform == "win32":
         try:
@@ -102,10 +116,12 @@ def _detect_system_memory_gb() -> float:
     return 0.0
 
 
-# ---------- 渲染配置 ----------
-@dataclass(frozen=True)
+
+@dataclass
 class RenderConfig:
-    """光栅化器与高斯数量上限的硬件相关配置。"""
+    """
+    光栅化器与高斯数量上限的硬件相关配置。
+    """
     raster_chunk: int
     radius_max: int
     max_gaussians: int
@@ -117,47 +133,46 @@ class RenderConfig:
         return 2 * self.radius_max + 1
 
 
+
 def _tune_for_gpu(vram_gb: float) -> RenderConfig:
-    """按显存分档。raster_chunk 拐点在 4096 附近；>=16GB 提到 8192 边际
-    收益仅约 2%。<4GB 降到 2048 留出训练余量。"""
+    """按可用显存分档。"""
     if vram_gb < 4:
-        return RenderConfig(2048, 3, 100_000, "cuda", vram_gb)
+        return RenderConfig(2048, 3, 150_000, "cuda", vram_gb)
     if vram_gb < 6:
-        return RenderConfig(4096, 5, 200_000, "cuda", vram_gb)
+        return RenderConfig(4096, 3, 250_000, "cuda", vram_gb)
     if vram_gb < 8:
-        return RenderConfig(4096, 6, 300_000, "cuda", vram_gb)
+        return RenderConfig(4096, 4, 350_000, "cuda", vram_gb)
     if vram_gb < 12:
-        return RenderConfig(4096, 10, 500_000, "cuda", vram_gb)
+        return RenderConfig(4096, 4, 500_000, "cuda", vram_gb)
     if vram_gb < 16:
-        return RenderConfig(4096, 12, 700_000, "cuda", vram_gb)
+        return RenderConfig(4096, 4, 700_000, "cuda", vram_gb)
     if vram_gb < 24:
-        return RenderConfig(8192, 14, 1_000_000, "cuda", vram_gb)
-    return RenderConfig(8192, 16, 1_500_000, "cuda", vram_gb)
+        return RenderConfig(4096, 5, 1_000_000, "cuda", vram_gb)
+    return RenderConfig(4096, 5, 1_500_000, "cuda", vram_gb)
 
 
 def _tune_for_cpu(ram_gb: float) -> RenderConfig:
-    """按系统内存分档。max_gaussians 保守以避免 RAM 溢出；chunk 沿用原
-    档位（CPU 上 chunk 增益有限）。"""
+    """按系统内存分档。max_gaussians 保守是为限制 CPU 渲染时间，而非防内存溢出。"""
     if ram_gb < 8:
-        return RenderConfig(32, 6, 50_000, "cpu", ram_gb)
+        return RenderConfig(32, 3, 50_000, "cpu", ram_gb)
     if ram_gb < 16:
-        return RenderConfig(48, 7, 100_000, "cpu", ram_gb)
+        return RenderConfig(48, 3, 100_000, "cpu", ram_gb)
     if ram_gb < 32:
-        return RenderConfig(64, 8, 200_000, "cpu", ram_gb)
+        return RenderConfig(64, 4, 200_000, "cpu", ram_gb)
     if ram_gb < 64:
-        return RenderConfig(96, 9, 300_000, "cpu", ram_gb)
+        return RenderConfig(96, 4, 300_000, "cpu", ram_gb)
     if ram_gb < 128:
-        return RenderConfig(128, 10, 400_000, "cpu", ram_gb)
-    return RenderConfig(192, 12, 600_000, "cpu", ram_gb)
+        return RenderConfig(128, 4, 400_000, "cpu", ram_gb)
+    return RenderConfig(192, 4, 600_000, "cpu", ram_gb)
+
 
 
 def auto_tune_config(device: Optional[str] = None,
                      vram_gb: Optional[float] = None,
                      ram_gb: Optional[float] = None,
                      device_index: int = 0) -> RenderConfig:
-    """按训练设备自动推导渲染配置。
-
-    cuda → 依据显存；cpu → 依据系统内存；None/auto → 自动判断。
+    """
+    按训练设备自动推导渲染配置。
     """
     if device is None or device == "auto":
         use_cuda = torch.cuda.is_available()
@@ -166,31 +181,38 @@ def auto_tune_config(device: Optional[str] = None,
 
     if use_cuda:
         if vram_gb is None:
-            vram_gb = _detect_gpu_total_memory_gb(device_index)
-        if vram_gb > 0:
+            vram_gb = _detect_gpu_available_memory_gb(device_index)
+        if vram_gb and vram_gb > 0:
             cfg = _tune_for_gpu(vram_gb)
             logger.info(
-                "[AutoTune] 设备=%s，GPU 显存 %.1fGB → raster_chunk=%d radius_max=%d "
-                "max_span=%d max_gaussians=%d",
-                device or "cuda", cfg.hardware_gb, cfg.raster_chunk, cfg.radius_max,
-                cfg.max_span, cfg.max_gaussians,
+                "[AutoTune] 设备=%s 可用显存 %.1fGB → "
+                "raster_chunk=%d radius_max=%d max_span=%d max_gaussians=%d",
+                device or "cuda", cfg.hardware_gb,
+                cfg.raster_chunk, cfg.radius_max, cfg.max_span, cfg.max_gaussians,
             )
             return cfg
-        logger.warning("[AutoTune] 指定 CUDA 但探测不到显存，回落到系统内存分档。")
-
-    if ram_gb is None:
-        ram_gb = _detect_system_memory_gb()
-    if ram_gb > 0:
-        cfg = _tune_for_cpu(ram_gb)
-        logger.info(
-            "[AutoTune] 设备=%s，系统内存 %.1fGB → raster_chunk=%d radius_max=%d "
+        logger.warning("[AutoTune] 指定 CUDA 但探测不到显存，回落为 fallback。")
+        cfg = RenderConfig(32, 3, 50_000, "fallback", 0.0)
+        logger.warning(
+            "[AutoTune] fallback → raster_chunk=%d radius_max=%d "
             "max_span=%d max_gaussians=%d",
-            device or "cpu", cfg.hardware_gb, cfg.raster_chunk, cfg.radius_max,
-            cfg.max_span, cfg.max_gaussians,
+            cfg.raster_chunk, cfg.radius_max, cfg.max_span, cfg.max_gaussians,
         )
         return cfg
 
-    cfg = RenderConfig(32, 6, 50_000, "fallback", 0.0)
+    if ram_gb is None:
+        ram_gb = _detect_system_memory_gb()
+    if ram_gb and ram_gb > 0:
+        cfg = _tune_for_cpu(ram_gb)
+        logger.info(
+            "[AutoTune] 设备=%s 系统内存 %.1fGB → "
+            "raster_chunk=%d radius_max=%d max_span=%d max_gaussians=%d",
+            device or "cpu", cfg.hardware_gb,
+            cfg.raster_chunk, cfg.radius_max, cfg.max_span, cfg.max_gaussians,
+        )
+        return cfg
+
+    cfg = RenderConfig(32, 3, 50_000, "fallback", 0.0)
     logger.warning(
         "[AutoTune] 无法探测系统内存，使用保守默认 → "
         "raster_chunk=%d radius_max=%d max_span=%d max_gaussians=%d",
@@ -322,7 +344,7 @@ def eval_sh(deg: int, sh_coeffs: torch.Tensor, dirs: torch.Tensor) -> torch.Tens
     """对方向 dirs 求值球谐，返回 [N, 3] 颜色。"""
     dirs = F.normalize(dirs, dim=-1)
     if deg == 0:
-        return torch.clamp(sh_coeffs[:, 0] * 0.28209479177387814 + 0.5, min=0.0)
+        return torch.clamp(sh_coeffs[:, 0] * 0.28209479177387814 + 0.5, 0.0, 1.0)
 
     N = sh_coeffs.shape[0]
     device = sh_coeffs.device
@@ -354,7 +376,7 @@ def eval_sh(deg: int, sh_coeffs: torch.Tensor, dirs: torch.Tensor) -> torch.Tens
 
     basis = torch.cat([sh0, sh1, sh2, sh3][:deg + 1], dim=1)
     color = torch.einsum('nc, ncd -> nd', basis, sh_coeffs[:, :basis.shape[1], :])
-    return torch.clamp(color + 0.5, min=0.0)
+    return torch.clamp(color + 0.5, 0.0, 1.0)
 
 
 # ---------- 高斯表示 ----------
@@ -440,16 +462,8 @@ def densify_initial_gaussians(gaussians: Gaussian3D, expansion_factor: int = 8, 
     gaussians.sh_coeffs = new_sh.requires_grad_(True)
 
 
-# ---------- 可微光栅化器（纯 PyTorch） ----------
+# ---------- 可微光栅化器 ----------
 class DifferentiableRasterizer(nn.Module):
-    """纯 PyTorch 光栅化器。
-
-    相对朴素实现的关键优化：
-      1. 布尔索引后用 shape[0] 判空，去掉 int(t.sum()) 的两次全流同步
-      2. chunk 元信息在 GPU 上 amax 后一次 D2H，替代分散的 .cpu().numpy()
-      3. pix_key 安全时用 int32（基数排序 pass 数减半），否则回退 int64
-      4. group_start_pos 用 searchsorted 单 kernel 替代 cat/where/cummax 五 kernel
-    """
 
     def __init__(self, image_width: int, image_height: int,
                  raster_chunk: int, radius_max: int):
@@ -668,7 +682,7 @@ class DifferentiableRasterizer(nn.Module):
             a_sorted = exponent.exp() * opa_sel
             c_sorted = col_sel
 
-            a_safe = a_sorted.clamp(max=1.0 - 1e-7)
+            a_safe = a_sorted.clamp(max=1.0 - 1e-5)
             log_ta = torch.log1p(-a_safe)
             log_cum = torch.cumsum(log_ta, dim=0)
             log_cum_shift = torch.cat([

@@ -77,7 +77,7 @@ def build_parser() -> argparse.ArgumentParser:
     # 高级特性
     parser.add_argument("--sh-degree", type=int, default=0, choices=[0, 1, 2, 3],
                         help="球谐阶数（0=仅漫反射，3=完整视角相关）")
-    parser.add_argument("--sh-warmup-steps", type=int, default=1000,
+    parser.add_argument("--sh-warmup-steps", type=int, default=200,
                         help="球谐阶数渐进提升的步数")
     parser.add_argument("--ssim-warmup-steps", type=int, default=500,
                         help="SSIM 权重线性提升的步数（0→0.2）")

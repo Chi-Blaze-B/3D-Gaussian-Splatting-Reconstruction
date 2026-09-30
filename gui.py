@@ -875,7 +875,8 @@ class PipelineWorker(QThread):
                     return
             else:
                 feature_type = c.get("feature_type", "orb")
-                self._log(f"  使用 {'SIFT+EM' if feature_type == 'sift' else 'ORB+E+EM'} 进行位姿估算...")
+                label = "SIFT+E+EM-BA" if feature_type == "sift" else "ORB+E+EM-BA"
+                self._log(f"  使用 {label} 进行位姿估算...")
                 intrinsics, poses, sparse_points = estimate_poses(
                     frame_paths,
                     min_inliers=25,
@@ -1395,7 +1396,7 @@ class MainWindow(QMainWindow):
 
         self.sh_warmup_spin = StyledSpinBox()
         self.sh_warmup_spin.setRange(0, 5000)
-        self.sh_warmup_spin.setValue(1000)
+        self.sh_warmup_spin.setValue(200)
         self.sh_warmup_spin.setSingleStep(100)
 
         self.ssim_warmup_spin = StyledSpinBox()
@@ -1438,9 +1439,12 @@ class MainWindow(QMainWindow):
 
         self.feature_type_label = StyledLabel("特征描述子:", font_size=11, color=C["text_secondary"])
         self.feature_type_combo = StyledComboBox()
-        self.feature_type_combo.addItems(["ORB+E+EM", "SIFT+EM"])
-        self.feature_type_combo.setToolTip("特征描述子：ORB+E（本质矩阵）+ EM（期望最大化算法）快速（二进制/Hamming）；SIFT+EM（期望最大化算法） 更稳健但较慢（浮点/L2）。")
-        self.pose_estimator_combo.currentTextChanged.connect(self._on_pose_estimator_changed)
+        self.feature_type_combo.addItems(["ORB（快）", "SIFT（稳）"])
+        self.feature_type_combo.setToolTip(
+            "ORB：二进制描述子，使用 Hamming 距离匹配，速度快。<br>"
+            "SIFT：浮点描述子，使用 L2 距离匹配，更稳健但较慢。<br><br>"
+            "完整流程：提取图像特征 → E 本质矩阵初始化 → 三角化、PnP 重定位 → EM 加权 BA。"
+        )
 
         form.addRow(StyledLabel("采样模式:", font_size=11, color=C["text_secondary"]), self.sampling_combo)
         form.addRow(StyledLabel("采样帧率:", font_size=11, color=C["text_secondary"]), self.fps_spin)
