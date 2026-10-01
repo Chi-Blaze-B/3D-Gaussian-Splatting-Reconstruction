@@ -1,13 +1,13 @@
 """
 3D Gaussian Splatting 的 PLY 导出工具。
 
-将高斯参数写入与官方 3DGS 查看器兼容的 .ply 文件
+写出与官方 3DGS 查看器兼容的 .ply 文件
 （https://github.com/graphdeco-inria/gaussian-splatting）。
 
-字段名与数值约定完全对齐官方 save_ply：
+字段约定（与官方 save_ply 完全对齐）：
   x y z nx ny nz f_dc_0..2 f_rest_0..44 opacity scale_0..2 rot_0..3
-  nx/ny/nz = 0（法线未用）；scale 存 log σ；opacity 存 logit（未过 sigmoid）；
-  SH 存原始系数（通道 0 已是 (RGB-0.5)/C0，求值方补 +0.5）；rot 存 (w,x,y,z)。
+  nx/ny/nz = 0；scale 存 log σ；opacity 存 logit（未过 sigmoid）；
+  SH 存原始系数（DC 通道已是 (RGB-0.5)/C0）；rot 存 (w,x,y,z)。
 """
 
 import logging
@@ -32,13 +32,13 @@ def write_ply(
 
     参数
     ----------
-    output_path : str — 目标 .ply 文件路径。
-    positions : (N, 3) float32 — XYZ 坐标。
-    scales : (N,), (N, 1) 或 (N, 3) float32 — 原始 log σ（不要传 exp 后的线性尺度）。
-    opacities : (N,) float32 — 原始 logit（不要传 sigmoid 后的概率）。
+    output_path : str — 目标 .ply 路径。
+    positions : (N, 3) float32 — XYZ。
+    scales : (N,), (N, 1) 或 (N, 3) float32 — 原始 log σ（不要传 exp 后）。
+    opacities : (N,) float32 — 原始 logit（不要传 sigmoid 后）。
     rotations : (N, 4) float32 — 四元数 (w, x, y, z)。
-    sh_coeffs : (N, num_bases, 3) float32 — 原始 SH 系数（通道 0 已按 (RGB-0.5)/C0）。
-    sh_degree : int — 最大 SH 阶数；决定写入多少 f_rest 字段（((deg+1)²-1)×3）。
+    sh_coeffs : (N, num_bases, 3) float32 — 原始 SH 系数。
+    sh_degree : int — 最大 SH 阶数，决定写入多少 f_rest 字段。
     """
     N = positions.shape[0]
 
@@ -46,7 +46,7 @@ def write_ply(
     if sh_coeffs.ndim == 2:
         sh_coeffs = sh_coeffs[:, np.newaxis, :]  # (N, 1, 3)
 
-    # 按 sh_degree 截断/补齐，保证声明阶数与实际字段一致（--sh-degree 0 → 无 f_rest 字段）
+    # 按 sh_degree 截断/补齐，保证声明阶数与实际字段一致
     target_bases = (sh_degree + 1) ** 2
     current_bases = sh_coeffs.shape[1]
     if current_bases < target_bases:
@@ -61,10 +61,10 @@ def write_ply(
     elif scales.shape[1] == 1:
         scales = np.hstack([scales, scales, scales])
 
-    # f_rest 通道主序：rest [N, target_bases-1, 3] → [N,3,rest] → 扁平 45（SH3）
+    # f_rest 通道主序：rest [N, target_bases-1, 3] → [N,3,rest] → 扁平
     # f_rest_{c*n+b} = sh_coeffs[:, 1+b, c]
-    rest = sh_coeffs[:, 1:, :]                      # [N, n_rest_bases, 3]
-    rest_cm = rest.transpose(0, 2, 1)               # [N, 3, n_rest_bases]
+    rest = sh_coeffs[:, 1:, :]
+    rest_cm = rest.transpose(0, 2, 1)
     n_rest = rest_cm.shape[1] * rest_cm.shape[2]
     rest_flat = rest_cm.reshape(N, n_rest)
 
@@ -111,11 +111,10 @@ def write_ply(
 
     data = np.zeros(N, dtype=dtype_fields)
 
-    # 位置
+    # 位置（nx/ny/nz 保持 0）
     data["x"] = positions[:, 0].astype(np.float32)
     data["y"] = positions[:, 1].astype(np.float32)
     data["z"] = positions[:, 2].astype(np.float32)
-    # nx/ny/nz 保持 0（官方格式法线未用）
 
     # SH DC（通道 0，已是 (RGB-0.5)/C0）
     data["f_dc_0"] = sh_coeffs[:, 0, 0].astype(np.float32)
@@ -131,7 +130,7 @@ def write_ply(
     data["scale_0"] = scales[:, 0].astype(np.float32)
     data["scale_1"] = scales[:, 1].astype(np.float32)
     data["scale_2"] = scales[:, 2].astype(np.float32)
-    # 旋转（w,x,y,z → 官方 rot_0..3 = w,x,y,z）
+    # 旋转（官方 rot_0..3 = w,x,y,z）
     data["rot_0"] = rotations[:, 0].astype(np.float32)
     data["rot_1"] = rotations[:, 1].astype(np.float32)
     data["rot_2"] = rotations[:, 2].astype(np.float32)
@@ -150,10 +149,7 @@ def export_training_checkpoint(
     output_path: str,
     sh_degree: Optional[int] = None,
 ) -> None:
-    """把当前训练状态导出为 PLY。
-
-    sh_degree 为 None 时使用 trainer.sh_degree（默认 3）。
-    """
+    """把当前训练状态导出为 PLY。sh_degree 为 None 时用 trainer.sh_degree。"""
     if sh_degree is None:
         sh_degree = getattr(trainer, "sh_degree", 3)
     p = trainer.gaussians.export_ply_dict()

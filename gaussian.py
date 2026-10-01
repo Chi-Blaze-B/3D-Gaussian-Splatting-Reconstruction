@@ -116,12 +116,9 @@ def _detect_system_memory_gb() -> float:
     return 0.0
 
 
-
 @dataclass
 class RenderConfig:
-    """
-    光栅化器与高斯数量上限的硬件相关配置。
-    """
+    """光栅化器与高斯数量上限的硬件相关配置。"""
     raster_chunk: int
     radius_max: int
     max_gaussians: int
@@ -131,7 +128,6 @@ class RenderConfig:
     @property
     def max_span(self) -> int:
         return 2 * self.radius_max + 1
-
 
 
 def _tune_for_gpu(vram_gb: float) -> RenderConfig:
@@ -166,14 +162,11 @@ def _tune_for_cpu(ram_gb: float) -> RenderConfig:
     return RenderConfig(192, 4, 600_000, "cpu", ram_gb)
 
 
-
 def auto_tune_config(device: Optional[str] = None,
                      vram_gb: Optional[float] = None,
                      ram_gb: Optional[float] = None,
                      device_index: int = 0) -> RenderConfig:
-    """
-    按训练设备自动推导渲染配置。
-    """
+    """按训练设备自动推导渲染配置。"""
     if device is None or device == "auto":
         use_cuda = torch.cuda.is_available()
     else:
@@ -240,13 +233,17 @@ def _load_frame_raw(path: str) -> np.ndarray:
 
 
 class LazyFrames:
-    """帧容器：预载 uint8，按需转 float32。"""
+    """帧容器：预载 uint8，按需转 float32。
+
+    LRU 缓存同样以 uint8 存储，避免调用方按 uint8 估算内存、
+    实际缓存 float32 造成 4 倍超支。
+    """
 
     def __init__(self, sources: List[Union[str, np.ndarray]], preload: bool = True,
                  cache_size: int = 0):
         self._sources = sources
         self._cache_size = max(0, cache_size)
-        self._cache: OrderedDict = OrderedDict()
+        self._cache: OrderedDict = OrderedDict()  # src -> uint8 ndarray
         self._raw: Optional[List[Optional[np.ndarray]]] = None
         self._hits = 0
         self._misses = 0
@@ -274,19 +271,29 @@ class LazyFrames:
         src = self._sources[idx]
         if not isinstance(src, str):
             return src
+
         if self._cache_size > 0:
             cached = self._cache.get(src)
             if cached is not None:
                 self._hits += 1
                 self._cache.move_to_end(src)
-                return cached
+                return cached.astype(np.float32) / 255.0
             self._misses += 1
-            img = self._convert(src, idx)
-            self._cache[src] = img
+            raw = self._load_raw(src, idx)
+            self._cache[src] = raw
             if len(self._cache) > self._cache_size:
                 self._cache.popitem(last=False)
-            return img
+            return raw.astype(np.float32) / 255.0
+
         return self._convert(src, idx)
+
+    def _load_raw(self, src: str, idx: int) -> np.ndarray:
+        """优先从预载 _raw 取 uint8；缺失时读盘。"""
+        if self._raw is not None:
+            raw = self._raw[idx]
+            if raw is not None:
+                return raw
+        return _load_frame_raw(src)
 
     def _convert(self, src: str, idx: int) -> np.ndarray:
         raw_frame = self._raw[idx] if self._raw is not None else None
@@ -464,6 +471,7 @@ def densify_initial_gaussians(gaussians: Gaussian3D, expansion_factor: int = 8, 
 
 # ---------- 可微光栅化器 ----------
 class DifferentiableRasterizer(nn.Module):
+    """分块 splatting：一次遍历所有高斯，每块只覆盖其包围盒内的像素。"""
 
     def __init__(self, image_width: int, image_height: int,
                  raster_chunk: int, radius_max: int):
@@ -520,7 +528,7 @@ class DifferentiableRasterizer(nn.Module):
         u = fx * (x_c / z) + cx
         v = fy * (y_c / z) + cy
 
-        # 2D 协方差 —— 保留梯度
+        # 2D 协方差（保留梯度）
         B = torch.zeros(N, 2, 3, dtype=cov3d.dtype, device=cov3d.device)
         B[:, 0, 0] = fx / z
         B[:, 0, 2] = -fx * x_c / (z * z)
@@ -912,6 +920,7 @@ class Trainer:
 
     def step(self, target_image: Union[np.ndarray, torch.Tensor],
              camera_pose: Optional[np.ndarray] = None) -> float:
+        """单步训练：渲染 → L1+SSIM → 反传 → 更新 → 密度自适应。"""
         if camera_pose is not None:
             self.view_matrix = torch.from_numpy(camera_pose.astype(np.float32)).to(self.device)
 
@@ -1028,6 +1037,7 @@ class Trainer:
                     checkpoint_path: Optional[str] = None,
                     start_frame: int = 0,
                     progress_callback: Optional[Callable[[int, int, float], None]] = None) -> float:
+        """遍历所有帧训练一轮；None 位姿的帧跳过。"""
         total_loss = 0.0
         processed_count = 0
 
@@ -1079,6 +1089,7 @@ class Trainer:
                 torch.cuda.empty_cache()
 
     def save_training_state(self, path: str) -> None:
+        """把参数、优化器状态、渲染配置等全部落盘。"""
         if self.train_focal:
             fx_val = self.fx.item() if isinstance(self.fx, torch.Tensor) else self.fx
             fy_val = self.fy.item() if isinstance(self.fy, torch.Tensor) else self.fy
@@ -1152,6 +1163,7 @@ class Trainer:
             torch.cuda.empty_cache()
 
     def load_training_state(self, path: str, device: str = "cpu") -> None:
+        """从检查点恢复所有训练状态（先释放旧参数再加载）。"""
         device = torch.device(device)
 
         self._release_training_state()
@@ -1291,6 +1303,7 @@ class AdaptiveDensityController:
         return self._log_scale_thresh
 
     def step(self) -> None:
+        """累积梯度 / 透明度，按节奏触发稠密化或修剪。"""
         self._step_count += 1
         self._cadence += 1
         g = self.trainer.gaussians
@@ -1432,7 +1445,7 @@ class AdaptiveDensityController:
         return stats
 
     def prune(self, target_remove: Optional[int] = None, enforce_cap: bool = False) -> int:
-        """按透明度阈值修剪高斯；enforce_cap=True 时改为硬裁剪到 max_gaussians。"""
+        """按透明度阈值修剪高斯；enforce_cap=True 时硬裁剪到 max_gaussians。"""
         g = self.trainer.gaussians
         n = g.num_gaussians
         if n == 0:

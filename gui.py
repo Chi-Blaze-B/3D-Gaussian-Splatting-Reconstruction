@@ -51,7 +51,7 @@ from PySide6.QtCore import Qt, QThread, Signal, QPoint, QPropertyAnimation, QTim
 from PySide6.QtGui import QPixmap, QImage, QFont, QColor, QPainter
 
 from frames import extract_frames
-from poses import estimate_poses, CameraPose
+from poses import estimate_poses, CameraPose, FrameStatus
 from point_cloud import initialize_gaussians, sample_point_colors
 from gaussian import (
     Gaussian3D, Trainer, LazyFrames, LossDivergenceError,
@@ -63,7 +63,6 @@ from exporter import export_training_checkpoint
 # ---------------------------------------------------------------------------
 # 设计系统
 # ---------------------------------------------------------------------------
-
 C = {
     "bg":             "#0f1724",
     "bg_sidebar":     "#141e2c",
@@ -114,6 +113,8 @@ def input_fg():
 # ---------------------------------------------------------------------------
 
 class RoundedCard(QFrame):
+    """带圆角与阴影的卡片容器。"""
+
     def __init__(self, parent=None):
         super().__init__(parent)
         self.setStyleSheet(card_bg())
@@ -138,6 +139,8 @@ class StyledLabel(QLabel):
 
 
 class StyledSpinBox(QWidget):
+    """带 +/- 按钮的整数输入框。"""
+
     valueChanged = Signal(int)
 
     def __init__(self, parent=None):
@@ -236,6 +239,8 @@ class StyledSpinBox(QWidget):
 
 
 class StyledDoubleSpinBox(QWidget):
+    """带 +/- 按钮的浮点输入框。"""
+
     valueChanged = Signal(float)
 
     def __init__(self, parent=None):
@@ -336,6 +341,8 @@ class StyledDoubleSpinBox(QWidget):
 
 
 class StyledComboBox(QWidget):
+    """自绘下拉框，弹出独立 QFrame 列表。"""
+
     currentTextChanged = Signal(str)
 
     def __init__(self, parent=None):
@@ -524,6 +531,8 @@ class ThinProgressBar(QProgressBar):
 
 
 class StatusDot(QWidget):
+    """状态圆点：idle 灰 / running 绿 / error 红 / done 绿。"""
+
     def __init__(self, status="idle", parent=None):
         super().__init__(parent)
         self.setFixedSize(10, 10)
@@ -564,6 +573,8 @@ class LogViewer(QTextEdit):
 
 
 class PreviewImage(QLabel):
+    """视频预览占位图。"""
+
     def __init__(self, parent=None):
         super().__init__(parent)
         self.setMinimumSize(360, 260)
@@ -587,6 +598,8 @@ class PreviewImage(QLabel):
 # ---------------------------------------------------------------------------
 
 class LossCurvePage(QWidget):
+    """两幅 matplotlib 图：帧损失 + 轮次平均损失。"""
+
     def __init__(self, parent=None):
         super().__init__(parent)
         layout = QVBoxLayout(self)
@@ -723,6 +736,8 @@ class LossCurvePage(QWidget):
 # ---------------------------------------------------------------------------
 
 class PipelineWorker(QThread):
+    """后台执行完整流水线（提取帧 → 位姿 → 高斯 → 训练 → 导出）。"""
+
     log_signal = Signal(str)
     progress_signal = Signal(int, str)
     finished_signal = Signal(bool, str)
@@ -778,8 +793,19 @@ class PipelineWorker(QThread):
         frame_dir = workdir / "frames"
         poses_dir = workdir / "poses"
 
-        has_frames = (workdir / "frame_paths.txt").exists() and frame_dir.exists() and any(frame_dir.iterdir())
-        has_poses = (workdir / "intrinsics.npy").exists() and (workdir / "sparse_points.npy").exists()
+        # ---- 缓存存在性判定 ----
+        # has_poses 必须同时具备 intrinsics / poses / sparse_points 三件套，
+        # 否则下游会读到不完整的旧结果。
+        has_frames = (
+            (workdir / "frame_paths.txt").exists()
+            and frame_dir.exists()
+            and any(frame_dir.iterdir())
+        )
+        has_poses = (
+            (workdir / "intrinsics.npy").exists()
+            and (workdir / "poses.npy").exists()
+            and (workdir / "sparse_points.npy").exists()
+        )
         has_gaussians = (workdir / "gaussian_params.npz").exists()
         has_training_state = (workdir / "training_state.pt").exists()
         can_resume = has_frames and has_poses and has_gaussians
@@ -790,19 +816,64 @@ class PipelineWorker(QThread):
 
         import json as _json
         meta_path = workdir / "frame_meta.json"
-        old_scale_val = None
+
         if has_frames and meta_path.exists():
             try:
-                old_scale_val = _json.loads(meta_path.read_text()).get("scale")
+                _old_meta = _json.loads(meta_path.read_text())
             except Exception:
-                old_scale_val = None
-            if old_scale_val is not None and abs(float(old_scale_val) - float(c["scale"])) >= 1e-6:
+                _old_meta = {}
+
+            _mismatch_reasons = []
+            _old_video = _old_meta.get("video")
+            _old_scale = _old_meta.get("scale")
+            _old_fps = _old_meta.get("fps")
+            _old_sampling = _old_meta.get("sampling_mode")
+            _old_feature = _old_meta.get("feature_type")
+
+            if _old_video is not None and os.path.abspath(str(_old_video)) != os.path.abspath(c["video"]):
+                _mismatch_reasons.append(
+                    f"video {os.path.basename(str(_old_video))} → {os.path.basename(c['video'])}"
+                )
+            if _old_scale is not None and abs(float(_old_scale) - float(c["scale"])) >= 1e-6:
+                _mismatch_reasons.append(f"scale {_old_scale} → {c['scale']:.2f}")
+            if _old_fps is not None and abs(float(_old_fps) - float(c["fps"])) >= 1e-6:
+                _mismatch_reasons.append(f"fps {_old_fps} → {c['fps']}")
+            if _old_sampling is not None and _old_sampling != c["sampling_mode"]:
+                _mismatch_reasons.append(
+                    f"sampling_mode {_old_sampling} → {c['sampling_mode']}"
+                )
+            if _old_feature is not None and _old_feature != c.get("feature_type", "orb"):
+                _mismatch_reasons.append(
+                    f"feature_type {_old_feature} → {c.get('feature_type', 'orb')}"
+                )
+
+            if _mismatch_reasons:
                 self._log(
-                    f"  ⚠️  工作目录已有 scale={old_scale_val} 提取的旧帧，与当前 scale={c['scale']:.2f} 不符，重新提取帧"
+                    f"  ⚠️  提取参数变化（{'; '.join(_mismatch_reasons)}），"
+                    f"重新提取帧并作废下游缓存（位姿 / 高斯 / 检查点）"
                 )
                 has_frames = False
+                has_poses = False
+                has_gaussians = False
+                has_training_state = False
+                can_resume = False
+                # 与提取参数强绑定的文件全部作废，避免误用
+                for _stale in (
+                    workdir / "training_state.pt",
+                    workdir / "best_training_state.pt",
+                    workdir / "gaussian_params.npz",
+                    workdir / "intrinsics.npy",
+                    workdir / "poses.npy",
+                    workdir / "sparse_points.npy",
+                ):
+                    try:
+                        if _stale.exists():
+                            _stale.unlink()
+                            self._log(f"  🗑  已删除过期文件 {_stale.name}")
+                    except OSError as _e:
+                        self._log(f"  ⚠️  无法删除过期文件 {_stale.name}: {_e}")
         elif has_frames:
-            self._log(f"  提示: 复用旧帧（无 frame_meta.json，未校验缩放比例）")
+            self._log("  提示: 复用旧帧（无 frame_meta.json，未校验提取参数）")
 
         if has_frames:
             frame_paths = [p.strip() for p in (workdir / "frame_paths.txt").read_text().splitlines()]
@@ -825,13 +896,41 @@ class PipelineWorker(QThread):
                 feature_type=c.get("feature_type", "orb"),
             )
             (workdir / "frame_paths.txt").write_text("\n".join(frame_paths))
-            meta_path.write_text(_json.dumps({"scale": c["scale"], "fps": c["fps"]}))
+            meta_path.write_text(_json.dumps({
+                "video": os.path.abspath(c["video"]),
+                "scale": c["scale"],
+                "fps": c["fps"],
+                "sampling_mode": c["sampling_mode"],
+                "feature_type": c.get("feature_type", "orb"),
+            }))
             self._log(f"  已提取 {len(frame_paths)} 帧")
 
         self.frame_paths_signal.emit(frame_paths)
 
         self._set_progress(10, f"{len(frame_paths)} 帧就绪")
-        frames = LazyFrames(frame_paths)
+
+        # ---- 帧容器：按估算内存选 preload / LRU ----
+        def _estimate_frame_mb(paths):
+            """粗略估算单帧 RGB uint8 内存占用（MB），与 LazyFrames LRU
+            缓存单位对齐（缓存 uint8，读取时才转 float32）。"""
+            try:
+                img = cv2.imread(paths[0], cv2.IMREAD_COLOR)
+                if img is None:
+                    return 6.0  # 1080p RGB uint8 估算
+                return img.shape[0] * img.shape[1] * 3 / (1024 ** 2)
+            except Exception:
+                return 6.0
+
+        _per_frame_mb = _estimate_frame_mb(frame_paths)
+        _total_mb = _per_frame_mb * len(frame_paths)
+        if _total_mb > 4096:
+            _cache_n = min(512, max(128, len(frame_paths) // 2))
+            frames = LazyFrames(frame_paths, preload=False, cache_size=_cache_n)
+            self._log(f"  ⚠️  帧缓存约 {_total_mb:.0f}MB > 4GB，启用 LRU 滑窗（{_cache_n} 帧上限）")
+        else:
+            frames = LazyFrames(frame_paths, preload=True)
+            self._log(f"  帧缓存：全量预加载（约 {_total_mb:.0f}MB）")
+
         h, w = frames[0].shape[:2]
         self._log(f"  分辨率: {w}x{h}")
 
@@ -839,23 +938,30 @@ class PipelineWorker(QThread):
         self._log("\n[2/5] 正在估算相机位姿...")
         self._set_progress(20, "正在估算相机位姿...")
 
+        sfm_result = None
+
         if has_poses:
             K = np.load(workdir / "intrinsics.npy")
             poses_data = np.load(workdir / "poses.npy")
             sparse_points = np.load(workdir / "sparse_points.npy")
+
             poses = []
-            if poses_data.shape[0] == len(frame_paths):
-                for p in poses_data:
-                    if np.isnan(p).any():
-                        poses.append(None)
-                    else:
-                        poses.append(CameraPose(R=p[:3, :3].copy(), t=p[:3, 3].copy()))
-            else:
-                for p in poses_data:
-                    poses.append(CameraPose(R=p[:3, :3].copy(), t=p[:3, 3].copy()))
-                while len(poses) < len(frame_paths):
+            for p in poses_data:
+                if np.isnan(p).any():
                     poses.append(None)
-            self._log(f"  已加载 {len(poses)} 个位姿（跳过估算）")
+                else:
+                    poses.append(CameraPose(R=p[:3, :3].copy(), t=p[:3, 3].copy()))
+
+            # 与 frame_paths 对齐：多截断、少补 None，避免 NaN 位姿进入 Trainer
+            if len(poses) > len(frame_paths):
+                poses = poses[:len(frame_paths)]
+            while len(poses) < len(frame_paths):
+                poses.append(None)
+
+            n_loaded_valid = sum(1 for p in poses if p is not None)
+            self._log(
+                f"  已加载位姿缓存：{len(poses)} 帧（有效 {n_loaded_valid}），跳过估算"
+            )
         else:
             focal_guess = None
             if c.get("use_focal_guess"):
@@ -880,14 +986,38 @@ class PipelineWorker(QThread):
                 feature_type = c.get("feature_type", "orb")
                 label = "SIFT+E+EM-BA" if feature_type == "sift" else "ORB+E+EM-BA"
                 self._log(f"  使用 {label} 进行位姿估算...")
-                intrinsics, poses, sparse_points = estimate_poses(
-                    frame_paths,
-                    min_inliers=25,
-                    feature_type=feature_type,
-                    focal_guess=focal_guess,
-                    aspect_ratio=1.0,
-                )
-                K = intrinsics.K
+                try:
+                    sfm_result = estimate_poses(
+                        frame_paths,
+                        min_inliers=25,
+                        feature_type=feature_type,
+                        focal_guess=focal_guess,
+                        aspect_ratio=1.0,
+                        # [B1]
+                        enable_loop=c.get("enable_loop", True),
+                        enable_pgo=c.get("enable_pgo", True),
+                    )
+                    K = sfm_result.intrinsics.K
+                    poses = sfm_result.poses
+                    sparse_points = sfm_result.xyz
+                except RuntimeError as e:
+                    self._log(f"  [ERROR] 位姿估算失败: {e}")
+                    self._log("  建议改用 COLMAP（--pose-estimator colmap），或更换素材（提高平移、减少纯旋转、增加纹理）。")
+                    self.finished_signal.emit(False, f"位姿估算失败: {e}")
+                    return
+
+                if sfm_result.frame_status is not None:
+                    from collections import Counter as _Counter
+                    _st = _Counter(sfm_result.frame_status)
+                    self._log(f"  SfM 帧状态: {dict(_st)}")
+                    self._log(f"  SfM 关键帧: {len(sfm_result.keyframes)} / {len(frame_paths)}")
+                    self._log(f"  SfM 回环: {len(sfm_result.loop_closures)} 处")
+                    _n_lost = _st.get(FrameStatus.LOST, 0) + _st.get(FrameStatus.INVALID, 0)
+                    if _n_lost > len(frame_paths) * 0.3:
+                        self._log(
+                            f"  ⚠️  超过 30% 的帧丢失/无效（{_n_lost} / {len(frame_paths)}），"
+                            f"建议改用 COLMAP 或更换素材。"
+                        )
 
             np.save(workdir / "intrinsics.npy", K)
             poses_arr = np.full((len(poses), 4, 4), np.nan, dtype=np.float32)
@@ -895,14 +1025,23 @@ class PipelineWorker(QThread):
                 if p is not None:
                     poses_arr[i] = p.RT
             np.save(workdir / "poses.npy", poses_arr)
-            if sparse_points is not None and sparse_points.size > 0:
-                np.save(workdir / "sparse_points.npy", sparse_points)
+
+            # 空点云也写盘：has_poses 依赖此文件存在
+            if sparse_points is None:
+                sparse_points = np.zeros((0, 3), dtype=np.float32)
+            np.save(workdir / "sparse_points.npy", sparse_points)
 
         while len(poses) < len(frame_paths):
             poses.append(None)
-        valid_count = sum(1 for p in poses if p is not None)
+        if sfm_result is not None and sfm_result.frame_status is not None:
+            _lost_or_invalid = sum(
+                1 for _st in sfm_result.frame_status
+                if _st in (FrameStatus.LOST, FrameStatus.INVALID)
+            )
+            valid_count = len(frame_paths) - _lost_or_invalid
+        else:
+            valid_count = sum(1 for p in poses if p is not None)
         self._log(f"  {valid_count} 个有效位姿 (共 {len(frame_paths)} 帧)")
-        self._set_progress(30, "位姿估算完成")
 
         if valid_count < 3:
             self._log("  错误: 有效位姿太少，请检查视频质量")
@@ -913,18 +1052,78 @@ class PipelineWorker(QThread):
         self._log("\n[3/5] 正在初始化3D高斯...")
         self._set_progress(35, "正在初始化高斯...")
 
+        gauss_init = None
+        gauss_init_file = workdir / "gaussian_params.npz"
         if has_gaussians:
-            params = dict(np.load(workdir / "gaussian_params.npz"))
-            gauss_init = {k: params[k] for k in ["positions", "scales", "opacities", "sh_coeffs", "rotations", "scale_domain"]}
-            self._log(f"  已加载 {params['positions'].shape[0]} 个高斯（跳过初始化）")
-        else:
-            class _I:
-                pass
-            _i = _I()
-            _i.K = K
-            colors, counts = sample_point_colors(sparse_points, poses, frames, _i)
+            try:
+                params = dict(np.load(gauss_init_file))
+                required = ("positions", "scales", "opacities", "sh_coeffs", "rotations")
+                missing = [k for k in required if k not in params]
+                if missing:
+                    self._log(f"  ⚠️  gaussian_params.npz 缺少键 {missing}，重新初始化")
+                    has_gaussians = False
+                else:
+                    n_loaded = int(params["positions"].shape[0])
+                    if n_loaded == 0:
+                        # 早期版本可能写入空 npz，加载它会直接训练出空 PLY
+                        self._log("  ⚠️  gaussian_params.npz 为空（0 个高斯），删除并重新初始化")
+                        try:
+                            gauss_init_file.unlink()
+                        except OSError as e:
+                            self._log(f"  ⚠️  删除空 npz 失败: {e}")
+                        has_gaussians = False
+                        can_resume = False
+                    else:
+                        gauss_init = {k: params[k] for k in required}
+                        self._log(f"  已加载 {n_loaded} 个高斯（跳过初始化）")
+            except Exception as e:
+                self._log(f"  ⚠️  读取 gaussian_params.npz 失败: {e}，重新初始化")
+                has_gaussians = False
+
+        if gauss_init is None:
+            # 本轮刚跑完 SfM 时优先复用其内建颜色 / 观测计数，省掉全量帧读取
+            use_sfm_colors = (
+                sfm_result is not None
+                and sfm_result.rgb is not None
+                and len(sfm_result.rgb) == len(sparse_points)
+            )
+
+            if use_sfm_colors:
+                colors = np.asarray(sfm_result.rgb, dtype=np.uint8)
+                if (sfm_result.obs_per_point is not None
+                        and len(sfm_result.obs_per_point) == len(sparse_points)):
+                    counts = np.array([len(o) for o in sfm_result.obs_per_point], dtype=np.int32)
+                else:
+                    counts = np.ones(len(sparse_points), dtype=np.int32)
+                self._log(f"  复用 SfM 内建颜色（{len(colors)} 点，无需重采样）")
+            else:
+                class _I:
+                    pass
+                _i = _I()
+                _i.K = K
+                colors, counts = sample_point_colors(sparse_points, poses, frames, _i)
+                self._log(f"  从帧重采样颜色（{len(colors)} 点）")
+
             gauss_init = initialize_gaussians(sparse_points, colors, counts)
-            np.savez(workdir / "gaussian_params.npz", **gauss_init)
+
+            num_gs = int(gauss_init["positions"].shape[0])
+            if num_gs == 0:
+                # 0 高斯会训练出无意义的空 PLY，直接退出
+                self._log(
+                    f"  [ERROR] 初始化高斯数为 0：sparse_points={len(sparse_points)}，"
+                    f"colors={len(colors)}。"
+                )
+                self._log(
+                    "  可能原因：SfM 未产出有效点云，或点云被全部剔除。"
+                    "请检查视频质量，或改用 COLMAP 后端。"
+                )
+                self.finished_signal.emit(False, "初始化高斯数为 0")
+                return
+
+            np.savez(gauss_init_file, **gauss_init)
+
+            if sfm_result is not None and sfm_result.keyframes:
+                self._log(f"  SfM 关键帧: {len(sfm_result.keyframes)} / {len(frame_paths)}")
 
         num_gs = gauss_init["positions"].shape[0]
         self._log(f"  共 {num_gs} 个高斯")
@@ -962,7 +1161,24 @@ class PipelineWorker(QThread):
             use_amp=c.get("amp", False),
         )
 
-        train_poses = [p.RT.astype(np.float32) if p is not None else None for p in poses]
+        # [A1] LOST / INVALID 帧不喂给训练
+        if sfm_result is not None and sfm_result.frame_status is not None:
+            _statuses = sfm_result.frame_status
+            train_poses = []
+            _n_lost = 0
+            for _i in range(len(frame_paths)):
+                _p = poses[_i] if _i < len(poses) else None
+                _st = _statuses[_i] if _i < len(_statuses) else None
+                if _p is None or _st in (FrameStatus.LOST, FrameStatus.INVALID):
+                    train_poses.append(None)
+                    _n_lost += 1
+                else:
+                    train_poses.append(_p.RT.astype(np.float32))
+            if _n_lost > 0:
+                self._log(f"  训练位姿过滤：跳过 {_n_lost}/{len(frame_paths)} 帧（LOST / INVALID）")
+        else:
+            train_poses = [p.RT.astype(np.float32) if p is not None else None for p in poses]
+
         start_epoch = 1
         start_frame = 0
         pt_ckpt = str(workdir / "training_state.pt")
@@ -1020,6 +1236,7 @@ class PipelineWorker(QThread):
                     self.finished_signal.emit(False, "已取消")
                     return
                 except torch.cuda.OutOfMemoryError:
+                    # 显存不足：降低上限、加大修剪、重新训练当前轮
                     self._log(f"\n  [OOM] CUDA 显存不足")
                     self._log("  尝试降低高斯上限并修剪...")
                     current_n = trainer.gaussians.num_gaussians
@@ -1092,6 +1309,8 @@ class PipelineWorker(QThread):
 # ---------------------------------------------------------------------------
 
 class MainWindow(QMainWindow):
+    """左侧参数栏 + 右侧多标签页（帧预览 / 日志 / 损失曲线）。"""
+
     def __init__(self):
         super().__init__()
         self.worker = None
@@ -1104,6 +1323,7 @@ class MainWindow(QMainWindow):
         self._preview_rows = 8
         self._resize_timer = None
         self._current_render_cfg = None
+        self._render_cfg_cache: Dict[str, Any] = {}
         self._build_ui()
         self._apply_theme()
 
@@ -1475,7 +1695,7 @@ class MainWindow(QMainWindow):
             "启用 PyTorch 自动混合精度（AMP）：在 CUDA 上通过 torch.autocast 让适合的算子自动以 FP16 计算，"
             "并用 GradScaler 处理梯度缩放，以加速并降低显存占用。\n"
             "光栅化器、协方差等数值敏感部分仍会保持 FP32，避免影响训练效果。\n"
-            "推荐带 Tensor Core 的 NVIDIA 显卡（Volta架构及以后）；"
+            "推荐带 Tensor Core 的 NVIDIA 显卡（Volta 及以后）；"
             "无 Tensor Core 或低端显卡通常收益很小甚至变慢，建议关闭。\n"
             "仅 CUDA 设备可用。"
         )
@@ -1505,6 +1725,30 @@ class MainWindow(QMainWindow):
         f2.addRow(StyledLabel("位姿估算:", font_size=11, color=C["text_secondary"]), self.pose_estimator_combo)
         f2.addRow(self.feature_type_label, self.feature_type_combo)
         f2.addRow(self.focal_guess_label, self.focal_guess_cb)
+
+        # [B1] 回环 / PGO 开关
+        self.loop_cb = QCheckBox("启用回环检测")
+        self.loop_cb.setChecked(True)
+        self.loop_cb.setStyleSheet(f"color: {C['text_primary']}; font-size: 11px; font-weight: 500;")
+        self.loop_cb.setToolTip(
+            "基于词袋（BoW）+ PnP RANSAC 几何验证检测回环。\n"
+            "短序列或纯前向拍摄可关闭以加速，并避免误回环。\n"
+            "仅在使用 OpenCV 位姿估算时生效。"
+        )
+        self.loop_label = StyledLabel("回环检测:", font_size=11, color=C["text_secondary"])
+
+        self.pgo_cb = QCheckBox("启用位姿图优化")
+        self.pgo_cb.setChecked(True)
+        self.pgo_cb.setStyleSheet(f"color: {C['text_primary']}; font-size: 11px; font-weight: 500;")
+        self.pgo_cb.setToolTip(
+            "在全局 BA 之后对关键帧位姿做位姿图优化（Huber 核）。\n"
+            "无回环时收益有限，可关闭以加速。\n"
+            "仅在使用 OpenCV 位姿估算时生效。"
+        )
+        self.pgo_label = StyledLabel("位姿图优化:", font_size=11, color=C["text_secondary"])
+
+        f2.addRow(self.loop_label, self.loop_cb)
+        f2.addRow(self.pgo_label, self.pgo_cb)
         cl.addLayout(f2)
 
         cl.addWidget(self._make_step_header("高斯训练"))
@@ -1532,9 +1776,16 @@ class MainWindow(QMainWindow):
             device = "cuda" if torch.cuda.is_available() else "cpu"
         return device
 
+    def _get_render_config(self, device: Optional[str] = None):
+        """按设备缓存 auto_tune_config 结果，避免重复探测显存/内存。"""
+        device = device or self._resolve_device()
+        if device not in self._render_cfg_cache:
+            self._render_cfg_cache[device] = auto_tune_config(device=device)
+        return self._render_cfg_cache[device]
+
     def _init_max_gaussians_spinbox(self):
         device = self._resolve_device()
-        cfg = auto_tune_config(device=device)
+        cfg = self._get_render_config(device)
         self._current_render_cfg = cfg
         auto_max = cfg.max_gaussians
         self.max_gaussians_spin.setRange(10000, auto_max)
@@ -1560,6 +1811,10 @@ class MainWindow(QMainWindow):
         self.feature_type_combo.setVisible(not is_colmap)
         self.focal_guess_label.setVisible(not is_colmap)
         self.focal_guess_cb.setVisible(not is_colmap)
+        self.loop_label.setVisible(not is_colmap)
+        self.loop_cb.setVisible(not is_colmap)
+        self.pgo_label.setVisible(not is_colmap)
+        self.pgo_cb.setVisible(not is_colmap)
 
     def _apply_theme(self):
         self.setStyleSheet(f"""
@@ -1594,15 +1849,26 @@ class MainWindow(QMainWindow):
                 self._show_single_preview(path)
 
     def _show_single_preview(self, vp):
+        """读取视频中间帧作为预览；失败时回退到第 0 帧。"""
+        cap = None
         try:
             cap = cv2.VideoCapture(vp)
-            if cap.isOpened():
+            if not cap.isOpened():
+                return
+            total = int(cap.get(cv2.CAP_PROP_FRAME_COUNT) or 0)
+            if total > 1:
+                cap.set(cv2.CAP_PROP_POS_FRAMES, total // 2)
+            ok, frame = cap.read()
+            if not ok:
+                cap.set(cv2.CAP_PROP_POS_FRAMES, 0)
                 ok, frame = cap.read()
-                if ok:
-                    self.preview_widget.set_image(frame)
-                cap.release()
+            if ok:
+                self.preview_widget.set_image(frame)
         except Exception:
             pass
+        finally:
+            if cap is not None:
+                cap.release()
 
     def _on_start(self):
         video = self.video_edit.text().strip()
@@ -1627,7 +1893,7 @@ class MainWindow(QMainWindow):
         pose_estimator = "colmap" if self.pose_estimator_combo.currentIndex() == 1 else "opencv"
         feature_type = "sift" if self.feature_type_combo.currentIndex() == 1 else "orb"
 
-        render_config = auto_tune_config(device=device)
+        render_config = self._get_render_config(device)
         spin_max = self.max_gaussians_spin.value()
         if spin_max != render_config.max_gaussians:
             render_config = replace(render_config, max_gaussians=int(spin_max))
@@ -1643,6 +1909,8 @@ class MainWindow(QMainWindow):
             "max_frames": self.max_frames_spin.value(),
             "num_epochs": self.epochs_spin.value(),
             "use_focal_guess": self.focal_guess_cb.isChecked(),
+            "enable_loop": self.loop_cb.isChecked(),
+            "enable_pgo": self.pgo_cb.isChecked(),
             "sh_degree": sh_degree,
             "sh_warmup_steps": self.sh_warmup_spin.value(),
             "ssim_warmup_steps": self.ssim_warmup_spin.value(),
@@ -1695,6 +1963,9 @@ class MainWindow(QMainWindow):
         self._log(f"🎲  动态背景:  {'是' if config['random_background'] else '否'}")
         self._log(f"🔍  焦距自校准: {'是' if config['train_focal'] else '否'}")
 
+        if config["pose_estimator"] == "opencv":
+            self._log(f"🔁  回环检测:  {'开' if config['enable_loop'] else '关'}")
+            self._log(f"🧭  位姿图优化: {'开' if config['enable_pgo'] else '关'}")
         self.worker = PipelineWorker(config)
         self.worker.log_signal.connect(self._append_log)
         self.worker.progress_signal.connect(self._update_progress)
@@ -1712,6 +1983,8 @@ class MainWindow(QMainWindow):
         self.start_btn.setEnabled(True)
         self.stop_btn.setEnabled(False)
 
+        canceled = (not success) and message == "已取消"
+
         if success:
             self.status_dot.set_status("done")
             self.status_text.setText("完成 ✓")
@@ -1721,6 +1994,13 @@ class MainWindow(QMainWindow):
             self.progress_label.setStyleSheet(f"color: {C['success']}; font-size: 10pt;")
             self._log(f"✅ {message}")
             self._log("🎉 3D 重建完成！请在输出目录查看 PLY 文件。")
+        elif canceled:
+            self.status_dot.set_status("idle")
+            self.status_text.setText("已取消")
+            self.status_text.setStyleSheet(f"color: {C['text_secondary']}; font-size: 10pt;")
+            self.progress_label.setText("已取消")
+            self.progress_label.setStyleSheet(f"color: {C['text_secondary']}; font-size: 10pt;")
+            self._log(f"⏹ {message}")
         else:
             self.status_dot.set_status("error")
             self.status_text.setText("失败 ✗")
@@ -1784,6 +2064,7 @@ class MainWindow(QMainWindow):
         return max(1, (n + self._preview_per_page - 1) // self._preview_per_page)
 
     def _render_preview_page(self):
+        """按当前视口大小重算分页并渲染缩略图。"""
         self._preview_cols = self._compute_preview_cols()
         self._preview_rows = self._compute_preview_rows()
         self._preview_per_page = self._preview_cols * self._preview_rows

@@ -1,9 +1,8 @@
 """
-基于 COLMAP 的位姿估计，用于 3D Gaussian Splatting（优化版）。
+基于 COLMAP 的位姿估计。
 
-封装 COLMAP CLI，依次执行特征提取、匹配与稀疏重建，
-再把结果解析为与 ORB+EM 流程一致的格式
-（CameraPose 列表 + 稀疏点云）。
+封装 COLMAP CLI：特征提取 → 匹配 → 稀疏重建，
+输出与 ORB+EM 流程一致的 (CameraIntrinsics, [CameraPose], sparse_points)。
 """
 
 from __future__ import annotations
@@ -18,7 +17,6 @@ from typing import Dict, List, Optional, Tuple
 
 import numpy as np
 
-# 本地依赖
 try:
     from poses import CameraIntrinsics, CameraPose
 except ImportError:
@@ -33,7 +31,7 @@ def _run_colmap(cmd: List[str], label: str, colmap_bin: str) -> subprocess.Compl
     logger.info("[COLMAP] %s...", label)
     env = dict(os.environ)
 
-    # 清掉父进程（PyQt5 等）注入的 Qt 相关环境变量
+    # 清掉父进程（PyQt5 等）注入的 Qt 环境变量
     for key in list(env.keys()):
         if key.startswith("QT_"):
             del env[key]
@@ -42,7 +40,7 @@ def _run_colmap(cmd: List[str], label: str, colmap_bin: str) -> subprocess.Compl
     existing = env.get("PATH", "")
     env["PATH"] = colmap_bin + os.pathsep + existing
 
-    # 显式为 COLMAP 指定 Qt 插件路径
+    # 显式指定 Qt 插件路径
     plugins_dir = os.path.join(colmap_bin, "..", "plugins")
     if os.path.isdir(plugins_dir):
         env["QT_PLUGIN_PATH"] = plugins_dir
@@ -90,29 +88,22 @@ def estimate_poses_with_colmap(
     """用 COLMAP 估计相机位姿。
 
     参数：
-        frame_paths: 输入帧的绝对路径列表。
-        output_dir: 存放 COLMAP 中间结果的目录。
+        frame_paths: 输入帧绝对路径列表。
+        output_dir: COLMAP 中间结果目录。
         colmap_exe: colmap 可执行文件路径（None 时自动探测）。
-        max_image_size: 特征提取时的图像最大边长。默认 2400（调优最优值）：
-            高分辨率能保留小尺度纹理 → SIFT 匹配更多更好 → 三角化点云更稠密。
-        sift_peak_threshold: SIFT 峰值阈值。
-        sift_edge_threshold: SIFT 边缘阈值。
-        sift_max_num_features: 每张图 SIFT 特征数上限。默认 12000（调优最优值）：
-            特征更多 → 匹配质量更好。注意：长序列会拉长运行时间，
-            超长视频建议改用 --pose-estimator opencv 或降低特征数。
-        matcher: 'exhaustive'（全对匹配，对无序图像集、两阶段采样间距不均的帧更稳，
-            复杂度 O(n²)）或 'sequential'（仅匹配时间相邻帧，视频场景最快）。
-            默认 'exhaustive'（对应调优最优值）。
-        matcher_overlap: sequential 匹配器的重叠窗口（前后各取多少帧）。
-        loop_detection: 启用 sequential 匹配器的回环检测
-            （匹配重访同一场景的远距离帧；需要 vocabulary tree，
-            否则 sequential_matcher 会卡住，故默认关闭）。
+        max_image_size: 特征提取时图像最大边长。默认 2400，保留小尺度纹理。
+        sift_peak_threshold / sift_edge_threshold / sift_max_num_features:
+            SIFT 参数。12000 特征匹配质量更好，长序列会拉长运行时间。
+        matcher: 'exhaustive'（全对匹配，对无序图像集、帧间距不均更稳）
+            或 'sequential'（仅时间相邻帧，视频场景最快）。默认 'exhaustive'。
+        matcher_overlap: sequential 匹配器前后重叠窗口。
+        loop_detection: sequential 匹配器启用回环检测（需要 vocabulary tree，
+            否则会卡住，故默认关闭）。
 
     返回：
-        intrinsics: CameraIntrinsics 对象。
-        poses: CameraPose 列表（未注册帧为 None），
-               长度等于 len(frame_paths)，顺序与 frame_paths 一致。
-        sparse_points: (N,3) numpy 数组，稀疏 3D 点。
+        intrinsics: CameraIntrinsics。
+        poses: CameraPose 列表（未注册帧为 None），长度与 frame_paths 一致。
+        sparse_points: (N,3) 稀疏 3D 点。
     """
     if CameraIntrinsics is None or CameraPose is None:
         raise ImportError("CameraIntrinsics/CameraPose not found. Install poses module.")
@@ -150,20 +141,18 @@ def estimate_poses_with_colmap(
     os.makedirs(sparse_dir, exist_ok=True)
 
     # ------------------------------------------------------------------
-    # 用符号链接（或复制）准备排序后的图像目录：
-    # 既最小化磁盘占用，又保证顺序可预测。
+    # 用符号链接（或复制）准备排序后的图像目录：省磁盘 + 顺序可预测
     # ------------------------------------------------------------------
     tmp_img_dir = str(workdir / "sorted_images")
     if os.path.isdir(tmp_img_dir):
         shutil.rmtree(tmp_img_dir, ignore_errors=True)
     os.makedirs(tmp_img_dir, exist_ok=True)
 
-    # 原始文件名 -> frame_paths 索引
     name_to_frame_idx: Dict[str, int] = {}
     for idx, p in enumerate(frame_paths):
         name_to_frame_idx[Path(p).name] = idx
 
-    # 按文件名排序，保证映射关系：0000.png, 0001.png, ...
+    # 按文件名排序，保持 0000.png, 0001.png, ... 的映射
     sorted_names = sorted(Path(p).name for p in frame_paths)
     src_dir = Path(frame_paths[0]).parent  # 假定所有帧在同一目录
     for idx, name in enumerate(sorted_names):
@@ -193,7 +182,7 @@ def estimate_poses_with_colmap(
         _run_colmap(cmd, "特征提取中", colmap_bin_dir)
 
         # ------------------------------------------------------------------
-        # 从数据库读取 image_id -> 原始文件名映射
+        # 从数据库读取 image_id → 原始文件名映射
         # ------------------------------------------------------------------
         conn = sqlite3.connect(db_path)
         try:
@@ -203,7 +192,7 @@ def estimate_poses_with_colmap(
             id_to_orig_name: Dict[int, str] = {}
             for image_id, seq_name in rows:
                 try:
-                    seq_idx = int(Path(seq_name).stem)      # "0000" -> 0
+                    seq_idx = int(Path(seq_name).stem)      # "0000" → 0
                     orig_name = sorted_names[seq_idx]        # 还原原始文件名
                     id_to_orig_name[image_id] = orig_name
                 except (ValueError, IndexError):
@@ -218,8 +207,7 @@ def estimate_poses_with_colmap(
         # 步骤 2：匹配
         # ------------------------------------------------------------------
         if matcher == "sequential":
-            # 视频序列首选：只匹配时间相邻帧。
-            # 复杂度 O(n·overlap) 而非 O(n²)，且避免把弱基线远距离帧对喂给 mapper。
+            # 视频首选：只匹配时间相邻帧，O(n·overlap)，避免弱基线远帧对污染
             matching_cmd = [
                 colmap_exe_path, "sequential_matcher",
                 "--database_path", db_path,
@@ -250,7 +238,7 @@ def estimate_poses_with_colmap(
             )
             pair_ids = [r[0] for r in c.fetchall()]
             if pair_ids:
-                # pair_id 编码：高 16 位 = image_id1，低 16 位 = image_id2（COLMAP 约定）
+                # pair_id 编码：高 16 位 = image_id1，低 16 位 = image_id2
                 img_ids = set()
                 for pid in pair_ids:
                     img_ids.add(pid >> 16)
@@ -280,10 +268,9 @@ def estimate_poses_with_colmap(
         _run_colmap(cmd, "Mapper（SfM 重建）", colmap_bin_dir)
 
         # ------------------------------------------------------------------
-        # 步骤 4：在 mapper 产出的所有模型中挑最好的。
-        # mapper 可能把场景拆成多个互不连通的子模型（sparse/0, sparse/1, ...）。
-        # model 0 未必最大 —— 可能只是一个几乎无图像/无点的失败种子。
-        # 把每个模型都转成 TXT，选注册图像最多的（并列时比 3D 点数）。
+        # 步骤 4：挑选最佳子模型。
+        # mapper 可能把场景拆成多个互不连通的子模型；model 0 未必最大。
+        # 把每个模型转成 TXT，选注册图像最多的（并列时比 3D 点数）。
         # ------------------------------------------------------------------
         model_ids = sorted(
             int(d.name) for d in Path(sparse_dir).iterdir()
@@ -317,7 +304,6 @@ def estimate_poses_with_colmap(
                 with open(img_txt, "r", encoding="utf-8", errors="ignore") as f:
                     for line in f:
                         s = line.strip()
-                        # 已注册图像行：9+ 个字段且不是 2D 观测行
                         if s and not s.startswith("#") and len(s.split()) >= 9 \
                                 and not s.split()[0].startswith("-"):
                             n_images += 1
@@ -352,8 +338,7 @@ def estimate_poses_with_colmap(
         for frame_idx, pose in poses_dict.items():
             ordered_poses[frame_idx] = pose
 
-        # 不再重复写 workdir/*.npy：顶层保存（定长 NaN 掩码）才是续训源，
-        # 这里再写一份既无人读取，格式也可能与顶层不一致。
+        # 顶层保存（定长 NaN 掩码）才是续训源，此处不再重复写 npy
         valid_poses = [p for p in ordered_poses if p is not None]
 
         best_mid = best_meta[0] if best_meta is not None else -1
@@ -456,7 +441,7 @@ def _parse_images_txt(
         i += 1
         if not line or line.startswith("#"):
             continue
-        # 行对的第一行：IMAGE_ID QW QX QY QZ TX TY TZ CAMERA_ID NAME
+        # 第一行：IMAGE_ID QW QX QY QZ TX TY TZ CAMERA_ID NAME
         parts = line.split(maxsplit=9)
         if len(parts) < 9:
             continue
@@ -487,7 +472,6 @@ def _parse_images_txt(
             if i < len(lines):
                 i += 1
         except (ValueError, IndexError):
-            # 行格式异常，尝试继续
             continue
 
     return poses_map

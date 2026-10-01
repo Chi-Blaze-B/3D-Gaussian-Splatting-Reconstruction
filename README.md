@@ -29,13 +29,12 @@
 **核心光栅化器完全基于 PyTorch 实现**，无需编译 CUDA 扩展，支持 SH 0–3 阶球谐函数，排序式逐像素 splat 向量化。整体流程还依赖 OpenCV、SciPy、PySide6、matplotlib、psutil 等库。
 
 - **纯 PyTorch 光栅化器**：无需编译 CUDA 扩展，支持 SH 0–3 阶，开箱即用。
-- **鲁棒姿态估计**：内置 ORB/SIFT 增量式 SfM，也可选用 COLMAP 后端。
-- **智能采样**：均匀、光流驱动（smart）、两阶段（视差+光流+清晰度）三种策略。
-- **自适应密度控制**：训练中自动分裂/复制/修剪高斯。
+- **鲁棒姿态估计**：内置 ORB/SIFT 增量式 SfM，含 EM-BA、回环检测、PGO、多视图三角化；也可选用 COLMAP 后端。
+- **智能采样**：均匀、光流驱动（smart）、两阶段（视差+光流+清晰度）三种策略，含时间覆盖兜底与分层选择。
+- **自适应密度控制**：训练中自动分裂/复制/修剪高斯，保护高梯度点。
 - **硬件自适应配置**：按实际训练设备自动推导分块、半径与高斯数量上限。
-- **暗色主题 GUI**：实时损失曲线、帧预览、日志输出。
+- **暗色主题 GUI**：实时损失曲线、帧预览、日志输出，支持回环/PGO、AMP 等开关。
 - **断点续训**：保存完整训练状态，恢复时从上次中断帧继续。
-
 ---
 
 ## 📦 安装
@@ -75,6 +74,7 @@
    ```bash
    git clone https://github.com/Chi-Blaze-B/3D-Gaussian-Splatting-Reconstruction
    ```
+
 ## 🚀 使用方式
 
 ### 1. 命令行接口（CLI）
@@ -83,7 +83,6 @@
 ```bash
 python cli.py --video input.mp4 --output output.ply
 ```
-
 #### 常用参数
 
 | 参数 | 说明 | 默认值 |
@@ -104,14 +103,15 @@ python cli.py --video input.mp4 --output output.ply
 | `--ssim-weight-max` | SSIM 最大权重 | `0.2` |
 | `--random-background` | 随机黑白背景 | `False` |
 | `--train-focal` | 训练中微调焦距 | `False` |
-| `--amp` | 混合精度 fp16（需 CUDA + Volta架构及以后显卡） | `False` |
+| `--amp` | 混合精度 fp16（需 CUDA + Volta 架构及以后显卡） | `False` |
 | `--pose-estimator` | opencv / colmap | `opencv` |
 | `--feature-type` | orb / sift（仅 opencv 后端） | `orb` |
 | `--use-focal-guess` | 以 1.0×图像长边作为初始像素焦距（约 53° 长边方向 FOV）传给位姿估计器；仅 `--pose-estimator opencv` 时生效 | `False` |
+| `--no-loop` | 关闭回环检测（默认回环检测开启；短序列 / 纯前向拍摄可关闭，加速并减少误回环风险） | 不传时开启 |
+| `--no-pgo` | 关闭位姿图优化（默认 PGO 开启；无回环时收益有限，可关闭） | 不传时开启 |
 | `--resume-dir` | 从工作目录续训 | `None` |
 | `--eval-every` | 每 N 轮打印日志 | `500` |
 | `--show-config` | 打印硬件自适应配置后退出 | `False` |
-
 #### 示例
 
 ```bash
@@ -125,9 +125,13 @@ python cli.py --video input.mp4 --output out.ply --sampling-mode smart --sh-degr
 python cli.py --video input.mp4 --output out.ply --sampling-mode two-stage --pose-estimator colmap \
     --sh-degree 3 --random-background --train-focal --max-gaussians 500000
 
+# 短序列 / 纯前向拍摄：关闭回环与 PGO 加速
+python cli.py --video input.mp4 --output out.ply --no-loop --no-pgo
+
 # 查看当前设备自适应渲染配置
 python cli.py --video input.mp4 --device cuda --show-config
 ```
+
 ### 2. 图形界面（GUI）
 
 启动 GUI：
@@ -144,18 +148,21 @@ GUI 提供：
 - 帧级和轮次级损失曲线
 - 日志输出、中断训练并保存检查点
 - “使用初始焦距猜测”开关、随机背景、焦距自校准、AMP 等训练选项
+- 回环检测、位姿图优化开关（仅 OpenCV 位姿估计时生效）
 - 自动检测 `training_state.pt` 并续训
 
-**注意**：GUI 提供“使用初始焦距猜测”开关，等价于 CLI 的 `--use-focal-guess`，但不支持自定义像素焦距值。GUI 无 --eval-every 对应控件，日志全量展示。GUI 通过工作目录自动检测 `training_state.pt` 续训，无需类似 `--resume-dir`的配置项。GUI 默认值与 CLI 有差异：训练轮次默认 1000（CLI 为 3000）、SH 阶数默认 3（CLI 为 0）、随机背景默认开（CLI 为 关）、焦距自校准默认开（CLI 为 关）、初始焦距猜测默认开（CLI 为 关），以界面为准。
+**注意**：GUI 提供“使用初始焦距猜测”开关，等价于 CLI 的 `--use-focal-guess`，但不支持自定义像素焦距值。GUI 无 `--eval-every` 对应控件，日志全量展示。GUI 通过工作目录自动检测 `training_state.pt` 续训，无需类似 `--resume-dir` 的配置项。GUI 默认值与 CLI 有差异：训练轮次默认 1000（CLI 为 3000）、SH 阶数默认 3（CLI 为 0）、随机背景默认开（CLI 为关）、焦距自校准默认开（CLI 为关）、初始焦距猜测默认开（CLI 为关），以界面为准。回环检测与 PGO 在 GUI 与 CLI 中均默认开启，CLI 可用 `--no-loop` / `--no-pgo` 关闭。
+---
 
 ## 🧩 核心模块
+
 | 模块 | 功能 |
 |------|------|
-| `frames.py` | 视频帧提取，支持 uniform / smart / two-stage 采样 |
-| `poses.py` | 纯 OpenCV+SciPy 增量式 SfM（ORB/SIFT），带鲁棒 BA |
+| `frames.py` | 视频帧提取，支持 uniform / smart / two-stage 采样；时间覆盖兜底与分层选择 |
+| `poses.py` | 纯 OpenCV+SciPy 增量式 SfM（ORB/SIFT），含 EM-BA、回环检测、PGO、多视图三角化 |
 | `colmap_poses.py` | COLMAP 封装，备选姿态估计后端 |
-| `point_cloud.py` | 稀疏点云初始化高斯参数，离群点剔除 |
-| `gaussian.py` | 3DGS 核心：纯 PyTorch 光栅化器、Trainer、密度控制、硬件自适应 |
+| `point_cloud.py` | 稀疏点云初始化高斯参数，离群点剔除、kNN 尺度估计、多视图颜色采样 |
+| `gaussian.py` | 3DGS 核心：纯 PyTorch 光栅化器、Trainer、自适应密度控制、硬件自适应 |
 | `exporter.py` | 导出标准 PLY，兼容官方查看器 |
 | `gui.py` | PySide6 暗色主题图形界面 |
 | `cli.py` | 命令行入口，集成完整流程 |
@@ -195,7 +202,6 @@ GUI 提供：
 ### 动态场景
 
 3DGS 假设场景静态。移动物体会产生重影/形变，属于方法边界。
-
 ## 🎯 姿态估计后端选择
 
 | 后端 | 命令 | 适用场景 |
@@ -209,6 +215,7 @@ GUI 提供：
 - 短序列（<60 帧）：OpenCV 后端。
 - 长序列（≥60 帧）：优先 COLMAP。
 - 不确定：先用默认 OpenCV + ORB。
+- 回环检测与 PGO 仅 OpenCV 后端可通过 CLI / GUI 控制；COLMAP 后端使用其自身重建流程。
 
 ## 🧠 硬件自适应渲染配置
 
@@ -227,18 +234,18 @@ CPU 分档参考：<8GB 50k、<16GB 100k、<32GB 200k、<64GB 300k、<128GB 400k
 
 ## 📈 训练细节
 
+- **SfM**：ORB/SIFT 增量式，E 矩阵初始化，三角化/PnP 重定位，局部/全局 BA，EM 软内点，回环 BoW+PnP，PGO Huber，多视图 DLT 重三角化，尺度归一化。
 - **损失**：`(1 - w_ssim) * L1 + w_ssim * SSIM`，SSIM 权重线性升温。
-- **密度控制**：按梯度分位数自适应分裂/复制，修剪低不透明度高斯。
+- **密度控制**：按梯度分位数自适应分裂/复制，修剪低不透明度高斯，保护高梯度高斯。
 - **初始稠密化**：高斯少于 2000 时自动 8 倍扩增。
 - **学习率衰减**：指数衰减。
 - **SH 升温**：前 `sh_warmup_steps` 步逐步提升 SH 阶数。
 - **梯度裁剪**：全局范数限制 10.0。
-- **光栅化器**：排序式逐像素 splat 向量化，分块控制显存。
-- **混合精度**：`--amp` 仅 CUDA + Tensor Core（Volta及以后）有收益，默认关闭。
+- **光栅化器**：排序式逐像素 splat 向量化，分块控制显存，支持 SH 0–3。
+- **混合精度**：`--amp` 仅 CUDA + Tensor Core（Volta 及以后）有收益，默认关闭。
 - **帧内存预加载**：训练前预解码为 uint8 RGB，减少磁盘 IO。
 - **Loss 发散保护**：单步 loss 超过阈值时保存检查点并中断。
-- **焦距自校准**：`--train-focal` 时优化 fx、fy。
-
+- **焦距自校准**：`--train-focal` 时优化 fx、fy，带步长与漂移限制。
 ## 💾 断点续训
 
 工作目录保存：
@@ -246,18 +253,19 @@ CPU 分档参考：<8GB 50k、<16GB 100k、<32GB 200k、<64GB 300k、<128GB 400k
 | 文件 | 内容 |
 |------|------|
 | `frame_paths.txt` | 帧路径列表 |
-| `frame_meta.json` | GUI 写入的帧元数据（scale/fps） |
+| `frame_meta.json` | GUI / CLI 写入的帧元数据（video/scale/fps/sampling_mode/feature_type） |
 | `intrinsics.npy`、`poses.npy`、`sparse_points.npy` | 内参、位姿、稀疏点云 |
 | `gaussian_params.npz` | 初始化高斯参数 |
 | `training_state.pt` | 完整训练状态 |
 | `best_training_state.pt` | 历史最优训练状态 |
+| `sparse_points.ply` | 稀疏点云导出（仅 OpenCV 后端生成，可选，供 MeshLab / CloudCompare 检查） |
 
 恢复训练：
 ```bash
 python cli.py --video input.mp4 --resume-dir ./workdir --output restored.ply
 ```
 
-恢复时从上次中断帧继续；高基数不同也可恢复；渲染配置同步恢复。  
+恢复时从上次中断帧继续；高斯数不同也可恢复；渲染配置同步恢复。  
 `best_loss` 从 `training_state.pt` 恢复；`best_training_state.pt` 仅保存历史最优，恢复流程不会自动读取。
 
 ## ⚙️ 高级参数建议
@@ -269,6 +277,8 @@ python cli.py --video input.mp4 --resume-dir ./workdir --output restored.ply
 - `--random-background`：提升前景质量，背景透明区域可能受干扰。
 - `--feature-type sift`：低纹理 / 短序列更稳健，速度慢。
 - `--pose-estimator colmap`：长序列推荐。
+- `--no-loop`：短序列 / 纯前向拍摄可关，加速并减少误回环风险。
+- `--no-pgo`：无回环时收益有限，可关。
 
 ## 📝 注意事项
 
@@ -278,8 +288,8 @@ python cli.py --video input.mp4 --resume-dir ./workdir --output restored.ply
 - 有显卡但想用 CPU 训练时务必显式传 `--device cpu`。
 - 启动时自动绑定所有逻辑核心。
 - 纯 PyTorch 光栅化器无需编译 CUDA 扩展，完成环境配置即可直接运行。
-- `--amp` 仅对Volta架构及以后有 Tensor Core 收益，无 Tensor Core 或低端显卡通常收益很小甚至变慢，建议关闭。
-
+- `--amp` 仅对 Volta 架构及以后有 Tensor Core 收益，无 Tensor Core 或低端显卡通常收益很小甚至变慢，建议关闭。
+- 回环检测与 PGO 默认开启；短序列或纯前向拍摄可关闭以加速。
 ## ⚠️ 已知限制
 
 - 性能数字因硬件、分辨率、场景而异。
