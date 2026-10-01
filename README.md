@@ -3,20 +3,33 @@
   <!-- 项目标题 -->
   <img src="https://img.shields.io/badge/🌟_3D_Gaussian_Splatting-Reconstruction-FF6F00?style=flat-square&logo=github&logoColor=white" alt="Project">
   <br><br>
+
   <!-- 环境与核心依赖 -->
   <img src="https://img.shields.io/badge/Python-3.11-3776AB?style=flat-square&logo=python&logoColor=white" alt="Python">
-  <img src="https://img.shields.io/badge/PyTorch-2.0+-EE4C2C?style=flat-square&logo=pytorch&logoColor=white" alt="PyTorch">
-  <img src="https://img.shields.io/badge/CUDA-11.8+-76B900?style=flat-square&logo=nvidia&logoColor=white" alt="CUDA">
+  <img src="https://img.shields.io/badge/PyTorch-2.0%2B-EE4C2C?style=flat-square&logo=pytorch&logoColor=white" alt="PyTorch">
+  <img src="https://img.shields.io/badge/CUDA-12.1%2B-76B900?style=flat-square&logo=nvidia&logoColor=white" alt="CUDA">
+  <br>
+
+  <!-- 核心第三方库 -->
+  <img src="https://img.shields.io/badge/NumPy-1.24.0%2B-4DABCF?style=flat-square&logo=numpy&logoColor=white" alt="NumPy">
+  <img src="https://img.shields.io/badge/SciPy-1.10.0%2B-8CAAE6?style=flat-square&logo=scipy&logoColor=white" alt="SciPy">
+  <img src="https://img.shields.io/badge/OpenCV-headless_%7C_4.8.0%2B-5C3EE8?style=flat-square&logo=opencv&logoColor=white" alt="OpenCV">
+  <img src="https://img.shields.io/badge/PySide6-6.5.0%2B-41CD52?style=flat-square&logo=qt&logoColor=white" alt="PySide6">
+  <img src="https://img.shields.io/badge/Matplotlib-3.7.0%2B-11557C?style=flat-square&logo=matplotlib&logoColor=white" alt="Matplotlib">
+  <img src="https://img.shields.io/badge/psutil-5.9.0%2B-3776AB?style=flat-square&logo=python&logoColor=white" alt="psutil">
   <br><br>
+
   <!-- 核心功能模块 -->
-  <img src="https://img.shields.io/badge/GUI-PySide6-8A2BE2?style=flat-square&logo=qt&logoColor=white" alt="GUI">
-  <img src="https://img.shields.io/badge/SfM-COLMAP_|_OpenCV-5C3EE8?style=flat-square&logo=opencv&logoColor=white" alt="SfM">
+  <img src="https://img.shields.io/badge/GUI-PySide6-41CD52?style=flat-square&logo=qt&logoColor=white" alt="GUI">
+  <img src="https://img.shields.io/badge/SfM-COLMAP_%7C_OpenCV-5C3EE8?style=flat-square&logo=opencv&logoColor=white" alt="SfM">
   <img src="https://img.shields.io/badge/Rendering-Real_Time-FF4500?style=flat-square" alt="Rendering">
   <br><br>
+
   <!-- 兼容性与许可证 -->
-  <img src="https://img.shields.io/badge/Platform-Windows_|_Linux_|_macOS-0078D4?style=flat-square&logo=windows&logoColor=white" alt="Platform">
+  <img src="https://img.shields.io/badge/Platform-Windows_%7C_Linux_%7C_macOS-0078D4?style=flat-square&logo=windows&logoColor=white" alt="Platform">
   <img src="https://img.shields.io/badge/License-Apache_2.0-1E90FF?style=flat-square&logo=apache&logoColor=white" alt="License">
   <br><br>
+
   <!-- 社区动态（自动实时更新） -->
   <img src="https://img.shields.io/github/stars/Chi-Blaze-B/3D-Gaussian-Splatting-Reconstruction?style=flat-square&color=yellow&logo=github" alt="Stars">
   <img src="https://img.shields.io/github/forks/Chi-Blaze-B/3D-Gaussian-Splatting-Reconstruction?style=flat-square&color=blue&logo=github" alt="Forks">
@@ -152,6 +165,7 @@ GUI 提供：
 - 自动检测 `training_state.pt` 并续训
 
 **注意**：GUI 提供“使用初始焦距猜测”开关，等价于 CLI 的 `--use-focal-guess`，但不支持自定义像素焦距值。GUI 无 `--eval-every` 对应控件，日志全量展示。GUI 通过工作目录自动检测 `training_state.pt` 续训，无需类似 `--resume-dir` 的配置项。GUI 默认值与 CLI 有差异：训练轮次默认 1000（CLI 为 3000）、SH 阶数默认 3（CLI 为 0）、随机背景默认开（CLI 为关）、焦距自校准默认开（CLI 为关）、初始焦距猜测默认开（CLI 为关），以界面为准。回环检测与 PGO 在 GUI 与 CLI 中均默认开启，CLI 可用 `--no-loop` / `--no-pgo` 关闭。
+
 ---
 
 ## 🧩 核心模块
